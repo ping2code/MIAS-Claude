@@ -1,0 +1,109 @@
+# MIAS-Claude configuration. Secrets never go here: they come from the environment
+# (MASSIVE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), optionally via a .env file.
+
+[watchlist]
+# The 30 symbols passing the options screen on 2026-10-08 (dashboard /screen, `python -m mias screen`).
+# /trend in Telegram works for any symbol, watched or not.
+symbols = [
+  # Market and macro ETFs
+  "SPY", "QQQ", "IWM", "DIA", "TQQQ", "GLD", "SLV", "TLT", "XLE",
+  # Semiconductors
+  "NVDA", "AMD", "AVGO", "MU", "SNDK", "INTC", "TSM",
+  # Mega-cap tech and communication
+  "AAPL", "MSFT", "GOOGL", "META", "AMZN", "NFLX", "ORCL", "NOW", "PLTR",
+  # Other
+  "TSLA", "MSTR", "HOOD", "BAC", "WMT",
+]
+market_symbols = ["SPY", "QQQ", "IWM"]
+
+[schedule]
+interval_seconds = 150          # one cycle every 2.5 minutes while the market is open
+timezone = "America/New_York"
+# Scheduled digests (exchange time). A closing summary is always sent at the close.
+digest_times = ["09:50", "11:30", "13:30", "15:30"]
+
+[data]
+base_url = "https://api.massive.com"
+# Stocks Advanced (real time) since 2026-10-07. Set to 15 if ever back on Stocks Starter.
+stock_delay_minutes = 0
+max_concurrency = 8
+request_timeout_seconds = 20
+max_retries = 4
+# Chain scope fetched each cycle: expirations up to N days out, strikes within +/- pct of spot.
+chain_max_dte = 100            # covers the 50-100 DTE contracts used for swing trades
+chain_strike_pct = 0.15
+max_chain_pages = 40
+
+[trend]
+# Which profile drives the headline trend and the trend-change alerts.
+# "swing" suits holding options for weeks; "intraday" reacts within the day.
+profile = "swing"
+strong_threshold = 60
+bias_threshold = 25
+
+[trend.profiles]
+swing = { "1w" = 0.35, "1d" = 0.45, "1h" = 0.20 }
+intraday = { "5m" = 0.25, "15m" = 0.30, "1h" = 0.30, "1d" = 0.15 }
+
+[options]
+# A single contract trading at least this much premium in one cycle is reported as a block.
+block_premium = 1_000_000
+# Unusual: today's volume exceeds open interest * ratio with at least this much premium.
+unusual_min_premium = 500_000
+unusual_vol_oi_ratio = 1.0
+# Same-day expiries always trade above OI; they still count in flow scores but not as unusual/blocks.
+alert_0dte = false
+# A symbol trading fewer option contracts than this today has its options read marked thin
+# (FICO, for example) and left out of the confidence verdict.
+thin_options_volume = 5000
+
+# Number of most recent cycles counted as "recent flow" (6 x 2.5 min = 15 min).
+recent_windows = 6
+strong_threshold = 60
+bias_threshold = 25
+
+# Contracts shown with /trend. "swing" follows the swing trend, "day" follows the intraday trend.
+# Liquid = two-sided quote with spread <= max_spread_pct of mid and open interest >= min_oi.
+[options.ideas.swing]
+min_dte = 50
+max_dte = 100
+delta = 0.60
+max_spread_pct = 10
+min_oi = 100
+
+[options.ideas.day]
+min_dte = 1          # set 0 to allow same-day expiries
+max_dte = 14
+delta = 0.45
+max_spread_pct = 5
+min_oi = 200
+
+[alerts]
+# A new trend or bias must hold for this many consecutive cycles before it is alerted.
+confirm_cycles = 2
+cooldown_minutes = 30
+# Options bias needed before a stock/options disagreement is called a divergence.
+divergence_min_options_score = 40
+iv_spike_points = 3.0           # ATM IV rise in volatility points ...
+iv_spike_window_minutes = 30    # ... within this many minutes
+block_cooldown_minutes = 60     # per contract
+
+[telegram]
+enabled = true
+# Answer /trend, /market, /list, /status, /help from the configured chat (only that chat).
+commands = true
+
+[screen]
+# Options-tradability screen (~200 symbols) shown on the dashboard. Runs at startup when no result exists,
+# then every interval_minutes while the market is open. "Refresh now" on the page is limited to once per 5 min.
+enabled = true
+interval_minutes = 120
+
+[web]
+enabled = true
+host = "0.0.0.0"
+port = 8080
+
+[storage]
+path = "data/mias.db"
+retention_days = 30

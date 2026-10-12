@@ -1,0 +1,18 @@
+# User service for running straight from the checkout (WSL, VPS or home server).
+#   cp deploy/systemd/mias-claude.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mias-claude
+#   loginctl enable-linger $USER     # keep it running after logout
+[Unit]
+Description=MIAS market and options trend alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/MyRepos/MIAS-Claude
+ExecStart=%h/MyRepos/MIAS-Claude/.venv/bin/python -m mias run
+Restart=always
+RestartSec=15
+Environment=MIAS_WEB_PORT=8080
+
+[Install]
+WantedBy=default.target

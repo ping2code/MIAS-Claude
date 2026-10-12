@@ -1,0 +1,79 @@
+# MIAS on OpenShift: one pod, one small volume. See README "Deploy on OpenShift".
+#
+# The secret is created separately so values never live in a file:
+#   oc create secret generic mias-secrets --from-env-file=.env
+# The config comes from config.toml:
+#   oc create configmap mias-config --from-file=config.toml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mias-data
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mias
+  labels: {app: mias}
+spec:
+  replicas: 1                 # exactly one: two pods would double every alert
+  strategy:
+    type: Recreate            # never overlap old and new pods on the same SQLite volume
+  selector:
+    matchLabels: {app: mias}
+  template:
+    metadata:
+      labels: {app: mias}
+    spec:
+      containers:
+        - name: mias
+          image: image-registry.openshift-image-registry.svc:5000/REPLACE_NAMESPACE/mias:latest
+          imagePullPolicy: Always
+          envFrom:
+            - secretRef: {name: mias-secrets}
+          env:
+            - {name: MIAS_CONFIG, value: /config/config.toml}
+            - {name: MIAS_DB_PATH, value: /data/mias.db}
+            - {name: TZ, value: America/New_York}
+          ports:
+            - {name: http, containerPort: 8080}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: config, mountPath: /config, readOnly: true}
+          resources:
+            requests: {cpu: 50m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 30
+            periodSeconds: 60
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities: {drop: [ALL]}
+            seccompProfile: {type: RuntimeDefault}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: mias-data}
+        - name: config
+          configMap: {name: mias-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mias
+spec:
+  selector: {app: mias}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+# No Route on purpose: the dashboard has no login. View it with
+#   oc port-forward svc/mias 8080:8080

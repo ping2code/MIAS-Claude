@@ -1,0 +1,19 @@
+# Single-host deployment (VPS or home server): podman compose up -d  /  docker compose up -d
+services:
+  mias:
+    build: .
+    image: localhost/mias:latest
+    restart: unless-stopped
+    env_file: .env                     # MASSIVE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+    volumes:
+      - ./config.toml:/app/config.toml:ro,Z
+      - mias-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    ports:
+      - "127.0.0.1:8080:8080"          # dashboard on localhost only; it has no login
+volumes:
+  mias-data:

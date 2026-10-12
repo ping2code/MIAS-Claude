@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+*.db
+*.db-*
+# Private trading data (broker exports, Excel lock files)
+report.*
+*.xlsx
+*.xls
+~$*
