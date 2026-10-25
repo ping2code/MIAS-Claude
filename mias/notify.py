@@ -17,7 +17,7 @@ class TelegramError(Exception):
 
 
 class Telegram:
-    def __init__(self, token: str, chat_id: str, *, transport: httpx.AsyncBaseTransport | None = None):
+    def __init__(self, token: str, chat_id: str = "", *, transport: httpx.AsyncBaseTransport | None = None):
         self._url = f"https://api.telegram.org/bot{token}/sendMessage"
         self._chat = chat_id
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(15, connect=10), transport=transport)
@@ -25,15 +25,15 @@ class Telegram:
     async def close(self) -> None:
         await self._http.aclose()
 
-    async def send(self, html: str) -> None:
+    async def send(self, html: str, chat: str | None = None) -> None:
         for chunk in split_message(html):
-            await self._send_one(chunk)
+            await self._send_one(chunk, chat or self._chat)
 
-    async def _send_one(self, text: str) -> None:
+    async def _send_one(self, text: str, chat: str) -> None:
         for attempt in range(3):
             try:
                 resp = await self._http.post(self._url, json={
-                    "chat_id": self._chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
+                    "chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True})
             except httpx.HTTPError as exc:
                 # Never include the URL: it carries the bot token.
                 err = TelegramError(f"network error: {type(exc).__name__}")
@@ -55,7 +55,7 @@ class Telegram:
                 desc = ""
             if resp.status_code == 400 and "parse" in desc.lower():
                 # Fall back to plain text rather than lose the alert.
-                resp = await self._http.post(self._url, json={"chat_id": self._chat, "text": strip_html(text)})
+                resp = await self._http.post(self._url, json={"chat_id": chat, "text": strip_html(text)})
                 if resp.status_code == 200:
                     return
             raise TelegramError(f"HTTP {resp.status_code}: {desc[:200]}")
@@ -90,28 +90,42 @@ def strip_html(text: str) -> str:
 
 
 class Dispatcher:
-    """Drains the outbox. With no Telegram configured, alerts are only logged."""
+    """Drains the outbox to every alert chat. With no Telegram configured, alerts are only logged.
 
-    def __init__(self, store: Store, telegram: Telegram | None):
+    Each alert remembers which chats already received it, so a failure in one chat is retried without
+    re-sending to the others."""
+
+    def __init__(self, store: Store, telegram: Telegram | None, chats: list[str] | None = None):
         self.store = store
         self.telegram = telegram
+        self.chats = [c for c in (chats or []) if c]
         self.last_error: str | None = None
         self._lock = asyncio.Lock()
 
     async def flush(self) -> int:
         async with self._lock:
             sent = 0
-            for alert_id, rule, text in self.store.pending():
-                log.info("ALERT [%s]\n%s", rule, strip_html(text))
-                if self.telegram is None:
+            for alert_id, rule, text, sent_to in self.store.pending():
+                done = [c for c in (sent_to or "").split(",") if c]
+                if not done:
+                    log.info("ALERT [%s]\n%s", rule, strip_html(text))
+                if self.telegram is None or not self.chats:
                     self.store.mark_delivered(alert_id)
                     continue
-                try:
-                    await self.telegram.send(text)
-                except Exception as exc:  # keep it in the outbox and retry next flush
-                    self.last_error = str(exc)
-                    self.store.mark_failed(alert_id, str(exc))
-                    log.error("telegram delivery failed for alert %d: %s", alert_id, exc)
+                failed = False
+                for chat in self.chats:
+                    if chat in done:
+                        continue
+                    try:
+                        await self.telegram.send(text, chat)
+                    except Exception as exc:  # keep it in the outbox; only the missing chats are retried
+                        self.last_error = str(exc)
+                        self.store.mark_failed(alert_id, str(exc), ",".join(done))
+                        log.error("telegram delivery to %s failed for alert %d: %s", chat, alert_id, exc)
+                        failed = True
+                        break
+                    done.append(chat)
+                if failed:
                     break
                 self.store.mark_delivered(alert_id)
                 self.last_error = None

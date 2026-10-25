@@ -29,12 +29,12 @@ class Service:
                                     max_retries=cfg.max_retries, max_concurrency=cfg.max_concurrency,
                                     transport=transport)
         tg = None
-        if cfg.telegram_enabled and cfg.telegram_token and cfg.telegram_chat_id:
-            tg = Telegram(cfg.telegram_token, cfg.telegram_chat_id)
+        if cfg.telegram_enabled and cfg.telegram_token and cfg.telegram_alert_chats:
+            tg = Telegram(cfg.telegram_token, cfg.telegram_alert_chats[0])
         elif cfg.telegram_enabled:
             log.warning("Telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing: alerts are only logged")
         self.telegram = tg
-        self.dispatcher = Dispatcher(self.store, tg)
+        self.dispatcher = Dispatcher(self.store, tg, cfg.telegram_alert_chats)
         self.engine = Engine(cfg, self.client, self.store, self.dispatcher)
         self.heartbeat = time.time()
         self.market_state = "unknown"
@@ -116,6 +116,9 @@ class Service:
         if is_open:
             self.market_state = "open"
             await self._run_cycle(now)
+            self._send_reports(now)
+            self._send_unusual(now)
+            await self._send_picks(now)
             if self.cfg.screen_enabled and self._screen_due(now):
                 self.start_screen()
             for t in self.cfg.digest_times:
@@ -134,6 +137,74 @@ class Service:
                 sent.append("close")
         self.store.put(f"digests:{today}", sent)
         await self.dispatcher.flush()
+
+    # ---- periodic per-symbol reports (e.g. NDX every 10 minutes) -------------------------------
+
+    def _send_reports(self, now: datetime) -> None:
+        if not self.cfg.reports or self.engine.last_cycle.get("at") != now.isoformat():
+            return                                   # only report on data from this very cycle
+        from .formatting import scheduled_report
+        local = now.astimezone(self.cfg.tz)
+        since_open = (local - datetime.combine(local.date(), OPEN, self.cfg.tz)).total_seconds()
+        if since_open < 0:
+            return
+        for sym, minutes in self.cfg.reports.items():
+            until = self.cfg.report_until.get(sym)
+            if until and local.date() > until:
+                continue                             # temporary report has expired
+            r = next((x for x in self.engine.last_results if x.symbol == sym), None)
+            if not r or not r.ok:
+                continue
+            tag = f"{local.date()}:{int(since_open // (minutes * 60))}"
+            last = self.store.get(f"report:{sym}") or {}
+            if last.get("tag") == tag:
+                continue
+            prev = last.get("price") if last.get("date") == str(local.date()) else None
+            self.store.enqueue("report", scheduled_report(r, self.cfg, local, minutes, prev), sym)
+            self.store.put(f"report:{sym}", {"tag": tag, "date": str(local.date()), "price": r.price})
+
+    def _send_unusual(self, now: datetime) -> None:
+        minutes = self.cfg.unusual_every_minutes
+        if not minutes or self.engine.last_cycle.get("at") != now.isoformat():
+            return
+        from .formatting import unusual_report
+        local = now.astimezone(self.cfg.tz)
+        since_open = (local - datetime.combine(local.date(), OPEN, self.cfg.tz)).total_seconds()
+        if since_open < 0:
+            return
+        tag = f"{local.date()}:{int(since_open // (minutes * 60))}"
+        last = self.store.get("unusual_report") or {}
+        if last.get("tag") == tag:
+            return
+        prev = last.get("volumes") if last.get("date") == str(local.date()) else None
+        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top)
+        if text:
+            self.store.enqueue("unusual", text)
+        self.store.put("unusual_report", {"tag": tag, "date": str(local.date()), "volumes": volumes})
+
+    # ---- daily spread picks ---------------------------------------------------------------------
+
+    async def _send_picks(self, now: datetime) -> None:
+        if not self.cfg.picks_enabled or self.engine.last_cycle.get("at") != now.isoformat():
+            return
+        local = now.astimezone(self.cfg.tz)
+        due = datetime.combine(local.date(), dtime.fromisoformat(self.cfg.picks_time), self.cfg.tz)
+        key = f"picks:{local.date()}"
+        if not (due <= local < due + timedelta(minutes=60)) or self.store.get(key):
+            return
+        self.store.put(key, True)          # once a day, even if building fails
+        try:
+            text = await self.picks_text(now)
+        except Exception:
+            log.exception("daily picks failed")
+            return
+        self.store.enqueue("picks", text)
+
+    async def picks_text(self, now: datetime) -> str:
+        from .formatting import picks_message
+        from .picks import daily_picks
+        p = await daily_picks(self.client, self.engine.last_results, self.cfg, now)
+        return picks_message(p, now.astimezone(self.cfg.tz))
 
     # ---- options screen (background; never blocks the alert cycle) ---------------------------
 

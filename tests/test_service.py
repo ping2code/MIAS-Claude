@@ -160,7 +160,7 @@ def test_dispatcher_keeps_failed_alerts_and_retries(tmp_path):
 
     async def go():
         tg = Telegram("tok", "chat", transport=httpx.MockTransport(handler))
-        d = Dispatcher(store, tg)
+        d = Dispatcher(store, tg, ["chat"])
         assert await d.flush() == 0 and len(store.pending()) == 1 and "tok" not in (d.last_error or "")
         state["fail"] = False
         assert await d.flush() == 1 and store.pending() == []
@@ -178,6 +178,7 @@ def _engine(cfg, fake):
 
 
 def test_engine_cycles_isolate_failures_and_alert(cfg):
+    cfg = dataclasses.replace(cfg, alert_mode="all")
     now = datetime.combine(TODAY, time(15, 0), ET)
     fake = FakeMassive(TODAY, now, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
     fake.fail.add("CCC")
@@ -344,7 +345,8 @@ def _bot_service(cfg, monkeypatch):
     from mias.app import Service
     from mias.bot import CommandBot
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
-    cfg = dataclasses.replace(cfg, telegram_token="tok", telegram_chat_id="42")
+    cfg = dataclasses.replace(cfg, telegram_token="tok", telegram_chat_id="42", telegram_alert_chats=["42"],
+                              telegram_allowed_users=["42"], telegram_allowed_chats=["42"])
     now = datetime.combine(TODAY, time(15, 0), ET)
     fake = FakeMassive(TODAY, now, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0, "ZZZ": 30.0})
     svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
@@ -458,3 +460,369 @@ def test_screen_due(cfg):
     assert not svc._screen_due(now)
     assert svc._screen_due(now + timedelta(minutes=cfg.screen_interval_minutes))
     run(svc.client.close())
+
+
+
+# ---- strong-alignment mode ---------------------------------------------------------------------
+
+def _aligned(swing, intra, opt, thin=False):
+    from mias.options import OptionsBias, OptionsSnapshot
+    from mias.trend import StockTrend, TimeframeTrend, label_for
+    lab = lambda x: label_for(x, 60, 25)
+    st = StockTrend(swing, lab(swing), {"1d": TimeframeTrend("1d", swing, lab(swing), 100, 0)}, 100, 0,
+                    "swing", {"swing": (swing, lab(swing)), "intraday": (intra, lab(intra))})
+    snap = OptionsSnapshot(1, 100, 1, 1, 1, 1, 1, 1, 1.0, 1.0, 30, 30, 0, 0, 105, 95, thin=thin)
+    olab = {"up": "bullish", "down": "bearish", "strong_up": "strong_bullish", "strong_down": "strong_bearish"}.get(lab(opt), "neutral")
+    return SymbolResult("AAA", stock=st, options=snap, bias=OptionsBias(opt, olab, {"x": 1}, 0, 0), stock_price=100)
+
+
+def test_strong_side():
+    from mias.signals import strong_side
+    assert strong_side(_aligned(70, 65, 30)) == "bull"
+    assert strong_side(_aligned(-70, -65, -80)) == "bear"
+    assert strong_side(_aligned(70, 50, 30)) == "none"          # intraday only UP, not STRONG
+    assert strong_side(_aligned(70, 65, 10)) == "none"          # options neutral
+    assert strong_side(_aligned(70, 65, 30, thin=True)) == "none"
+    assert strong_side(_aligned(70, 65, -30)) == "none"
+
+
+def test_strong_alignment_confirm_flicker_end_and_cooldown(cfg):
+    from mias.signals import evaluate_strong
+    state, t = {}, 1_000_000.0
+    assert evaluate_strong(_aligned(70, 65, 30), state, cfg, t) == []              # 1st aligned reading
+    rs = evaluate_strong(_aligned(70, 65, 30), state, cfg, t + 150)                # confirmed
+    assert [r.rule for r in rs] == ["strong_alignment"] and "STRONG BULLISH" in rs[0].text
+    assert evaluate_strong(_aligned(70, 50, 30), state, cfg, t + 300) == []        # one weak reading: no change
+    assert evaluate_strong(_aligned(70, 65, 30), state, cfg, t + 450) == []        # flicker absorbed
+    evaluate_strong(_aligned(70, 50, 30), state, cfg, t + 600)
+    rs = evaluate_strong(_aligned(70, 50, 30), state, cfg, t + 750)                # confirmed end
+    assert [r.rule for r in rs] == ["alignment_ended"]
+    evaluate_strong(_aligned(70, 65, 30), state, cfg, t + 900)
+    assert evaluate_strong(_aligned(70, 65, 30), state, cfg, t + 1050) == []       # re-entry inside cooldown
+    quiet = dataclasses.replace(cfg, alignment_end_alert=False)
+    s2 = {}
+    for i in range(2):
+        evaluate_strong(_aligned(-70, -65, -40), s2, quiet, t + 150 * i)
+    evaluate_strong(_aligned(0, 0, 0), s2, quiet, t + 300)
+    assert evaluate_strong(_aligned(0, 0, 0), s2, quiet, t + 450) == []           # end alert switched off
+
+
+def test_strong_mode_suppresses_other_alerts(cfg):
+    now = datetime.combine(TODAY, time(15, 0), ET)
+    fake = FakeMassive(TODAY, now, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    eng, store, client = _engine(cfg, fake)
+
+    async def go():
+        await eng.cycle(now)
+        for i in range(1, 4):       # the same heavy flow that triggers blocks and flips in "all" mode
+            fake.now = now + timedelta(minutes=2.5 * i)
+            fake.volumes["AAA"] = {("put", 100.0, 8): 10 + 12000 * i, ("call", 100.0, 8): 10 + 9000 * i}
+            fake.last_at["AAA"] = {("put", 100.0, 8): "buy", ("call", 100.0, 8): "sell"}
+            await eng.cycle(fake.now)
+        await client.close()
+    run(go())
+    rules = {a["rule"] for a in store.recent_alerts()}
+    assert not rules & {"block", "options_flip", "trend_change", "divergence", "market"}
+
+
+# ---- NDX-style instruments and scheduled reports -----------------------------------------------
+
+def _ndx_cfg(cfg):
+    from mias.config import Instrument
+    return dataclasses.replace(cfg, symbols=["AAA", "NDX"], instruments={
+        "NDX": Instrument("I:NDX", "QQQ", "I:NDX", 0.06, "trend from QQQ bars")}, reports={"NDX": 10})
+
+
+def test_instrument_uses_proxy_trend_and_option_implied_price(cfg):
+    cfg = _ndx_cfg(cfg)
+    now = datetime.combine(TODAY, time(11, 0), ET)
+    fake = FakeMassive(TODAY, now, {"AAA": 100.0, "QQQ": 750.0, "I:NDX": 300.0})
+    eng, store, client = _engine(cfg, fake)
+
+    async def go():
+        res = await eng.cycle(now)
+        await client.close()
+        return {r.symbol: r for r in res}
+    by = run(go())
+    ndx = by["NDX"]
+    assert ndx.ok and ndx.stock is not None and ndx.options is not None
+    assert ndx.price == pytest.approx(300.0, abs=0.05) and ndx.price_is_live      # from NDX option quotes
+    assert ndx.prev_close is not None and ndx.source_note
+    assert any("/v3/snapshot/options/I:NDX" in c for c in fake.calls)
+    assert any("/aggs/ticker/QQQ/" in c for c in fake.calls)
+    assert store.get("spot:NDX")["price"] == pytest.approx(300.0, abs=0.05)
+
+
+def test_prev_close_skips_weekend_index_bar(cfg):
+    sat = datetime(2026, 10, 10, 1, 0, tzinfo=ET)
+    fri = datetime(2026, 10, 9, 1, 0, tzinfo=ET)
+    bars = [{"t": int(fri.timestamp() * 1000), "o": 1, "h": 1, "l": 1, "c": 30883.15},
+            {"t": int(sat.timestamp() * 1000), "o": 1, "h": 1, "l": 1, "c": 30853.32}]
+    client = MassiveClient("test-key", transport=httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"results": bars})))
+    eng = Engine(cfg, client, Store(cfg.db_path), None)
+    assert run(eng._prev_close("I:NDX", date(2026, 10, 12))) == 30883.15
+    run(client.close())
+
+
+def test_ndx_report_every_10_minutes(cfg):
+    from mias.app import Service
+    cfg = _ndx_cfg(cfg)
+    t0 = datetime.combine(TODAY, time(10, 0), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0, "QQQ": 750.0, "I:NDX": 300.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+
+    async def go():
+        for minutes in (0, 2.5, 5, 7.5, 10, 12.5):        # 10:00 .. 10:12:30 -> slots 10:00 and 10:10
+            await svc._tick(t0 + timedelta(minutes=minutes))
+        await svc.client.close()
+    run(go())
+    reports = [a for a in svc.store.recent_alerts() if a["rule"] == "report"]
+    assert len(reports) == 2 and all("NDX" in a["text"] and "10-min report" in a["text"] for a in reports)
+    assert "since last" in reports[0]["text"]               # newest first: the 10:10 report compares to 10:00
+
+
+# ---- daily spread picks --------------------------------------------------------------------------
+
+def _leg(kind, strike, dte, delta, mid, oi=5000, spread=0.04):
+    from mias.options import Contract
+    exp = TODAY + timedelta(days=dte)
+    return Contract(f"O:X{kind}{strike}{dte}", kind, strike, exp, dte, 100, mid, oi, 0.3, delta, 0.02,
+                    mid - spread / 2, mid + spread / 2, 1, mid, 1)
+
+
+def _chain_legs():
+    legs = []
+    for dte in (10, 44, 72):                        # only 44 is inside the 30-60 day window
+        for k, cd, cm, pd_, pm in ((90, .80, 11.0, -.20, 1.2), (95, .65, 7.0, -.33, 2.2), (100, .50, 4.5, -.50, 4.4),
+                                   (105, .33, 2.4, -.66, 7.2), (110, .22, 1.3, -.80, 11.1)):
+            legs += [_leg("call", k, dte, cd, cm), _leg("put", k, dte, pd_, pm)]
+    return legs
+
+
+def test_build_spread_picks_window_deltas_and_liquidity():
+    from mias.picks import build_spread
+    long, short = build_spread(_chain_legs(), "call")
+    assert (long.strike, short.strike, long.dte) == (100, 110, 44)
+    long, short = build_spread(_chain_legs(), "put")
+    assert (long.strike, short.strike, long.dte) == (100, 90, 44)
+    thin = [c for c in _chain_legs() if c.strike != 110] + [_leg("call", 110, 44, .22, 1.3, oi=50)]
+    assert build_spread(thin, "call")[1].strike == 105        # illiquid 110C skipped -> nearest liquid short
+    assert build_spread([_leg("call", 100, 10, .5, 4.5)], "call") is None
+
+
+def test_candidates_rules(cfg):
+    from mias.picks import candidates
+    up = _aligned(75, 40, 10)                          # strong up swing, options mildly bullish
+    up.symbol = "UPS"
+    against = _aligned(75, 40, -40); against.symbol = "AGN"   # options money against: excluded
+    weak = _aligned(35, 30, 5); weak.symbol = "WEAK"           # tier B
+    down = _aligned(-70, -65, -30); down.symbol = "DWN"
+    calls = candidates([up, against, weak, down], "call", cfg)
+    assert [(t, r.symbol) for t, _, r in calls] == [("A", "UPS"), ("B", "WEAK")]
+    puts = candidates([up, against, weak, down], "put", cfg)
+    assert [(t, r.symbol) for t, _, r in puts] == [("A", "DWN")]
+
+
+def test_daily_picks_message_with_and_without_put(cfg, monkeypatch):
+    from mias import picks
+    from mias.formatting import picks_message
+    up = _aligned(75, 40, 10); up.symbol = "UPS"; up.live_price = 100.0
+
+    class FakeClient:
+        async def option_chain(self, sym, **kw):
+            return _chain_legs(), False
+    monkeypatch.setattr(picks, "parse_contract", lambda item, today, tz: item)   # chain items are Contracts
+    now = datetime.combine(TODAY, time(10, 0), ET)
+    p = run(picks.daily_picks(FakeClient(), [up], cfg, now))
+    assert p["call"].symbol == "UPS" and p["put"] is None and p["put_near"].symbol == "UPS"
+    s = p["call"]
+    assert s.cost == pytest.approx(3.2) and s.max_profit == pytest.approx(6.8) and s.breakeven == pytest.approx(103.2)
+    text = picks_message(p, now)
+    assert "CALL SPREAD" in text and "Buy" in text and "100C" in text and "110C" in text and "Limit <b>3.20</b>" in text
+    assert "PUT SPREAD" in text and "No trade today" in text and "time stop" in text
+
+
+def test_picks_sent_once_at_10(cfg, monkeypatch):
+    from mias.app import Service
+    t0 = datetime.combine(TODAY, time(9, 57, 30), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+    calls = []
+
+    async def fake_text(now):
+        calls.append(now)
+        return "🎯 picks"
+    svc.picks_text = fake_text
+
+    async def go():
+        for minutes in (0, 2.5, 5, 7.5):                     # 09:57:30 .. 10:05:00
+            await svc._tick(t0 + timedelta(minutes=minutes))
+        await svc.client.close()
+    run(go())
+    assert len(calls) == 1 and calls[0].astimezone(ET).time() >= time(10, 0)
+    assert [a["rule"] for a in svc.store.recent_alerts()].count("picks") == 1
+
+
+def test_temporary_report_stops_after_until_date(cfg):
+    from mias.app import Service
+    cfg = dataclasses.replace(cfg, reports={"AAA": 10, "BBB": 10}, report_until={"AAA": TODAY})
+    t0 = datetime.combine(TODAY, time(11, 0), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+    tomorrow = datetime.combine(TODAY + timedelta(days=1), time(11, 0), ET)
+
+    async def go():
+        await svc._tick(t0)
+        fake.today, fake.now = tomorrow.date(), tomorrow
+        await svc._tick(tomorrow)
+        await svc.client.close()
+    run(go())
+    sent = [(a["symbol"], a["ts"]) for a in svc.store.recent_alerts() if a["rule"] == "report"]
+    assert sorted(s for s, _ in sent) == ["AAA", "BBB", "BBB"]      # AAA only on its last day; BBB both days
+
+
+# ---- unusual activity report --------------------------------------------------------------------
+
+def _with_unusual(sym, prints):
+    from mias.options import OptionsSnapshot, Print
+    snap = OptionsSnapshot(1, 100, 1, 1, 1, 1, 1, 1, 1.0, 1.0, 30, 30, 0, 0, None, None,
+                           unusual=[Print(f"O:{sym}{i}", k, s, "2026-10-16", side, v, prem, oi, 1.0)
+                                    for i, (k, s, side, v, prem, oi) in enumerate(prints)])
+    return SymbolResult(sym, options=snap)
+
+
+def test_unusual_report_ranks_marks_and_caps():
+    from mias.formatting import unusual_report
+    now = datetime.combine(TODAY, time(10, 40), ET)
+    res = [_with_unusual("AAA", [("call", 100, "buy", 5000, 9e6, 100), ("put", 90, "buy", 4000, 2e6, 50),
+                                 ("call", 105, "sell", 3000, 1.5e6, 10), ("call", 110, "buy", 2000, 1.2e6, 5)]),
+           _with_unusual("BBB", [("put", 50, "sell", 8000, 5e6, 300)])]
+    text, vols = unusual_report(res, now, None, top=10)
+    lines = text.splitlines()
+    assert "AAA 10/16 100C" in lines[2] and "BBB 10/16 50P" in lines[3]       # ranked by premium
+    assert text.count("AAA ") == 3                                              # max 3 per symbol
+    assert "🆕" not in text and "Lean" in text                                  # first report: no markers
+    # Next report: AAA 100C grew, BBB unchanged, AAA 90P dropped from prev so it's "new" again.
+    prev = dict(vols); prev["O:AAA0"] = 4000; prev.pop("O:AAA1")
+    text2, _ = unusual_report(res, now, prev, top=10)
+    assert "⬆️ 🟢 AAA 10/16 100C" in text2 and "+1,000 since last" in text2
+    assert "🆕 🔴 AAA 10/16 90P" in text2 and "1 new, 1 growing" in text2
+    assert unusual_report([SymbolResult("ZZZ")], now, None, 10)[0] is None     # nothing unusual: no message
+
+
+def test_unusual_report_every_10_minutes(cfg):
+    from mias.app import Service
+    cfg = dataclasses.replace(cfg, unusual_every_minutes=10, reports={})
+    t0 = datetime.combine(TODAY, time(10, 30), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+    sent = []
+    import mias.formatting as fm
+    real = fm.unusual_report
+
+    def spy(results, now, prev, top, per_symbol=3):
+        sent.append(now)
+        return "🔥 report", {}
+    fm.unusual_report = spy
+    try:
+        async def go():
+            for minutes in (0, 2.5, 5, 7.5, 10, 12.5):        # slots 10:30 and 10:40
+                await svc._tick(t0 + timedelta(minutes=minutes))
+            await svc.client.close()
+        run(go())
+    finally:
+        fm.unusual_report = real
+    assert len(sent) == 2
+    assert [a["rule"] for a in svc.store.recent_alerts()].count("unusual") == 2
+
+
+
+# ---- sharing: group alerts, several users -------------------------------------------------------
+
+def test_dispatcher_sends_to_every_chat_and_retries_only_missing(tmp_path):
+    store = Store(tmp_path / "m.db")
+    store.enqueue("t", "hello")
+    sent, fail = [], {"g2": True}
+
+    def handler(req):
+        body = json.loads(req.content)
+        if fail.get(body["chat_id"]):
+            return httpx.Response(500, json={"description": "down"})
+        sent.append(body["chat_id"])
+        return httpx.Response(200, json={"ok": True})
+
+    async def go():
+        tg = Telegram("tok", "g1", transport=httpx.MockTransport(handler))
+        d = Dispatcher(store, tg, ["g1", "g2"])
+        assert await d.flush() == 0 and len(store.pending()) == 1      # g1 got it, g2 failed
+        fail["g2"] = False
+        assert await d.flush() == 1 and store.pending() == []
+        await tg.close()
+    run(go())
+    assert sent == ["g1", "g2"]                                         # g1 never received it twice
+
+
+def _shared_bot(cfg, monkeypatch):
+    from mias.app import Service
+    from mias.bot import CommandBot
+    cfg = dataclasses.replace(cfg, telegram_token="tok", telegram_alert_chats=["-100"],
+                              telegram_allowed_users=["1", "2", "3"], telegram_allowed_chats=["-100"])
+    now = datetime.combine(TODAY, time(15, 0), ET)
+    fake = FakeMassive(TODAY, now, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+    bot = CommandBot(svc)
+    out = []
+
+    class FakeTG:
+        async def send(self, html, chat=None):
+            out.append((chat, html))
+
+        async def close(self):
+            pass
+    svc.telegram = FakeTG()
+    return svc, bot, out
+
+
+def test_bot_users_group_and_whoami(cfg, monkeypatch):
+    svc, bot, out = _shared_bot(cfg, monkeypatch)
+    dm = lambda user, text: {"chat": {"id": int(user), "type": "private"}, "from": {"id": int(user)}, "text": text}
+    grp = lambda user, text: {"chat": {"id": -100, "type": "supergroup"}, "from": {"id": int(user)}, "text": text}
+
+    async def go():
+        await bot._handle(dm("2", "/list"))              # friend in a private chat: reply goes to them
+        await bot._handle(dm("9", "/list"))              # stranger: ignored
+        await bot._handle(dm("9", "/whoami"))            # stranger can still learn their IDs
+        await bot._handle(grp("3", "/list@NIAS_Bot"))    # command in the group: reply to the group
+        await bot._handle(grp("3", "AMD looks weak today"))   # normal chat in the group: silent
+        await bot._handle(grp("3", "/nonsense"))         # unknown command in the group: silent
+        await bot._handle(dm("1", "hello there friend"))      # unknown in a DM: helpful reply
+        await svc.client.close()
+        await bot.close()
+    run(go())
+    chats = [c for c, _ in out]
+    assert chats == ["2", "9", "-100", "1"]
+    assert "Watching" in out[0][1] and "Watching" in out[2][1]
+    assert "not allowed yet" in out[1][1] and "<code>9</code>" in out[1][1]
+    assert "didn't get that" in out[3][1]
+
+
+def test_ids_come_from_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "111")
+    monkeypatch.setenv("TELEGRAM_ALERT_CHATS", "-100123")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111, 222,333")
+    monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
+    cfg_path = tmp_path / "config.toml"           # away from the real .env next to the repo's config
+    cfg_path.write_text((ROOT / "config.toml").read_text())
+    c = config_mod.load(cfg_path)
+    assert c.telegram_alert_chats == ["-100123"] and c.telegram_allowed_users == ["111", "222", "333"]
+    assert c.telegram_allowed_chats == ["-100123"]          # defaults to the alert chats
+    monkeypatch.delenv("TELEGRAM_ALERT_CHATS"); monkeypatch.delenv("TELEGRAM_ALLOWED_USERS")
+    c = config_mod.load(cfg_path)
+    assert c.telegram_alert_chats == ["111"] and c.telegram_allowed_users == ["111"]   # single-user default

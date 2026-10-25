@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import tomllib
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -49,6 +50,19 @@ def _templates(raw: dict) -> dict[str, IdeaTemplate]:
 
 
 @dataclass(frozen=True)
+class Instrument:
+    """A symbol whose data comes from elsewhere, e.g. an index without real-time index data."""
+    options_symbol: str            # chain to analyze, e.g. "I:NDX"
+    trend_symbol: str              # bars used for the trend, e.g. "QQQ"
+    close_symbol: str | None       # daily bars for the previous close, e.g. "I:NDX"
+    chain_strike_pct: float | None # narrower strike window for very large chains
+    note: str = ""
+
+
+ALERT_MODES = ("strong_alignment", "all")
+
+
+@dataclass(frozen=True)
 class Config:
     symbols: list[str]
     market_symbols: list[str]
@@ -76,6 +90,15 @@ class Config:
     recent_windows: int
     options_strong: float
     options_bias: float
+    alert_mode: str
+    alignment_end_alert: bool
+    instruments: dict[str, Instrument]
+    reports: dict[str, int]
+    report_until: dict[str, date]
+    unusual_every_minutes: int
+    unusual_top: int
+    picks_enabled: bool
+    picks_time: str
     confirm_cycles: int
     cooldown_minutes: int
     divergence_min_options_score: float
@@ -94,6 +117,9 @@ class Config:
     api_key: str = field(repr=False, default="")
     telegram_token: str = field(repr=False, default="")
     telegram_chat_id: str = field(repr=False, default="")
+    telegram_alert_chats: list[str] = field(repr=False, default_factory=list)
+    telegram_allowed_users: list[str] = field(repr=False, default_factory=list)
+    telegram_allowed_chats: list[str] = field(repr=False, default_factory=list)
 
 
 def load_dotenv(path: Path) -> None:
@@ -111,6 +137,11 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value)
 
 
+def _ids(name: str) -> list[str]:
+    """Comma-separated Telegram user/chat IDs from the environment (kept out of the public config)."""
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
 def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> Config:
     path = Path(path)
     if not path.is_file():
@@ -122,8 +153,9 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
     def sec(name: str) -> dict:
         return raw.get(name, {})
 
-    wl, sch, data, tr, opt, al, tg, web, st, scr = (sec(n) for n in (
-        "watchlist", "schedule", "data", "trend", "options", "alerts", "telegram", "web", "storage", "screen"))
+    wl, sch, data, tr, opt, al, tg, web, st, scr, ins, rep = (sec(n) for n in (
+        "watchlist", "schedule", "data", "trend", "options", "alerts", "telegram", "web", "storage", "screen",
+        "instruments", "reports"))
 
     symbols = [s.strip().upper() for s in os.environ.get("MIAS_SYMBOLS", "").split(",") if s.strip()] \
         or [s.upper() for s in wl.get("symbols", [])]
@@ -141,6 +173,26 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
     primary = tr.get("profile", "swing")
     if primary not in profiles:
         raise ConfigError(f"trend.profile {primary!r} is not one of {sorted(profiles)}")
+
+    mode = al.get("mode", "strong_alignment")
+    if mode not in ALERT_MODES:
+        raise ConfigError(f"alerts.mode must be one of {ALERT_MODES}, got {mode!r}")
+    instruments = {}
+    for name, i in ins.items():
+        if "options_symbol" not in i or "trend_symbol" not in i:
+            raise ConfigError(f"instruments.{name} needs options_symbol and trend_symbol")
+        pct = i.get("chain_strike_pct")
+        instruments[name.upper()] = Instrument(i["options_symbol"], i["trend_symbol"].upper(), i.get("close_symbol"),
+                                               float(pct) if pct is not None else None, i.get("note", ""))
+    reports = {k.upper(): int(v) for k, v in rep.get("every_minutes", {}).items()}
+    if any(m < 5 for m in reports.values()):
+        raise ConfigError("reports.every_minutes values must be >= 5")
+    if 0 < int(rep.get("unusual_every_minutes", 0)) < 5:
+        raise ConfigError("reports.unusual_every_minutes must be 0 (off) or >= 5")
+    try:
+        report_until = {k.upper(): date.fromisoformat(str(v)) for k, v in rep.get("until", {}).items()}
+    except ValueError as exc:
+        raise ConfigError(f"reports.until must hold YYYY-MM-DD dates: {exc}") from None
 
     interval = int(os.environ.get("MIAS_INTERVAL_SECONDS", sch.get("interval_seconds", 150)))
     if interval < 30:
@@ -177,6 +229,15 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         recent_windows=int(opt.get("recent_windows", 6)),
         options_strong=float(opt.get("strong_threshold", 60)),
         options_bias=float(opt.get("bias_threshold", 25)),
+        alert_mode=mode,
+        alignment_end_alert=bool(al.get("alignment_end_alert", True)),
+        instruments=instruments,
+        reports=reports,
+        report_until=report_until,
+        unusual_every_minutes=int(rep.get("unusual_every_minutes", 0)),
+        unusual_top=int(rep.get("unusual_top", 10)),
+        picks_enabled=bool(raw.get("picks", {}).get("enabled", True)),
+        picks_time=raw.get("picks", {}).get("time", "10:00"),
         confirm_cycles=max(1, int(al.get("confirm_cycles", 2))),
         cooldown_minutes=int(al.get("cooldown_minutes", 30)),
         divergence_min_options_score=float(al.get("divergence_min_options_score", 40)),
@@ -195,6 +256,9 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         api_key=os.environ.get("MASSIVE_API_KEY", ""),
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+        telegram_alert_chats=_ids("TELEGRAM_ALERT_CHATS") or _ids("TELEGRAM_CHAT_ID"),
+        telegram_allowed_users=_ids("TELEGRAM_ALLOWED_USERS") or _ids("TELEGRAM_CHAT_ID"),
+        telegram_allowed_chats=_ids("TELEGRAM_ALLOWED_CHATS") or _ids("TELEGRAM_ALERT_CHATS") or _ids("TELEGRAM_CHAT_ID"),
     )
     if require_secrets and not cfg.api_key:
         raise ConfigError("MASSIVE_API_KEY is not set")

@@ -17,6 +17,7 @@ class SymbolResult:
     prev_close: float | None = None
     chain_truncated: bool = False
     errors: list[str] | None = None
+    source_note: str | None = None      # e.g. where an index's trend and price come from
 
     @property
     def price(self) -> float | None:

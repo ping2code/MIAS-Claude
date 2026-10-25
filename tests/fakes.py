@@ -118,9 +118,11 @@ class FakeMassive:
                 return httpx.Response(500, json={"error": "boom"})
             s, e = date.fromisoformat(start), date.fromisoformat(end)
             if span == "day":
-                days = [d for d in trading_days(e, 300) if d >= s]
-                return _json({"results": daily_bars(days, self.spots[sym] - 300 * self.drift[sym] * 10,
-                                                    self.drift[sym] * 10)})
+                days = trading_days(self.today, 300)
+                bars = daily_bars(days, self.spots[sym] - 300 * self.drift[sym] * 10, self.drift[sym] * 10)
+                lo = int(datetime.combine(s, time(0), ET).timestamp() * 1000)
+                hi = int(datetime.combine(e + timedelta(days=1), time(0), ET).timestamp() * 1000)
+                return _json({"results": [b for b in bars if lo <= b["t"] < hi]})
             days = trading_days(self.today, 30)
             start_p = self.spots[sym] - len(days) * 78 * self.drift[sym]
             bars = session_5m_bars(days, start_p, self.drift[sym])

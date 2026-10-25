@@ -2,7 +2,8 @@
 # (MASSIVE_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), optionally via a .env file.
 
 [watchlist]
-# The 30 symbols passing the options screen on 2026-10-08 (dashboard /screen, `python -m mias screen`).
+# The 30 symbols passing the options screen on 2026-10-08 (dashboard /screen, `python -m mias screen`),
+# plus the 12 added on 2026-10-24.
 # /trend in Telegram works for any symbol, watched or not.
 symbols = [
   # Market and macro ETFs
@@ -13,6 +14,10 @@ symbols = [
   "AAPL", "MSFT", "GOOGL", "META", "AMZN", "NFLX", "ORCL", "NOW", "PLTR",
   # Other
   "TSLA", "MSTR", "HOOD", "BAC", "WMT",
+  # Added 2026-10-24
+  "SOXL", "ARM", "DELL", "IREN", "OKLO", "BE", "GS", "ASTS", "BMNR", "GLXY", "SOFI",
+  # Indexes (see [instruments.*])
+  "NDX", "SPX",
 ]
 market_symbols = ["SPY", "QQQ", "IWM"]
 
@@ -78,7 +83,44 @@ delta = 0.45
 max_spread_pct = 5
 min_oi = 200
 
+[instruments.NDX]
+# Nasdaq-100 index. The plan has real-time NDX options but no real-time index bars or snapshot, so:
+options_symbol = "I:NDX"   # options read (flow, P/C, IV, walls, contracts) from the NDX chain itself
+trend_symbol = "QQQ"       # trend from QQQ bars, which track NDX almost exactly
+close_symbol = "I:NDX"     # previous close from NDX daily bars; the live price comes from NDX option quotes
+chain_strike_pct = 0.06    # NDX chains are very large; +/-6% keeps each fetch to ~20 pages
+note = "trend from QQQ bars · price from NDX option quotes"
+
+[instruments.SPX]
+# S&P 500 index, like NDX: trend from SPY, price and options read from the SPX chain (SPX + SPXW).
+# The plan has no SPX index bars, so no close_symbol: the previous close is the last price seen the day before.
+options_symbol = "I:SPX"
+trend_symbol = "SPY"
+chain_strike_pct = 0.05    # SPX lists strikes every 5 points with daily expiries; +/-5% keeps fetches bounded
+note = "trend from SPY bars · price from SPX option quotes"
+
+[reports]
+# A full /trend-style report sent every N minutes while the market is open, aligned to 09:30.
+every_minutes = { NDX = 10, META = 10, MSFT = 10 }
+# Optional last day (inclusive) for a report; after it the report stops by itself.
+until = { META = "2026-10-13", MSFT = "2026-10-13" }
+# Unusual options activity across the watchlist (volume > open interest, >= unusual_min_premium, no same-day
+# expiries) every N minutes, marking contracts that are new or growing since the previous report. 0 = off.
+unusual_every_minutes = 5
+unusual_top = 10
+
+[picks]
+# Daily spread picks to Telegram: up to one bull call spread and one bear put spread (30-60 days,
+# ~0.50/0.25 delta, liquid strikes), or "no trade today" when nothing qualifies. Also: /picks in the bot.
+enabled = true
+time = "10:00"
+
 [alerts]
+# "strong_alignment": alert only when swing is STRONG UP, intraday is STRONG UP and options are BULLISH
+#   (or the bearish mirror), once confirmed; plus a message when that alignment ends.
+# "all": every rule (trend flips, options flips, blocks, IV spikes, wall breaks, market).
+mode = "strong_alignment"
+alignment_end_alert = true
 # A new trend or bias must hold for this many consecutive cycles before it is alerted.
 confirm_cycles = 2
 cooldown_minutes = 30

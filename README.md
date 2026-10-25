@@ -59,26 +59,41 @@ the confidence verdict, and their options flip alerts are suppressed.
 
 | Message | When |
 |---|---|
-| Symbol alert | Stock trend flips (bull / neutral / bear), options bias flips, stock and options become **aligned** or **diverge**, a ≥ $1M single-contract **block** prints, front **IV spikes** ≥ 3 points in 30 min, or the live price **breaks the call wall / put wall** |
-| Market alert | The SPY/QQQ/IWM composite trend changes |
-| Digest | 09:50, 11:30, 13:30, 15:30 ET: every symbol's price, stock score, options score, P/C, IV, plus top unusual contracts |
+| **Strong alignment** (default alert mode) | Swing **STRONG UP** + intraday **STRONG UP** + options **BULLISH**, or the bearish mirror. It must hold for 2 checks (5 min), with a 30-minute cooldown per symbol. The alert includes swing and day-trade contract picks. |
+| Alignment ended | When that state breaks (confirmed over 2 checks). Turn off with `alignment_end_alert = false`. |
+| **NDX report** | A full NDX reading every 10 minutes from 09:30 to 16:00, with the change since the previous report (`[reports]`) |
+| **Daily spread picks** | 10:00 ET (and `/picks` anytime): up to one bull call spread and one bear put spread. Rules: swing UP/STRONG UP (or DOWN), confidence MEDIUM+, options not against, 30–60 days, ~0.50/0.25 delta legs with OI ≥ 1,000. Includes a limit price, breakeven, take-profit (55% of max), a 10-trading-day time stop and a hard exit 7 days before expiry. "No trade today" when nothing qualifies. |
+| **Unusual activity** | Every 10 minutes (`[reports] unusual_every_minutes`): the top 10 contracts across the watchlist where today's volume exceeds open interest (≥ $500K premium, no same-day expiries, max 3 per symbol), with 🆕 new / ⬆️ growing markers, volume added since the previous report, and a bullish/bearish lean by last-trade side |
+| Digest | 09:50, 11:30, 13:30, 15:30 ET: every symbol's price, swing/intraday/options scores, IV, top unusual contracts |
 | Closing summary | At the close (handles early closes) |
 | System | Started; degraded after 3 bad cycles in a row; recovered |
 
-A flip must hold for 2 consecutive cycles (5 min) before it is sent, and each rule has a 30-minute cooldown per
-symbol, so choppy markets do not spam you. All thresholds are in `config.toml`.
+Set `[alerts] mode = "all"` to restore every rule: trend and options-bias flips, aligned/divergence, ≥ $1M blocks,
+IV spikes, call/put wall breaks and the SPY/QQQ/IWM market trend. Checkpoint `checkpoint-2026-10-12` is the last
+version where that was the default.
 
 Example:
 ```
-🔴 META  14:35 ET
-• Stock trend BULLISH → BEARISH (-38)
-• Stock and options ALIGNED BEARISH
+🟢 PLTR  14:35 ET
+• STRONG BULLISH ALIGNMENT: swing STRONG UP · intraday STRONG UP · options BULLISH
 
-Price 718.40 live (-2.7%)
-Stock: DOWN (-38)  5m -71 · 15m -55 · 1h -30 · 1d -12
-Options: BEARISH (-44)  net prem -$18.2M · P/C 1.31 · IV 41.2% · RR25 -3.1
-Levels: call wall 740 · put wall 700 · dealers short γ (moves can extend)
+Price 198.61 live (+2.31%)
+Swing: STRONG UP (+90)  1w +87 · 1d +99 · 1h +76
+Intraday: STRONG UP (+66)  ...
+Options: BULLISH (+31)  net prem +$4.2M · P/C 0.44 · IV 45.7%
+✅ Confidence HIGH: every timeframe UP and options bullish
+Swing call: ... · Day trade call: ...
 ```
+
+## NDX (and other index-style symbols)
+
+The plan has real-time NDX **options** but not real-time NDX index bars or snapshots. `[instruments.NDX]` therefore:
+- reads the trend from **QQQ** bars, which track NDX almost exactly (the scores don't depend on price level),
+- takes the **live price** from NDX option quotes (put-call parity) and the previous close from NDX daily bars,
+- builds the options read (flow, P/C, IV, skew, walls, contracts) from the **NDX chain** (`I:NDX`, ±6% strikes).
+
+NDX contracts are large (a 0.6-delta swing call is about $120,000), so treat NDX mainly as a market read; QQQ
+options are the practical way to trade it.
 
 ## How the scores work
 

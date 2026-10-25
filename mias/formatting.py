@@ -101,6 +101,12 @@ def symbol_alert(r: SymbolResult, reasons: list[tuple[str, str]], now: datetime,
     lv = levels_line(r)
     if lv:
         lines.append(lv)
+    if head_dir in ("bull", "bear") and any(text.startswith("STRONG") for _, text in reasons):
+        for line in (idea_line(r, "swing", head_dir, cfg, "Swing"), idea_line(r, "day", head_dir, cfg, "Day trade")):
+            if line:
+                lines.append(line)
+    if r.source_note:
+        lines.append(f"<i>{escape(r.source_note)}</i>")
     return "\n".join(lines)
 
 
@@ -126,7 +132,7 @@ def idea_line(r: SymbolResult, name: str, direction_: str, cfg, title: str) -> s
     if not i:
         return f"{title}: no liquid {kind} near Δ{t.delta:.2f} in {t.min_dte}–{t.max_dte} DTE"
     return (f"{title} {kind}: {i.expiry} {i.strike:g}{kind[0].upper()} ({i.dte}d) Δ{abs(i.delta):.2f} "
-            f"mid {i.mid:.2f} · spread {i.spread_pct:.1f}% · OI {i.oi:,.0f} · vol {i.volume:,.0f}")
+            f"mid {i.mid:.2f} (≈${100 * i.mid:,.0f}) · spread {i.spread_pct:.1f}% · OI {i.oi:,.0f} · vol {i.volume:,.0f}")
 
 
 def day_section(r: SymbolResult, cfg) -> list[str]:
@@ -156,7 +162,7 @@ def trend_reply(r: SymbolResult, cfg, now: datetime, watched: bool, market_open:
     day = day_section(r, cfg)
     if day:
         lines += ["", *day]
-    notes = []
+    notes = [r.source_note] if r.source_note else []
     if not market_open:
         notes.append("market closed: last session data")
     if not watched:
@@ -167,6 +173,15 @@ def trend_reply(r: SymbolResult, cfg, now: datetime, watched: bool, market_open:
         notes.append("partial: " + "; ".join(r.errors)[:150])
     lines.append("<i>" + escape(" · ".join(notes)) + "</i>" if notes else "")
     return "\n".join(l for l in lines if l is not None).rstrip()
+
+
+def scheduled_report(r: SymbolResult, cfg, now: datetime, minutes: int, prev_price: float | None) -> str:
+    """Periodic full read of one symbol (e.g. NDX every 10 minutes)."""
+    head = f"⏱ <b>{escape(r.symbol)}</b> {minutes}-min report"
+    if prev_price and r.price:
+        d = r.price - prev_price
+        head += f" · {d:+,.2f} ({100 * d / prev_price:+.2f}%) since last"
+    return head + "\n" + trend_reply(r, cfg, now, watched=True, market_open=True)
 
 
 def market_alert(old: str, new: str, stock: float, opts: float | None, symbols: list[str], now: datetime) -> str:
@@ -202,10 +217,100 @@ def digest(results: list[SymbolResult], market: tuple[str, float, float | None] 
         lines.append("<b>Unusual (vol &gt; OI)</b>")
         for sym, p in unusual[:8]:
             lines.append(escape(f"{sym} {p.expiry} {p.strike:g}{p.kind[0].upper()} vol {p.volume:,.0f} "
-                                f"vs OI {p.oi:,.0f} · {money(p.premium)} · last at {p.side}"))
+                                f"vs OI {p.oi:,.0f} · {money(p.premium).lstrip('+')} · last at {p.side}"))
     errors = [r.symbol for r in results if r.errors]
     if errors:
         lines.append(f"⚠️ partial data: {', '.join(errors)}")
     if stock_delay_minutes:
         lines.append(f"<i>Stock bars {stock_delay_minutes}m delayed; prices marked live come from options quotes.</i>")
     return "\n".join(lines)
+
+
+def _spread_block(s, now: datetime) -> list[str]:
+    from .picks import HARD_EXIT_DAYS, TAKE_PROFIT, TIME_STOP_DAYS, add_trading_days
+    from datetime import timedelta
+    k = "C" if s.side == "call" else "P"
+    move = 100 * (s.breakeven / s.price - 1)
+    full = 100 * (s.short_strike / s.price - 1)
+    target = s.cost + TAKE_PROFIT * s.max_profit
+    sign = 1 if s.side == "call" else -1          # Spread stores scores signed toward the trade
+    if s.options is None:
+        opt = "options –"
+    else:
+        note = "with the trade" if s.options >= 25 else "mildly against" if s.options <= -10 else "neutral"
+        opt = f"options {sign * s.options:+.0f} ({note})"
+    return [
+        f"<b>{escape(s.symbol)}</b> ${s.price:,.2f} · tier {s.tier} · confidence {s.confidence}",
+        f"Swing {sign * s.swing:+.0f} · intraday {sign * s.intraday:+.0f} · {opt}",
+        f"Buy {s.expiry:%m/%d} {s.long_strike:g}{k} / Sell {s.expiry:%m/%d} {s.short_strike:g}{k} ({s.dte}d)",
+        f"Limit <b>{s.cost:.2f}</b> debit (≈${100 * s.cost:,.0f}), natural {s.natural[0]:.2f}–{s.natural[1]:.2f}",
+        f"Max profit ${100 * s.max_profit:,.0f} ({s.max_profit / s.cost:.1f}×) · breakeven {s.breakeven:,.2f} "
+        f"({move:+.1f}%) · full at {s.short_strike:g} ({full:+.1f}%)",
+        f"OI {s.long_oi:,.0f} / {s.short_oi:,.0f}",
+        f"Exit: take profit at ≈{target:.2f} · time stop {add_trading_days(now.date(), TIME_STOP_DAYS):%a %b %d} "
+        f"· hard exit {s.expiry - timedelta(days=HARD_EXIT_DAYS):%a %b %d}",
+    ]
+
+
+def picks_message(p: dict, now: datetime) -> str:
+    lines = [f"🎯 <b>Daily spread picks</b>  {now:%a %b %d %H:%M} ET"]
+    for side, icon, title, word in (("call", "🟢", "CALL SPREAD (bullish)", "uptrend"),
+                                    ("put", "🔴", "PUT SPREAD (bearish)", "downtrend")):
+        lines += ["", f"{icon} <b>{title}</b>"]
+        s = p.get(side)
+        if s:
+            lines += _spread_block(s, now)
+        else:
+            near = p.get(f"{side}_near")
+            hint = ""
+            if near and near.stock:
+                sc = near.stock.score
+                hint = f" Closest: {escape(near.symbol)} (swing {sc:+.0f})."
+            lines.append(f"No trade today: nothing qualifies (needs a confirmed {word}, options not against it, "
+                         f"liquid strikes).{hint}")
+    lines += ["", "<i>Up to one of each per day. Skip if you're at your open-position limit.</i>"]
+    return "\n".join(lines)
+
+
+def _flow_side(p) -> str:
+    if p.side == "mid":
+        return "neutral"
+    return "bull" if (p.side == "buy") == (p.kind == "call") else "bear"
+
+
+def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, float] | None, top: int,
+                   per_symbol: int = 3) -> tuple[str | None, dict[str, float]]:
+    """Unusual contracts across symbols, ranked by premium. Returns (text or None if empty, volumes for next time).
+
+    prev holds each contract's volume at the previous report; contracts not in it are marked new."""
+    rows = [(r.symbol, p) for r in results if r.options for p in r.options.unusual[:per_symbol]]
+    rows.sort(key=lambda sp: -sp[1].premium)
+    rows = rows[:top]
+    volumes = {p.ticker: p.volume for _, p in rows}
+    if not rows:
+        return None, volumes
+    lines = [f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET",
+             "<i>volume &gt; open interest · ≥ $500K premium · ranked by premium today</i>"]
+    new = grew = 0
+    bull = bear = 0.0
+    for sym, p in rows:
+        side = _flow_side(p)
+        bull += p.premium if side == "bull" else 0
+        bear += p.premium if side == "bear" else 0
+        tag = ""
+        if prev is not None:
+            if p.ticker not in prev:
+                tag, new = "🆕 ", new + 1
+            elif p.volume > prev[p.ticker]:
+                tag, grew = "⬆️ ", grew + 1
+        added = ""
+        if prev is not None and p.ticker in prev and p.volume > prev[p.ticker]:
+            added = f" · +{p.volume - prev[p.ticker]:,.0f} since last"
+        icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}[side]
+        lines.append(escape(f"{tag}{icon} {sym} {p.expiry[5:].replace('-', '/')} {p.strike:g}{p.kind[0].upper()} · "
+                            f"vol {p.volume:,.0f} vs OI {p.oi:,.0f} · {money(p.premium).lstrip('+')} · last at {p.side}{added}"))
+    summary = f"Lean (by last trade): bullish {money(bull).lstrip('+')} · bearish {money(bear).lstrip('+')}"
+    if prev is not None:
+        summary += f" · {new} new, {grew} growing"
+    lines += ["", escape(summary)]
+    return "\n".join(lines), volumes

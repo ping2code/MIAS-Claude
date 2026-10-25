@@ -120,6 +120,15 @@ class MassiveClient:
                     out[item["ticker"]] = item
         return out
 
+    async def underlying_value(self, symbol: str) -> float | None:
+        """The underlying's (delayed) value as carried on its option chain snapshot, e.g. for I:SPX."""
+        data = await self.get(f"/v3/snapshot/options/{symbol}", {"limit": 1})
+        for item in data.get("results") or []:
+            value = (item.get("underlying_asset") or {}).get("value")
+            if value:
+                return float(value)
+        return None
+
     async def option_chain(self, symbol: str, *, spot: float, today: date, max_dte: int, strike_pct: float,
                            max_pages: int) -> tuple[list[dict], bool]:
         from datetime import timedelta

@@ -26,6 +26,9 @@ class Store:
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(alerts)")}
+        if "sent_to" not in cols:     # added for multi-chat delivery
+            self.db.execute("ALTER TABLE alerts ADD COLUMN sent_to TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -65,14 +68,15 @@ class Store:
 
     def pending(self, max_age_s: float = 3600, max_attempts: int = 20) -> list[tuple[int, str, str]]:
         return self.db.execute(
-            "SELECT id, rule, text FROM alerts WHERE delivered IS NULL AND ts>=? AND attempts<? ORDER BY id",
+            "SELECT id, rule, text, sent_to FROM alerts WHERE delivered IS NULL AND ts>=? AND attempts<? ORDER BY id",
             (time.time() - max_age_s, max_attempts)).fetchall()
 
     def mark_delivered(self, alert_id: int) -> None:
         self.db.execute("UPDATE alerts SET delivered=?, attempts=attempts+1 WHERE id=?", (time.time(), alert_id))
 
-    def mark_failed(self, alert_id: int, error: str) -> None:
-        self.db.execute("UPDATE alerts SET attempts=attempts+1, last_error=? WHERE id=?", (error[:300], alert_id))
+    def mark_failed(self, alert_id: int, error: str, sent_to: str | None = None) -> None:
+        self.db.execute("UPDATE alerts SET attempts=attempts+1, last_error=?, sent_to=COALESCE(?, sent_to) WHERE id=?",
+                        (error[:300], sent_to, alert_id))
 
     def recent_alerts(self, limit: int = 50) -> list[dict]:
         rows = self.db.execute("SELECT ts, symbol, rule, text, delivered FROM alerts ORDER BY id DESC LIMIT ?",

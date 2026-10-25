@@ -93,6 +93,9 @@ class Engine:
     # ---- per symbol -------------------------------------------------------------------------
 
     async def _symbol(self, sym: str, snap: dict, now: datetime, today: date, dry_run: bool) -> SymbolResult:
+        inst = self.cfg.instruments.get(sym)
+        if inst:
+            return await self._instrument(sym, inst, now, today, dry_run)
         r = SymbolResult(sym, errors=[])
         session = snap.get("session") or {}
         r.stock_price = _num(session.get("price")) or _num(session.get("close"))
@@ -121,6 +124,62 @@ class Engine:
             r.errors.append("no reference price")
         return r
 
+    async def _instrument(self, sym: str, inst, now: datetime, today: date, dry_run: bool) -> SymbolResult:
+        """Index-style symbol: trend from a proxy's bars, price and options read from its own option chain."""
+        r = SymbolResult(sym, errors=[], source_note=inst.note or None)
+        try:
+            trend = await self._stock(inst.trend_symbol, now, today)
+            r.stock = trend if trend.timeframes else None
+        except Exception as exc:
+            r.errors.append(f"trend ({inst.trend_symbol}): {exc}")
+            log.warning("%s trend via %s failed: %s", sym, inst.trend_symbol, exc)
+        if inst.close_symbol:
+            try:
+                r.prev_close = await self._prev_close(inst.close_symbol, today)
+            except Exception as exc:
+                log.warning("%s previous close failed: %s", sym, exc)
+        last = self.store.get(f"spot:{sym}")
+        last_day = datetime.fromtimestamp(last["ts"], self.cfg.tz).date() if last else None
+        # Without index bars (e.g. SPX) the previous close is the last price seen on an earlier day.
+        prev_seen = (last.get("prev") if last_day == today else last["price"]) if last else None
+        r.prev_close = r.prev_close or prev_seen
+        ref = last["price"] if last and now.timestamp() - last.get("ts", 0) < 5 * 86400 else r.prev_close
+        if not ref:
+            try:
+                ref = await self.client.underlying_value(inst.options_symbol)
+            except Exception as exc:
+                log.warning("%s underlying value failed: %s", sym, exc)
+        if not ref:
+            r.errors.append("no reference price")
+            return r
+        r.stock_price = ref          # only a reference for the chain window; the live price comes from the chain
+        try:
+            await self._options(r, now, today, dry_run, chain_symbol=inst.options_symbol,
+                                strike_pct=inst.chain_strike_pct)
+        except Exception as exc:
+            r.errors.append(f"options: {exc}")
+            log.warning("%s options failed: %s", sym, exc)
+        if r.options and r.options.implied_spot:
+            r.live_price = r.stock_price = r.options.implied_spot
+            if not dry_run:
+                self.store.put(f"spot:{sym}", {"ts": now.timestamp(), "price": r.live_price, "prev": prev_seen})
+        else:
+            r.live_price = None
+            r.errors.append("no live price from option quotes")
+        return r
+
+    async def _prev_close(self, symbol: str, today: date) -> float | None:
+        cached = self._daily.get(f"close:{symbol}")
+        if cached and cached[0] == today:
+            return cached[1]
+        bars = await self.client.aggregates(symbol, 1, "day", today - timedelta(days=10), today - timedelta(days=1))
+        # Index feeds can carry a weekend bar; the previous close is the last weekday session before today.
+        closes = [b["c"] for b in bars
+                  if (d := datetime.fromtimestamp(b["t"] / 1000, self.cfg.tz).date()) < today and d.weekday() < 5]
+        value = closes[-1] if closes else None
+        self._daily[f"close:{symbol}"] = (today, value)
+        return value
+
     async def _stock(self, sym: str, now: datetime, today: date):
         cfg = self.cfg
         hist = self._hist5.get(sym)
@@ -145,11 +204,12 @@ class Engine:
                            profiles=cfg.trend_profiles, primary=cfg.trend_primary,
                            strong=cfg.trend_strong, bias=cfg.trend_bias)
 
-    async def _options(self, r: SymbolResult, now: datetime, today: date, dry_run: bool) -> None:
+    async def _options(self, r: SymbolResult, now: datetime, today: date, dry_run: bool, *,
+                       chain_symbol: str | None = None, strike_pct: float | None = None) -> None:
         cfg, sym = self.cfg, r.symbol
         chain, truncated = await self.client.option_chain(
-            sym, spot=r.stock_price, today=today, max_dte=cfg.chain_max_dte,
-            strike_pct=cfg.chain_strike_pct, max_pages=cfg.max_chain_pages)
+            chain_symbol or sym, spot=r.stock_price, today=today, max_dte=cfg.chain_max_dte,
+            strike_pct=strike_pct or cfg.chain_strike_pct, max_pages=cfg.max_chain_pages)
         r.chain_truncated = truncated
         if truncated:
             r.errors.append("options chain truncated")
@@ -212,7 +272,10 @@ class Engine:
                 if iv is not None and hts < ts:
                     iv_hist.append((hts, iv))
             try:
-                reasons = signals.evaluate(r, state, cfg, ts, iv_hist)
+                if cfg.alert_mode == "strong_alignment":
+                    reasons = signals.evaluate_strong(r, state, cfg, ts)
+                else:
+                    reasons = signals.evaluate(r, state, cfg, ts, iv_hist)
             except Exception:
                 log.exception("%s: alert evaluation failed", r.symbol)
                 continue
@@ -222,7 +285,7 @@ class Engine:
                 self.store.enqueue(",".join(sorted({x.rule for x in reasons})), text, r.symbol)
 
         mc = signals.market_composite(results, cfg.market_symbols)
-        if mc:
+        if mc and cfg.alert_mode == "all":
             stock, opts = mc
             new = label_for(stock, cfg.trend_strong, cfg.trend_bias)
             mstate = self.store.get("state:__market__", {})

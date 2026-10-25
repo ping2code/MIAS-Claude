@@ -1,5 +1,8 @@
 """Alert rules. Edge-triggered with confirmation and cooldowns, state persisted across restarts.
 
+Mode "strong_alignment" (default) alerts only on full agreement, see `evaluate_strong`.
+Mode "all" uses `evaluate`:
+
 Per symbol, one message per cycle combines every reason that fired:
   trend_change    composite stock trend class changed (bull / neutral / bear), confirmed N cycles
   options_flip    options bias class changed, confirmed N cycles
@@ -138,3 +141,38 @@ def market_composite(results: list[SymbolResult], symbols: list[str]) -> tuple[f
     stock = round(sum(r.stock.score for r in rs) / len(rs), 1)
     ob = [r.bias.score for r in rs if r.bias and r.bias.components]
     return stock, (round(sum(ob) / len(ob), 1) if ob else None)
+
+
+def strong_side(r: SymbolResult) -> str:
+    """bull: swing STRONG UP + intraday STRONG UP + options bullish; bear: the mirror; none otherwise."""
+    if not r.stock or not r.bias or not r.bias.components or (r.options and r.options.thin):
+        return "none"
+    swing = r.stock.composites.get("swing", (r.stock.score, r.stock.label))[1]
+    intra = r.stock.composites.get("intraday", (None, ""))[1]
+    opt = direction(r.bias.label)
+    if swing == "strong_up" and intra == "strong_up" and opt == "bull":
+        return "bull"
+    if swing == "strong_down" and intra == "strong_down" and opt == "bear":
+        return "bear"
+    return "none"
+
+
+def evaluate_strong(r: SymbolResult, state: dict, cfg: Config, now: float) -> list[Reason]:
+    """Alert when a symbol enters full strong alignment (confirmed), and optionally when it leaves it."""
+    # Start from "none" so an alignment already in place when this mode is switched on still gets alerted.
+    change = _confirm(state.setdefault("strong", {"cls": "none", "pending": None, "count": 0}),
+                      strong_side(r), cfg.confirm_cycles)
+    if not change:
+        return []
+    old, new = change
+    if new != "none":
+        if not _cooled(state, f"strong_{new}", now, cfg.cooldown_minutes):
+            return []
+        word = "BULLISH" if new == "bull" else "BEARISH"
+        tf = "UP" if new == "bull" else "DOWN"
+        return [Reason("strong_alignment", new,
+                       f"STRONG {word} ALIGNMENT: swing STRONG {tf} · intraday STRONG {tf} · options {word}")]
+    if cfg.alignment_end_alert:
+        word = "BULLISH" if old == "bull" else "BEARISH"
+        return [Reason("alignment_ended", "neutral", f"Strong {word.lower()} alignment ENDED")]
+    return []

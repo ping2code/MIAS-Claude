@@ -1,4 +1,9 @@
-"""Telegram commands via long polling. Only the configured chat is served; every other chat is ignored.
+"""Telegram commands via long polling.
+
+Served: messages from allow-listed users (TELEGRAM_ALLOWED_USERS) in any chat, and any member of an
+allow-listed chat such as the private group (TELEGRAM_ALLOWED_CHATS). Everyone else is ignored, except
+/whoami, which only tells people their own IDs so they can be added. Replies go to the chat that asked.
+In groups the bot reacts to /commands only, so normal conversation never triggers it.
 
   /trend NVDA [MU ...]   fresh trend + options read + confidence (also: /t NVDA, or just send "NVDA")
   /market                SPY / QQQ / IWM and watchlist breadth
@@ -9,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 from datetime import datetime, timezone
@@ -22,20 +28,29 @@ from .verdict import verdict
 
 log = logging.getLogger(__name__)
 
+# The chat currently being answered; set per incoming message so concurrent replies never cross chats.
+_reply_chat: contextvars.ContextVar[str | None] = contextvars.ContextVar("reply_chat", default=None)
+GROUP_TYPES = ("group", "supergroup")
+KNOWN = {"trend", "t", "market", "picks", "list", "status", "help", "start", "whoami"}
+
 TICKER = re.compile(r"^\$?([A-Z]{1,5}(?:\.[A-Z])?)$")
 MAX_SYMBOLS = 5
 COMMANDS = [
     ("trend", "Trend, options and confidence for symbols, e.g. /trend NVDA MU"),
     ("market", "Overall market: SPY, QQQ, IWM and breadth"),
+    ("picks", "Today's call and put spread picks"),
     ("list", "Watched symbols"),
     ("status", "Service health"),
     ("help", "How to use this bot"),
+    ("whoami", "Your Telegram user and chat IDs"),
 ]
 HELP = """<b>MIAS bot</b>
 /trend NVDA: trend, options read and confidence (up to 5: /trend NVDA MU AMD)
 Shortcut: just send <code>NVDA</code> or <code>nvda mu</code>
 /market: SPY, QQQ, IWM and watchlist breadth
-/list: watched symbols · /status: health
+/picks: today's call and put spread picks (also sent automatically at 10:00 ET)
+/list: watched symbols · /status: health · /whoami: your IDs
+In the group, use commands: <code>/trend NVDA</code> or <code>/t nvda mu</code>
 
 <b>Reading the answer</b>
 Swing = 1w/1d/1h trend (holding weeks). Intraday = 5m–1h.
@@ -65,7 +80,8 @@ class CommandBot:
         self.svc = service
         cfg = service.cfg
         self._base = f"https://api.telegram.org/bot{cfg.telegram_token}/"
-        self._chat = str(cfg.telegram_chat_id)
+        self._users = set(cfg.telegram_allowed_users)
+        self._chats = set(cfg.telegram_allowed_chats)
         self._http = httpx.AsyncClient(timeout=httpx.Timeout(70, connect=10))
         self._sem = asyncio.Semaphore(3)
         self._tasks: set[asyncio.Task] = set()
@@ -110,12 +126,29 @@ class CommandBot:
         except httpx.HTTPError:
             pass
 
+    def authorized(self, user: str, chat: str) -> bool:
+        return user in self._users or chat in self._chats
+
     async def _handle(self, msg: dict) -> None:
-        chat = str((msg.get("chat") or {}).get("id", ""))
-        if chat != self._chat:
-            log.warning("ignoring message from unauthorized chat %s", chat)
+        chat_info = msg.get("chat") or {}
+        chat = str(chat_info.get("id", ""))
+        user = str((msg.get("from") or {}).get("id", ""))
+        text = msg.get("text") or ""
+        in_group = chat_info.get("type") in GROUP_TYPES
+        if in_group and not text.startswith("/"):
+            return                                   # ordinary group conversation
+        cmd, args = parse(text)
+        _reply_chat.set(chat)
+        if cmd == "whoami":
+            ok = self.authorized(user, chat)
+            await self.reply(f"Your user ID: <code>{escape(user)}</code>\nThis chat ID: <code>{escape(chat)}</code>\n"
+                             f"Access: {'✅ allowed' if ok else '⛔ not allowed yet'}")
             return
-        cmd, args = parse(msg.get("text", ""))
+        if not self.authorized(user, chat):
+            log.warning("ignoring message from unauthorized user %s in chat %s", user, chat)
+            return
+        if in_group and cmd not in KNOWN:
+            return                                   # someone else's command, or a typo: stay quiet
         try:
             await self.dispatch(cmd, args)
         except Exception:
@@ -133,6 +166,11 @@ class CommandBot:
             await asyncio.gather(*(self._trend(s) for s in dict.fromkeys(syms[:MAX_SYMBOLS])))
         elif cmd == "market":
             await self.reply(await self.market_text())
+        elif cmd == "picks":
+            if not self.svc.engine.last_results:
+                await self.reply("No market data yet: picks need a completed check (market hours).")
+                return
+            await self.reply(await self.svc.picks_text(datetime.now(timezone.utc)))
         elif cmd == "list":
             await self.reply("Watching: " + ", ".join(self.svc.cfg.symbols))
         elif cmd == "status":
@@ -188,4 +226,4 @@ class CommandBot:
 
     async def reply(self, html: str) -> None:
         if self.svc.telegram:
-            await self.svc.telegram.send(html)
+            await self.svc.telegram.send(html, _reply_chat.get())
