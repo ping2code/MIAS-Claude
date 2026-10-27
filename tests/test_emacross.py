@@ -183,3 +183,78 @@ def test_daytrade_config_parses():
     assert rules.symbols == ("SPY", "QQQ") and rules.stop == 0.25 and rules.trail == ((0.5, 0.25),)
     with pytest.raises(config_mod.ConfigError):
         config_mod._daytrade({"stopp": 0.2})
+
+
+def test_paper_fills_at_bid_and_ask_with_mid_alongside():
+    tr = _trade(2.04)                        # bought at the ask
+    tr.entry_mid = 2.00
+    tr.bid = 2.58                            # mid reaches the +30% target (2.65) but the bid is lower
+    tr.on_price(1, 2.65, 2.65, 2.65, 2.65, RULES)
+    assert tr.partial_done and tr.open_qty == 2
+    assert tr.pnl == pytest.approx((2.58 - 2.04) * 3 * 100)
+    assert tr.pnl_mid == pytest.approx((2.65 - 2.00) * 3 * 100)
+    tr.bid = 1.90
+    tr.on_price(2, 1.95, 1.95, 1.95, 1.95, RULES)      # runners stop at breakeven (2.04): sold at the bid
+    assert tr.closed and tr.exit_reason == "breakeven"
+    assert tr.pnl == pytest.approx((2.58 - 2.04) * 300 + (1.90 - 2.04) * 200)
+    assert tr.mfe_pct == pytest.approx(100 * (2.65 / 2.04 - 1), abs=0.1) and tr.peak_t == 1
+    assert tr.mae_pct == pytest.approx(100 * (1.95 / 2.04 - 1), abs=0.1) and tr.low_t == 2
+
+
+def test_live_entry_records_why_how_and_trend(cfg, tmp_path):
+    from types import SimpleNamespace as NS
+    bars, i = _bars_with_bull_setup()
+    store = Store(tmp_path / "rec.db")
+    client = FakeClient()
+    client.spot = bars[i].c
+    at = datetime.fromtimestamp((bars[i].t + E.FIVE) / 1000 + 45, timezone.utc)
+    r = NS(stock=NS(score=-40.0, composites={"intraday": (-20.0, "")}))
+    asyncio.run(E.live(client, store, cfg, at, {"SPY": bars}, {"SPY": r}))
+    tr = E.Trade(**store.get(E.KEY)["open"]["SPY"])
+    assert tr.entry == 2.02 and tr.entry_mid == 2.0                    # ask, mid
+    info = tr.info
+    assert info["confirmed_close"] and info["fill_delay_s"] == 45 and "pullback" in info["reason"]
+    assert info["with_swing"] == "against" and info["swing"] == -40 and info["entry_spread_pct"] == 2.0
+    assert info["chart_stop_pct"] > 0
+    text = store.pending()[-1][2]
+    assert "AGAINST the swing trend" in text and "ask (mid 2.00" in text
+    # Closing it logs the full record.
+    client.mid = 1.5
+    asyncio.run(E.manage(client, store, cfg, at + timedelta(minutes=1), {"SPY": bars}))
+    log = store.get(E.LOG_KEY)
+    assert log[-1]["exit_reason"] == "stop" and log[-1]["with_swing"] == "against" and "mae_pct" in log[-1]
+    assert "worst" in store.pending()[-1][2]
+
+
+def test_swing_filter_skips_entries_against_the_trend(cfg, tmp_path):
+    import dataclasses
+    from types import SimpleNamespace as NS
+    cfg = dataclasses.replace(cfg, daytrade=dataclasses.replace(cfg.daytrade, swing_filter=True))
+    bars, i = _bars_with_bull_setup()
+    store = Store(tmp_path / "f.db")
+    client = FakeClient()
+    at = datetime.fromtimestamp((bars[i].t + E.FIVE) / 1000 + 45, timezone.utc)
+    r = NS(stock=NS(score=-40.0, composites={"intraday": (-20.0, "")}))
+    assert asyncio.run(E.live(client, store, cfg, at, {"SPY": bars}, {"SPY": r})) == 0
+    assert store.get(E.KEY)["skipped"] == {"against the swing trend": 1}
+
+
+def test_watcher_reprices_open_trades_between_cycles(cfg, tmp_path):
+    from mias.app import Service
+    bars, i = _bars_with_bull_setup()
+    svc = Service(cfg)
+    svc.store = Store(tmp_path / "w.db")
+    svc.engine.store = svc.store
+    client = FakeClient()
+    client.spot = bars[i].c
+    at = datetime.fromtimestamp((bars[i].t + E.FIVE) / 1000 + 30, timezone.utc)
+    asyncio.run(E.live(client, svc.store, cfg, at, {"SPY": bars}))
+
+    async def aggregates(*a, **k):
+        return []
+    client.aggregates = aggregates
+    svc.client = client
+    svc.market_state = "open"
+    client.mid = 1.0
+    sent = asyncio.run(svc.watch_once(at + timedelta(seconds=30)))
+    assert sent == 1 and svc.store.get(E.KEY)["closed"][-1]["exit_reason"] == "stop"

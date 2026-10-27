@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import emacross, formatting, positions, sectors, signals
+from . import emacross, events, formatting, positions, scorecard, sectors, signals
 from .config import Config
 from .massive import MassiveClient
 from .models import SymbolResult
@@ -18,6 +18,8 @@ from .trend import direction, label_for, stock_trend
 
 log = logging.getLogger(__name__)
 
+# Directional alerts logged on the scorecard (tier 1 and the directional tier-2 changes).
+SCORED = ("pullback_entry", "strong_alignment", "trend_change", "options_flip", "wall_break")
 # A volume baseline older than this is discarded rather than turned into one oversized flow window.
 MAX_BASELINE_AGE_S = 15 * 60
 
@@ -35,6 +37,8 @@ class Engine:
         self.last_cycle: dict = {}
         self.swing_changes: dict[str, tuple[str, str, float]] = {}
         self.five: dict[str, list] = {}       # day-trade symbols: regular-session 5-minute bars (emacross)
+        self.today5: dict[str, list[dict]] = {}   # today's raw 5-minute bars per symbol (morning brief)
+        self._ivhist: dict | None = None             # IV history, read once per cycle (mias/events.py)
 
     # ---- public -----------------------------------------------------------------------------
 
@@ -42,6 +46,7 @@ class Engine:
         now = now or datetime.now(timezone.utc)
         t0, req0 = time.monotonic(), self.client.requests
         today = now.astimezone(self.cfg.tz).date()
+        self._ivhist = self.store.get("ivhist") or {}
 
         try:
             snaps = await self.client.snapshots(self.cfg.symbols)
@@ -55,6 +60,9 @@ class Engine:
 
         if not dry_run:
             ts = now.timestamp()
+            if self.store.get("ivhist") is None:
+                events.backfill_iv(self.store, self.cfg.tz)
+            events.record_iv(self.store, results, today)
             self.store.add_metrics(ts, today.isoformat(), {r.symbol: r.to_dict() for r in results if r.ok})
             self._evaluate(results, now)
             try:
@@ -63,9 +71,14 @@ class Engine:
                 log.exception("position check failed")
             if self.cfg.daytrade.enabled:
                 try:
-                    await emacross.live(self.client, self.store, self.cfg, now, self.five)
+                    await emacross.live(self.client, self.store, self.cfg, now, self.five,
+                                        {r.symbol: r for r in results})
                 except Exception:
                     log.exception("EMA day-trade check failed")
+            try:
+                await scorecard.update(self.client, self.store, self.cfg.tz, now)
+            except Exception:
+                log.exception("scorecard update failed")
             if self.dispatcher:
                 await self.dispatcher.flush()
 
@@ -133,7 +146,15 @@ class Engine:
                 log.warning("%s options failed: %s", sym, exc)
         else:
             r.errors.append("no reference price")
+        self._events(r, today)
         return r
+
+    def _events(self, r: SymbolResult, today: date) -> None:
+        try:
+            hist = self._ivhist if self._ivhist is not None else (self.store.get("ivhist") or {})
+            r.events = events.context(r, hist, self.cfg.tz, today, (self._daily.get(r.symbol) or (None, []))[1])
+        except Exception as exc:
+            log.warning("%s event context failed: %s", r.symbol, exc)
 
     async def _instrument(self, sym: str, inst, now: datetime, today: date, dry_run: bool) -> SymbolResult:
         """Index-style symbol: trend from a proxy's bars, price and options read from its own option chain."""
@@ -177,6 +198,7 @@ class Engine:
         else:
             r.live_price = None
             r.errors.append("no live price from option quotes")
+        self._events(r, today)
         return r
 
     async def _prev_close(self, symbol: str, today: date) -> float | None:
@@ -204,6 +226,7 @@ class Engine:
             daily = (today, raw)
             self._daily[sym] = daily
         today5 = await self.client.aggregates(sym, 5, "minute", today, today)
+        self.today5[sym] = today5
 
         available_until = int((now.timestamp() - cfg.stock_delay_minutes * 60) * 1000)
         five = hist[1] + today5
@@ -313,6 +336,8 @@ class Engine:
                         later, reasons = reasons + later, []     # just alerted this symbol: batch it instead
                     events += [{"symbol": r.symbol, "rule": x.rule, "dir": x.direction, "text": x.text}
                                for x in later]
+                    for x in [x for x in reasons + later if x.rule in SCORED]:
+                        self._score(r, x.rule, x.direction, ts)
                     for x in later:
                         if x.rule == "trend_change":
                             self.swing_changes[r.symbol] = (old_swing, state["swing"]["cls"], r.stock.score)
@@ -357,6 +382,20 @@ class Engine:
                 self.store.enqueue("market", formatting.market_alert(
                     old_label, new, stock, opts, [s for s in cfg.market_symbols if s in cfg.symbols], local))
             self.store.put("state:__market__", mstate)
+
+    def _score(self, r: SymbolResult, rule: str, direction_: str, ts: float) -> None:
+        """Log a directional alert on the scorecard, with the swing contract it would suggest."""
+        contract = premium = None
+        if direction_ in ("bull", "bear") and r.options and r.symbol not in self.cfg.instruments:
+            kind = "call" if direction_ == "bull" else "put"
+            idea = r.options.ideas.get("swing", {}).get(kind)
+            if idea:
+                contract = positions.option_ticker(r.symbol, date.fromisoformat(idea.expiry), kind, idea.strike)
+                premium = idea.mid
+        try:
+            scorecard.record(self.store, ts, r.symbol, rule, direction_, r.price, contract, premium)
+        except Exception:
+            log.exception("%s: scorecard record failed", r.symbol)
 
     def digest_text(self, title: str, now: datetime) -> str:
         return formatting.digest(self.last_results, self.last_market, title, now.astimezone(self.cfg.tz),

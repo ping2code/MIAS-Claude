@@ -119,8 +119,12 @@ def iv_line(r: SymbolResult) -> str | None:
     if not s or not s.hv20:
         return f"IV {o.atm_iv_month:.0f}% (30-day ATM)"
     ratio = o.atm_iv_month / s.hv20
-    word = "cheap" if ratio < 0.9 else "fair" if ratio <= 1.25 else "expensive"
-    return (f"IV {o.atm_iv_month:.1f}% vs 20d realized {s.hv20:.1f}% ({ratio:.2f}×) → options <b>{word}</b>")
+    state = (r.events or {}).get("iv_state")
+    word = {"cheap": "cheap", "fair": "fair", "rich": "expensive"}.get(state) or \
+        ("cheap" if ratio < 0.9 else "fair" if ratio <= 1.25 else "expensive")
+    pct = (r.events or {}).get("iv_pct")
+    rank = f" · {pct:.0f}th percentile of its last {r.events['iv_days']} days" if pct is not None else ""
+    return (f"IV {o.atm_iv_month:.1f}% vs 20d realized {s.hv20:.1f}% ({ratio:.2f}×){rank} → options <b>{word}</b>")
 
 
 def idea_line(r: SymbolResult, name: str, direction_: str, cfg, title: str) -> str | None:
@@ -133,8 +137,13 @@ def idea_line(r: SymbolResult, name: str, direction_: str, cfg, title: str) -> s
     i = r.options.ideas.get(name, {}).get(kind)
     if not i:
         return f"{title}: no liquid {kind} near Δ{t.delta:.2f} in {t.min_dte}–{t.max_dte} DTE"
-    return (f"{title} {kind}: {i.expiry} {i.strike:g}{kind[0].upper()} ({i.dte}d) Δ{abs(i.delta):.2f} "
+    line = (f"{title} {kind}: {i.expiry} {i.strike:g}{kind[0].upper()} ({i.dte}d) Δ{abs(i.delta):.2f} "
             f"mid {i.mid:.2f} (≈${100 * i.mid:,.0f}) · spread {i.spread_pct:.1f}% · OI {i.oi:,.0f} · vol {i.volume:,.0f}")
+    if name == "swing" and r.events:
+        from datetime import date as _date
+        from .events import advice
+        line = "\n".join([line, *(escape(a) for a in advice(i, r.events, _date.today()))])
+    return line
 
 
 def day_section(r: SymbolResult, cfg) -> list[str]:
@@ -253,6 +262,7 @@ def _spread_block(s, now: datetime) -> list[str]:
         f"OI {s.long_oi:,.0f} / {s.short_oi:,.0f}",
         f"Exit: take profit at ≈{target:.2f} · time stop {add_trading_days(now.date(), TIME_STOP_DAYS):%a %b %d} "
         f"· hard exit {s.expiry - timedelta(days=HARD_EXIT_DAYS):%a %b %d}",
+        *(escape(w) for w in getattr(s, "warnings", ())),
     ]
 
 
@@ -282,48 +292,118 @@ def _flow_side(p) -> str:
     return "bull" if (p.side == "buy") == (p.kind == "call") else "bear"
 
 
-def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, float] | None, top: int,
-                   per_symbol: int = 3, blocks: list[dict] | None = None) -> tuple[str | None, dict[str, float]]:
-    """Unusual contracts across symbols, ranked by premium. Returns (text or None if empty, volumes for next time).
+def _new_volume(p, prev: dict[str, float] | None) -> float:
+    return p.volume - prev.get(p.ticker, 0.0) if prev is not None else p.volume
 
-    prev holds each contract's volume at the previous report; contracts not in it are marked new.
-    blocks (tiered mode): large prints since the previous report, appended as their own section."""
+
+def _new_premium(p, prev: dict[str, float] | None, tapes: dict | None) -> float:
+    t = (tapes or {}).get(p.ticker)
+    if t is not None and t.total > 0:
+        return t.total
+    return max(0.0, _new_volume(p, prev)) * (p.premium / p.volume if p.volume else 0.0)
+
+
+def _mix(t) -> str:
+    parts = [f"buy {t.pct(t.buy)}%", f"sell {t.pct(t.sell)}%"]
+    if t.pct(t.mid):
+        parts.append(f"mid {t.pct(t.mid)}%")
+    if t.pct(t.multi):
+        parts.append(f"multi-leg {t.pct(t.multi)}%")
+    if t.sweeps:
+        parts.append(f"{t.sweeps} sweep{'s' if t.sweeps != 1 else ''}")
+    return " · ".join(parts)
+
+
+def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, float] | None, top: int,
+                   per_symbol: int = 3, blocks: list[dict] | None = None, tapes: dict | None = None,
+                   since: datetime | None = None, oi_lines: list[str] | None = None) -> tuple[str | None, dict[str, float]]:
+    """Unusual contracts (volume above open interest) that traded since the previous report, ranked by the premium
+    traded in that window. Returns (text or None when nothing new, every flagged contract's volume for next time).
+
+    prev: each contract's volume at the previous report (None = first report of the day, so "new" = since the open).
+    tapes: trade-by-trade classification per contract for the window (mias/flow.py); without one, a contract is
+    signed by where its last trade printed. blocks: large prints since the previous report. oi_lines: the morning
+    check of yesterday's flow against today's open interest."""
     rows = [(r.symbol, p) for r in results if r.options for p in r.options.unusual[:per_symbol]]
-    rows.sort(key=lambda sp: -sp[1].premium)
-    rows = rows[:top]
     volumes = {p.ticker: p.volume for _, p in rows}
-    extra = block_lines(blocks) if blocks else []
-    if not rows:
-        if not extra:
-            return None, volumes
-        return "\n".join([f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET", *extra]), volumes
-    lines = [f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET",
-             "<i>volume &gt; open interest · ≥ $500K premium · ranked by premium today</i>"]
+    active = [(s, p) for s, p in rows if _new_volume(p, prev) > 0]
+    active.sort(key=lambda sp: -_new_premium(sp[1], prev, tapes))
+    quiet = len(rows) - len(active)
+    shown = active[:top]
+    extra = block_lines(blocks, tapes) if blocks else []
+    if not shown and not extra and not oi_lines:
+        return None, volumes
+    window = f"since {since:%H:%M}" if since else "since the open"
+    lines = [f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET"]
+    if oi_lines:
+        lines += [*oi_lines, ""]
+    if shown:
+        lines.append(f"<i>volume &gt; open interest today: possibly new positions (tomorrow's open interest "
+                     f"confirms) · ranked by premium {window}</i>")
     new = grew = 0
-    bull = bear = 0.0
-    for sym, p in rows:
-        side = _flow_side(p)
-        bull += p.premium if side == "bull" else 0
-        bear += p.premium if side == "bear" else 0
+    bull = bear = mixed = multi = 0.0
+    by_tape = False
+    for sym, p in shown:
+        t = (tapes or {}).get(p.ticker)
+        prem = _new_premium(p, prev, tapes)
+        if t is not None and t.total > 0:
+            by_tape = True
+            side = {"bull": "bull", "bear": "bear"}.get(t.lean, "neutral")
+            bull += t.bull
+            bear += t.bear
+            mixed += t.mid
+            multi += t.multi
+            how = _mix(t)
+        else:
+            side = _flow_side(p)
+            bull += prem if side == "bull" else 0
+            bear += prem if side == "bear" else 0
+            mixed += prem if side == "neutral" else 0
+            how = f"last at {p.side}"
         tag = ""
         if prev is not None:
             if p.ticker not in prev:
                 tag, new = "🆕 ", new + 1
-            elif p.volume > prev[p.ticker]:
+            else:
                 tag, grew = "⬆️ ", grew + 1
-        added = ""
-        if prev is not None and p.ticker in prev and p.volume > prev[p.ticker]:
-            added = f" · +{p.volume - prev[p.ticker]:,.0f} since last"
         icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}[side]
         lines.append(escape(f"{tag}{icon} {sym} {p.expiry[5:].replace('-', '/')} {p.strike:g}{p.kind[0].upper()} · "
-                            f"vol {p.volume:,.0f} vs OI {p.oi:,.0f} · {money(p.premium).lstrip('+')} · last at {p.side}{added}"))
-    summary = f"Lean (by last trade): bullish {money(bull).lstrip('+')} · bearish {money(bear).lstrip('+')}"
-    if prev is not None:
-        summary += f" · {new} new, {grew} growing"
-    lines += ["", escape(summary)]
+                            f"new {money(prem).lstrip('+')} (+{_new_volume(p, prev):,.0f}) · {how} · "
+                            f"day {money(p.premium).lstrip('+')}, vol {p.volume:,.0f} vs OI {p.oi:,.0f}"))
+    if shown:
+        how = "trade by trade" if by_tape else "by last trade"
+        summary = (f"New flow ({how}): bullish {money(bull).lstrip('+')} · bearish {money(bear).lstrip('+')} · "
+                   f"no side {money(mixed).lstrip('+')}" + (f" · multi-leg {money(multi).lstrip('+')}" if multi else ""))
+        if prev is not None:
+            summary += f" · {new} new, {grew} growing"
+        if quiet:
+            summary += f" · {quiet} quiet"
+        lines += ["", escape(summary)]
     if extra:
         lines += ["", *extra]
     return "\n".join(lines), volumes
+
+
+def oi_lines(checks: list[dict], top: int = 8) -> list[str]:
+    """Yesterday's flagged contracts against today's open interest (mias/flow.oi_check)."""
+    if not checks:
+        return []
+    icon = {"opened": "✅", "partly": "↔️", "closed": "✖️"}
+    word = {"opened": "opened", "partly": "partly opened", "closed": "closing/turnover"}
+    lines = ["<b>Yesterday's flow, checked against today's open interest</b>"]
+    for c in checks[:top]:
+        delta = c["oi_after"] - c["oi"]
+        lean = {"bull": "bullish", "bear": "bearish"}.get(c.get("lean"), "mixed")
+        lines.append(escape(f"{icon[c['verdict']]} {c['symbol']} {c['expiry'][5:].replace('-', '/')} "
+                            f"{c['strike']:g}{c['kind'][0].upper()} · vol {c['volume']:,.0f} → OI {delta:+,.0f} "
+                            f"({100 * c['share']:.0f}%) · {word[c['verdict']]} · was {lean}"))
+    n = {v: sum(c["verdict"] == v for c in checks) for v in icon}
+    stuck = {d: sum(c["premium"] for c in checks if c["verdict"] == "opened" and c.get("lean") == d)
+             for d in ("bull", "bear")}
+    lines.append(escape(f"Opened {n['opened']} · partly {n['partly']} · closing/turnover {n['closed']}. "
+                        f"Opened and one-sided: bullish {money(stuck['bull']).lstrip('+')} · "
+                        f"bearish {money(stuck['bear']).lstrip('+')}"))
+    return lines
 
 
 CHANGE_GROUPS = (("Trend", ("trend_change", "market")), ("Options", ("options_flip",)),
@@ -354,8 +434,10 @@ def changes_message(events: list[dict], start: datetime, end: datetime,
     return "\n".join(lines)
 
 
-def block_lines(items: list[dict], top: int = 6) -> list[str]:
-    """Blocks since the last report: one-sided ones listed, matched pairs (spreads, combos, rolls) skipped."""
+def block_lines(items: list[dict], tapes: dict | None = None, top: int = 6) -> list[str]:
+    """Blocks since the last report: one-sided ones listed, multi-leg and matched pairs (spreads, combos, rolls)
+    skipped. With a tape (mias/flow.py) a block is judged by its classified prints; without one, by its last
+    trade and by looking for a same-size block on another strike or expiry."""
     merged: dict[str, dict] = {}
     for b in items:
         m = merged.setdefault(b["ticker"], dict(b, premium=0.0, volume=0.0))
@@ -364,9 +446,22 @@ def block_lines(items: list[dict], top: int = 6) -> list[str]:
         m["side"] = b["side"]
     blocks = list(merged.values())
     paired: set[str] = set()
+    for b in blocks:
+        t = (tapes or {}).get(b["ticker"])
+        if t is None or t.total <= 0:
+            continue
+        b["taped"] = True
+        if t.multi >= 0.5 * t.total:
+            paired.add(b["ticker"])
+        elif t.lean in ("bull", "bear"):
+            b["side"] = "buy" if (t.lean == "bull") == (b["kind"] == "call") else "sell"
+        else:
+            b["side"] = "mid"
     for a in blocks:
+        if a.get("taped") or a["ticker"] in paired:
+            continue
         for b in blocks:
-            if a is b or a["symbol"] != b["symbol"] or a["expiry"] != b["expiry"] and a["kind"] != b["kind"]:
+            if a is b or b.get("taped") or a["symbol"] != b["symbol"] or a["expiry"] != b["expiry"] and a["kind"] != b["kind"]:
                 continue
             if max(a["volume"], b["volume"]) <= 1.25 * min(a["volume"], b["volume"]):
                 paired |= {a["ticker"], b["ticker"]}      # same size on two strikes/expiries or call + put
@@ -379,10 +474,12 @@ def block_lines(items: list[dict], top: int = 6) -> list[str]:
             bullish = (b["side"] == "buy") == (b["kind"] == "call")
             lines.append(escape(f"{'🟢' if bullish else '🔴'} {b['symbol']} {b['expiry'][5:].replace('-', '/')} "
                                 f"{b['strike']:g}{b['kind'][0].upper()} {b['volume']:,.0f}x · "
-                                f"{money(b['premium']).lstrip('+')} at {'ask' if b['side'] == 'buy' else 'bid'}"))
+                                f"{money(b['premium']).lstrip('+')} "
+                                + (("mostly bought" if b["side"] == "buy" else "mostly sold") if b.get("taped") else
+                                   f"at {'ask' if b['side'] == 'buy' else 'bid'}")))
     skipped = sorted({b["symbol"] for b in blocks if b["ticker"] in paired})
     mid = sorted({b["symbol"] for b in blocks if b["ticker"] not in paired and b["side"] == "mid"})
-    notes = ([f"paired (spread/roll/combo): {', '.join(skipped)}"] if skipped else []) + \
+    notes = ([f"multi-leg or paired (spread/roll/combo): {', '.join(skipped)}"] if skipped else []) + \
             ([f"at mid (no side): {', '.join(mid)}"] if mid else [])
     if notes:
         lines.append(f"<i>Skipped blocks: {escape(' · '.join(notes))}</i>")

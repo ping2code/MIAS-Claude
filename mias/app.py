@@ -18,6 +18,8 @@ log = logging.getLogger(__name__)
 
 WINDOW_START, WINDOW_END = dtime(9, 25), dtime(16, 15)
 OPEN, CLOSE = dtime(9, 30), dtime(16, 0)
+TAPE_CONTRACTS = 30              # unusual contracts per report that get a trade-by-trade tape
+FLOW_SCORE_PREMIUM = 1_000_000   # one-sided new flow at least this large is logged on the scorecard
 DEGRADED_AFTER = 3
 
 
@@ -57,6 +59,7 @@ class Service:
         web = WebServer(self) if self.cfg.web_enabled else None
         if web:
             await web.start(self.cfg.web_host, self.cfg.web_port)
+        watch_task = asyncio.create_task(self._watch_paper_trades()) if self.cfg.daytrade.enabled else None
         bot_task = bot = None
         if self.telegram and self.cfg.telegram_commands:
             from .bot import CommandBot
@@ -74,6 +77,9 @@ class Service:
                 await self._sleep_until_next()
         finally:
             log.info("shutting down")
+            if watch_task:
+                watch_task.cancel()
+                await asyncio.gather(watch_task, return_exceptions=True)
             if self._screen_task:
                 self._screen_task.cancel()
                 await asyncio.gather(self._screen_task, return_exceptions=True)
@@ -118,8 +124,9 @@ class Service:
             await self._run_cycle(now)
             self._send_reports(now)
             self._send_changes(now)
-            self._send_unusual(now)
+            await self._send_unusual(now)
             await self._send_picks(now)
+            self._send_brief(now)
             if self.cfg.screen_enabled and self._screen_due(now):
                 self.start_screen()
             for t in self.cfg.digest_times:
@@ -136,6 +143,9 @@ class Service:
                     await self._run_cycle(now)     # final read after the bell
                 self._send_changes(now, force=True)
                 self.store.enqueue("digest", self.engine.digest_text("Closing summary", now))
+                if local.weekday() == 4:
+                    from . import scorecard
+                    self.store.enqueue("scorecard", scorecard.report(self.store, now, 7))
                 sent.append("close")
         self.store.put(f"digests:{today}", sent)
         await self.dispatcher.flush()
@@ -165,27 +175,78 @@ class Service:
             self.store.enqueue("report", scheduled_report(r, self.cfg, local, minutes, prev), sym)
             self.store.put(f"report:{sym}", {"tag": tag, "date": str(local.date()), "price": r.price})
 
-    def _send_unusual(self, now: datetime) -> None:
+    async def _send_unusual(self, now: datetime) -> None:
         minutes = self.cfg.unusual_every_minutes
         if not minutes or self.engine.last_cycle.get("at") != now.isoformat():
             return
-        from .formatting import unusual_report
+        from . import flow, scorecard
+        from .formatting import oi_lines, unusual_report
         local = now.astimezone(self.cfg.tz)
-        since_open = (local - datetime.combine(local.date(), OPEN, self.cfg.tz)).total_seconds()
+        today = str(local.date())
+        open_at = datetime.combine(local.date(), OPEN, self.cfg.tz)
+        since_open = (local - open_at).total_seconds()
         if since_open < 0:
             return
         tag = f"{local.date()}:{int(since_open // (minutes * 60))}"
         last = self.store.get("unusual_report") or {}
         if last.get("tag") == tag:
             return
-        prev = last.get("volumes") if last.get("date") == str(local.date()) else None
+        same_day = last.get("date") == today
+        prev = last.get("volumes") if same_day else None
+        since = datetime.fromtimestamp(last["ts"], self.cfg.tz) if same_day and last.get("ts") else open_at
         pending = self.store.get("blocks") or {}
-        blocks = pending.get("items") if pending.get("date") == str(local.date()) else None
-        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top, blocks=blocks)
+        blocks = pending.get("items") if pending.get("date") == today else None
+
+        # Trade-by-trade tapes for the contracts that traded unusually in this window, and for the blocks.
+        rows = [(r.symbol, p) for r in self.engine.last_results if r.options for p in r.options.unusual[:3]]
+        moved = [(s, p) for s, p in rows if p.volume - (prev or {}).get(p.ticker, 0.0) > 0]
+        moved.sort(key=lambda sp: -(sp[1].volume - (prev or {}).get(sp[1].ticker, 0.0)) * (sp[1].price or 0))
+        want = {p.ticker: p.kind for _, p in moved[:TAPE_CONTRACTS]}
+        want.update({b["ticker"]: b["kind"] for b in blocks or []})
+        tapes = {}
+        if want:
+            tapes = await flow.tapes(self.client, list(want.items()), int(since.timestamp() * 1e9),
+                                     int(now.timestamp() * 1e9))
+
+        # First report of the day: did yesterday's flagged volume show up as new open interest?
+        day = self.store.get("unusual_day") or {}
+        checks = []
+        if day.get("date") and day["date"] != today:
+            try:
+                checks = await flow.oi_check(self.client, day)
+            except Exception as exc:
+                log.warning("open-interest check failed: %s", exc)
+            for c in checks:
+                r = next((x for x in self.engine.last_results if x.symbol == c["symbol"]), None)
+                if c["verdict"] == "opened" and c.get("lean") in ("bull", "bear") and r and r.price:
+                    scorecard.record(self.store, now.timestamp(), c["symbol"], "flow_opened", c["lean"], r.price)
+            day = {}
+        if not day:
+            day = {"date": today, "contracts": {}}
+
+        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top, blocks=blocks,
+                                       tapes=tapes, since=since if same_day else None, oi_lines=oi_lines(checks))
         if text:
             self.store.enqueue("unusual", text)
-        self.store.put("unusual_report", {"tag": tag, "date": str(local.date()), "volumes": volumes})
-        self.store.put("blocks", {"date": str(local.date()), "items": []})
+        price = {r.symbol: r.price for r in self.engine.last_results}
+        for sym, p in rows:
+            c = day["contracts"].setdefault(p.ticker, {"symbol": sym, "kind": p.kind, "strike": p.strike,
+                                                       "expiry": p.expiry, "oi": p.oi, "bull": 0.0, "bear": 0.0,
+                                                       "total": 0.0})
+            c["volume"], c["premium"] = p.volume, p.premium
+            t = tapes.get(p.ticker)
+            if t is not None:
+                c["bull"] += t.bull
+                c["bear"] += t.bear
+                c["total"] += t.total
+                c["lean"] = "bull" if c["bull"] >= 0.6 * c["total"] else "bear" if c["bear"] >= 0.6 * c["total"] \
+                    else "mixed"
+                if t.lean in ("bull", "bear") and t.total >= FLOW_SCORE_PREMIUM and price.get(sym):
+                    scorecard.record(self.store, now.timestamp(), sym, "flow", t.lean, price[sym], p.ticker,
+                                     t.total / t.contracts / 100 if t.contracts else None)
+        self.store.put("unusual_day", day)
+        self.store.put("unusual_report", {"tag": tag, "date": today, "volumes": volumes, "ts": now.timestamp()})
+        self.store.put("blocks", {"date": today, "items": []})
 
     # ---- tier 2: batched changes every N minutes ----------------------------------------------
 
@@ -239,6 +300,24 @@ class Service:
             log.exception("daily picks failed")
             return
         self.store.enqueue("picks", text)
+
+    def _send_brief(self, now: datetime) -> None:
+        if not self.cfg.brief_enabled or self.engine.last_cycle.get("at") != now.isoformat():
+            return
+        local = now.astimezone(self.cfg.tz)
+        due = datetime.combine(local.date(), dtime.fromisoformat(self.cfg.brief_time), self.cfg.tz)
+        key = f"brief:{local.date()}"
+        if not (due <= local < due + timedelta(minutes=30)) or self.store.get(key):
+            return
+        self.store.put(key, True)
+        try:
+            self.store.enqueue("brief", self.brief_text(now))
+        except Exception:
+            log.exception("morning brief failed")
+
+    def brief_text(self, now: datetime) -> str:
+        from .brief import text
+        return text(self.engine, self.cfg, now)
 
     async def picks_text(self, now: datetime) -> str:
         from .formatting import picks_message
@@ -305,6 +384,39 @@ class Service:
     def _cycled_on(self, local: datetime) -> bool:
         at = self.engine.last_cycle.get("at")
         return bool(at) and datetime.fromisoformat(at).astimezone(self.cfg.tz).date() == local.date()
+
+    async def _watch_paper_trades(self) -> None:
+        """Between cycles, re-price open EMA paper trades every [daytrade] manage_seconds (stops and trails would
+        otherwise be checked only every cycle)."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self.cfg.daytrade.manage_seconds)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                await self.watch_once(datetime.now(timezone.utc))
+            except Exception:
+                log.exception("paper-trade watch failed")
+
+    async def watch_once(self, now: datetime) -> int:
+        from . import emacross
+        from .trend import complete_bars, regular_session, to_bars
+        if self.market_state != "open":
+            return 0
+        st = self.store.get(emacross.KEY) or {}
+        open_syms = list((st.get("open") or {}) if st.get("date") == str(now.astimezone(self.cfg.tz).date()) else [])
+        if not open_syms:
+            return 0
+        today = now.astimezone(self.cfg.tz).date()
+        five = {}
+        for sym in open_syms:                      # fresh 5-minute closes for the invalidation check
+            raw = await self.client.aggregates(sym, 5, "minute", today, today)
+            five[sym] = complete_bars(regular_session(to_bars(raw), self.cfg.tz), 5, int(now.timestamp() * 1000))
+        sent = await emacross.manage(self.client, self.store, self.cfg, now, five)
+        if sent:
+            await self.dispatcher.flush()
+        return sent
 
     async def _market_open(self, local: datetime) -> bool:
         try:

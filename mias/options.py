@@ -93,6 +93,21 @@ class Idea:
     oi: float
     volume: float
     iv: float | None       # percent
+    # The short leg of a debit spread on the same expiry (about SPREAD_SHORT_DELTA), when a liquid one exists.
+    short_strike: float | None = None
+    short_mid: float | None = None
+    short_delta: float | None = None
+
+    @property
+    def spread_cost(self) -> float | None:
+        return round(self.mid - self.short_mid, 2) if self.short_mid is not None else None
+
+    @property
+    def spread_width(self) -> float | None:
+        return abs(self.short_strike - self.strike) if self.short_strike is not None else None
+
+
+SPREAD_SHORT_DELTA = 0.30
 
 
 @dataclass
@@ -119,6 +134,7 @@ class OptionsSnapshot:
     quote_coverage: float = 0.0
     thin: bool = False                       # too little volume for flow to mean much
     ideas: dict[str, dict[str, Idea]] = field(default_factory=dict)   # template -> call/put -> Idea
+    iv_term: list[tuple[str, int, float]] = field(default_factory=list)  # (expiry, dte, ATM IV %) up to 100 DTE
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -326,6 +342,8 @@ def analyze(raw_chain: list[dict], *, ref_spot: float, prev_volumes: dict[str, f
         quote_coverage=round(quoted / len(contracts), 3) if contracts else 0.0,
         thin=cv + pv < thin_volume,
         ideas={name: pick_contracts(contracts, t) for name, t in (idea_templates or {}).items()},
+        iv_term=[(e.isoformat(), (e - today).days, iv) for e in expiries if 1 <= (e - today).days <= 100
+                 for iv in [_atm_iv(contracts, e, spot)] if iv],
     )
     return snap, volumes
 
@@ -349,9 +367,18 @@ def pick_contracts(contracts: list[Contract], t) -> dict[str, Idea]:
             if best_key is None or key < best_key:
                 best, best_key = c, key
         if best and abs(abs(best.delta) - t.delta) <= 0.12:
-            out[kind] = Idea(kind, best.expiry.isoformat(), best.dte, best.strike, round(best.delta, 2),
-                             round(best.mid, 2), round(100 * (best.ask - best.bid) / best.mid, 1), best.oi,
-                             best.volume, round(100 * best.iv, 1) if best.iv else None)
+            idea = Idea(kind, best.expiry.isoformat(), best.dte, best.strike, round(best.delta, 2),
+                        round(best.mid, 2), round(100 * (best.ask - best.bid) / best.mid, 1), best.oi,
+                        best.volume, round(100 * best.iv, 1) if best.iv else None)
+            sign = 1 if kind == "call" else -1
+            shorts = [c for c in contracts if c.kind == kind and c.expiry == best.expiry and c.delta is not None
+                      and c.mid and sign * (c.strike - best.strike) > 0 and c.oi >= t.min_oi
+                      and 100 * (c.ask - c.bid) / c.mid <= t.max_spread_pct]
+            if shorts:
+                sc = min(shorts, key=lambda c: abs(abs(c.delta) - SPREAD_SHORT_DELTA))
+                if abs(abs(sc.delta) - SPREAD_SHORT_DELTA) <= 0.10:
+                    idea.short_strike, idea.short_mid, idea.short_delta = sc.strike, round(sc.mid, 2), round(sc.delta, 2)
+            out[kind] = idea
     return out
 
 

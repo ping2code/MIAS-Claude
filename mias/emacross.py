@@ -51,6 +51,8 @@ class DayTradeRules:
     first_target: float = 0.30
     trail: tuple[tuple[float, float], ...] = ((0.75, 0.50), (1.00, 0.75))
     max_losses_in_row: int = 2
+    manage_seconds: int = 30        # open paper trades are re-priced this often (the main cycle is 150 s)
+    swing_filter: bool = False      # only take entries in the direction of the swing trend (see the backtest split)
 
 
 def _hm(text: str) -> time:
@@ -81,6 +83,8 @@ class Setup:
     orb: str | None = None           # with / against / inside
     sma200: str | None = None        # with / against
     move: float | None = None        # best underlying move in the setup's favor before the next opposite cross
+    regime: str | None = None        # trend / chop: the day's character at entry (see regime())
+    retest_t: int | None = None      # start of the candle that pulled back into the EMAs
 
     @property
     def key(self) -> str:
@@ -91,18 +95,55 @@ class Setup:
         return 1 if self.side == "bull" else -1
 
 
+def regime(bars: list[Bar], i: int, first: int) -> str:
+    """'trend' when the day is moving (ADX(14) >= 25 on these candles and price at least 40% of an average day's
+    range away from the open), else 'chop'."""
+    from .indicators import adx
+    prev = bars[max(0, first - 800):first]
+    ranges: dict[int, list[float]] = {}
+    for b in prev:
+        r = ranges.setdefault(b.t // 86_400_000, [b.h, b.l])
+        r[0], r[1] = max(r[0], b.h), min(r[1], b.l)
+    avg = sum(h - l for h, l in ranges.values()) / len(ranges) if ranges else 0.0
+    a = adx(bars[max(0, i - 80):i + 1])
+    moved = abs(bars[i].c - bars[first].o)
+    return "trend" if a is not None and a >= 25 and avg and moved >= 0.4 * avg else "chop"
+
+
+def fill_entry(su: Setup, bars: list[Bar], i: int, first: int, extreme: float, tz: ZoneInfo, rules: DayTradeRules,
+               span: int = FIVE, closes: list[float] | None = None) -> None:
+    """Mark a setup entered at the close of candle i (unless outside entry hours), with its context."""
+    b, sg = bars[i], su.sign
+    day = _et(b.t, tz).date()
+    su.entry_t = b.t + span
+    if not _at(day, rules.start, tz) <= su.entry_t <= _at(day, rules.last_entry, tz):
+        su.status = "outside_hours"
+        return
+    su.status, su.price, su.invalidation = "entry", b.c, extreme
+    vw = session_vwap(bars[first:i + 1])
+    su.vwap = "with" if vw is not None and sg * (b.c - vw) > 0 else "against"
+    orb = [x for x in bars[first:i + 1] if x.t < bars[first].t + 15 * 60_000]
+    if orb and b.t >= bars[first].t + 15 * 60_000:
+        hi, lo = max(x.h for x in orb), min(x.l for x in orb)
+        su.orb = "with" if sg * (b.c - (hi if sg > 0 else lo)) > 0 else \
+            "against" if sg * (b.c - (lo if sg > 0 else hi)) < 0 else "inside"
+    if i >= 199:
+        closes = closes or [x.c for x in bars]
+        su.sma200 = "with" if sg * (b.c - sum(closes[i - 199:i + 1]) / 200) > 0 else "against"
+    su.regime = regime(bars, i, first)
+
+
 def scan(symbol: str, bars: list[Bar], day: date, tz: ZoneInfo, rules: DayTradeRules, *,
-         retest: bool = True) -> list[Setup]:
-    """Every cross on `day` and what became of it. `bars` are completed regular-session 5-minute candles,
-    earlier days included so the EMAs are warmed up. retest=False is the control group: enter on the cross."""
+         retest: bool = True, span: int = FIVE) -> list[Setup]:
+    """Every cross on `day` and what became of it. `bars` are completed regular-session candles (5-minute unless
+    span says otherwise), earlier days included so the EMAs are warmed up. retest=False is the control group:
+    enter on the cross."""
     closes = [b.c for b in bars]
     fast, slow = ema(closes, rules.fast), ema(closes, rules.slow)
     idx = [i for i, b in enumerate(bars) if _et(b.t, tz).date() == day]
     if not idx or idx[0] == 0:
         return []
     first = idx[0]
-    orb = bars[first:first + 3]
-    start, last = _at(day, rules.start, tz), _at(day, rules.last_entry, tz)
     out: list[Setup] = []
     crosses: list[tuple[int, Setup]] = []
     active: Setup | None = None
@@ -110,20 +151,7 @@ def scan(symbol: str, bars: list[Bar], day: date, tz: ZoneInfo, rules: DayTradeR
     touched_i = cross_i = 0
 
     def enter(su: Setup, i: int, extreme: float) -> None:
-        b, sg = bars[i], su.sign
-        su.entry_t = b.t + FIVE
-        if not start <= su.entry_t <= last:
-            su.status = "outside_hours"
-            return
-        su.status, su.price, su.invalidation = "entry", b.c, extreme
-        vw = session_vwap(bars[first:i + 1])
-        su.vwap = "with" if vw is not None and sg * (b.c - vw) > 0 else "against"
-        if i >= first + 3:
-            hi, lo = max(x.h for x in orb), min(x.l for x in orb)
-            su.orb = "with" if sg * (b.c - (hi if sg > 0 else lo)) > 0 else \
-                "against" if sg * (b.c - (lo if sg > 0 else hi)) < 0 else "inside"
-        if i >= 199:
-            su.sma200 = "with" if sg * (b.c - sum(closes[i - 199:i + 1]) / 200) > 0 else "against"
+        fill_entry(su, bars, i, first, extreme, tz, rules, span, closes)
 
     for i in idx:
         b = bars[i]
@@ -151,6 +179,7 @@ def scan(symbol: str, bars: list[Bar], day: date, tz: ZoneInfo, rules: DayTradeR
         else:
             touched = min(touched, b.l) if sg > 0 else max(touched, b.h)
             if sg * (b.c - b.o) > 0 and sg * (b.c - fast[i]) > 0 and sg * (b.c - bars[i - 1].c) > 0:
+                active.retest_t = bars[touched_i].t
                 enter(active, i, touched)
             elif i - touched_i >= rules.confirm_bars:
                 active.status = "no_retest"
@@ -188,12 +217,27 @@ class Trade:
     exit_reason: str | None = None
     low: float | None = None
     under: float | None = None
+    slip: float = 0.0                # backtests: share of the price lost on every fill (bid/ask and impact)
+    # Live paper trades fill at the real quote: bought at the ask, sold at the bid (never above the trigger price).
+    # The midpoint result is kept alongside for comparison.
+    entry_mid: float | None = None
+    mid_realized: float = 0.0
+    bid: float | None = None         # current bid, set before each price update
+    ask: float | None = None
+    peak_t: int | None = None        # when the best (MFE) and worst (MAE) option prices were seen
+    low_t: int | None = None
+    under_hi: float | None = None    # the stock's range while the trade was open
+    under_lo: float | None = None
+    info: dict = field(default_factory=dict)   # entry record: reason, timing, stop distances, spread, trend
+    exit_spread_pct: float | None = None
 
     @classmethod
     def open(cls, su: Setup, contract: str, strike: float, expiry: str, t: int, premium: float,
-             rules: DayTradeRules) -> "Trade":
+             rules: DayTradeRules, slip: float = 0.0) -> "Trade":
+        premium = round(premium * (1 + slip), 4)
         return cls(su.symbol, su.side, contract, strike, expiry, t, premium, su.invalidation, rules.contracts,
-                   rules.contracts, round(premium * (1 - rules.stop), 2), premium, low=premium, under=su.price)
+                   rules.contracts, round(premium * (1 - rules.stop), 2), premium, low=premium, under=su.price,
+                   slip=slip)
 
     @property
     def closed(self) -> bool:
@@ -207,9 +251,29 @@ class Trade:
     def pnl_pct(self) -> float:
         return round(100 * self.realized / (self.entry * self.qty * 100), 1)
 
+    @property
+    def pnl_mid(self) -> float:
+        return round(self.mid_realized, 2)
+
+    @property
+    def mfe_pct(self) -> float:
+        return round(100 * (self.peak / self.entry - 1), 1)
+
+    @property
+    def mae_pct(self) -> float:
+        return round(100 * ((self.low or self.entry) / self.entry - 1), 1)
+
     def _sell(self, qty: int, price: float) -> None:
-        self.realized += (price - self.entry) * qty * 100
+        fill = min(price, self.bid) if self.bid else price * (1 - self.slip)
+        self.realized += (fill - self.entry) * qty * 100
+        self.mid_realized += (price - (self.entry_mid or self.entry)) * qty * 100
         self.open_qty -= qty
+
+    def mark(self, t: int, under: float | None) -> None:
+        """Track the stock's range while open (MAE/MFE in stock terms)."""
+        if under:
+            self.under_hi = max(self.under_hi or under, under)
+            self.under_lo = min(self.under_lo or under, under)
 
     def exit(self, t: int, price: float, reason: str) -> list[tuple[str, str]]:
         if self.closed:
@@ -223,7 +287,10 @@ class Trade:
         """Feed one price bar (a minute bar, or a single live quote as o=h=l=c). The stop is checked first."""
         if self.closed:
             return []
-        self.low = min(self.low or l, l)
+        if self.low is None or l < self.low:
+            self.low, self.low_t = l, t
+        if h > self.peak:
+            self.peak_t = t
         if l <= self.stop:
             reason = "stop" if not self.partial_done else "breakeven" if self.stop <= self.entry else "trailed"
             return self.exit(t, min(o, self.stop), reason)
@@ -281,15 +348,17 @@ class _Cache:
         return data
 
 
-async def _five_minute(client, cache: _Cache, symbol: str, start: date, end: date, tz: ZoneInfo) -> list[Bar]:
-    """Regular-session 5-minute bars, fetched a month at a time (the API caps a request at ~50k minutes)."""
+async def _five_minute(client, cache: _Cache, symbol: str, start: date, end: date, tz: ZoneInfo,
+                       minutes: int = 5) -> list[Bar]:
+    """Regular-session N-minute bars (5 by default), fetched a month at a time (the API caps a request at ~50k
+    minutes)."""
     raw: list[dict] = []
     d = start
     while d <= end:
         chunk_end = min(end, d + timedelta(days=27))
         live = chunk_end >= date.today()
-        fetch = lambda a=d, b=chunk_end: client.aggregates(symbol, 5, "minute", a, b)
-        raw += await (fetch() if live else cache.get(f"{symbol}_5m_{d}_{chunk_end}", fetch))
+        fetch = lambda a=d, b=chunk_end: client.aggregates(symbol, minutes, "minute", a, b)
+        raw += await (fetch() if live else cache.get(f"{symbol}_{minutes}m_{d}_{chunk_end}", fetch))
         d = chunk_end + timedelta(days=1)
     return regular_session(to_bars(raw), tz)
 
@@ -328,20 +397,30 @@ def _summary_rows(trades: list[dict]) -> dict:
 
 
 async def backtest(client, symbol: str, start: date, end: date, tz: ZoneInfo, rules: DayTradeRules,
-                   cache_dir: Path, *, retest: bool = True) -> tuple[list[dict], list[Setup]]:
+                   cache_dir: Path, *, retest: bool = True, scan_fn=None, minutes: int = 5,
+                   slip: float = 0.0, trend: tuple | None = None) -> tuple[list[dict], list[Setup]]:
     """Simulate every setup from start to end with real option minute bars. Fills: the option's first minute
     bar after the signal (its open); stops at the stop price (or the open if it gapped through); targets at the
-    target price. No commissions or slippage beyond that. A minute bar touching both stop and target counts
-    as the stop (conservative)."""
+    target price; every fill gives up `slip` of the price. A minute bar touching both stop and target counts
+    as the stop (conservative). scan_fn defaults to the EMA cross-and-retest (mias/daysetups.py has others).
+    trend: (profiles, strong, bias) to record the swing and intraday scores at each entry (slower)."""
     cache = _Cache(cache_dir)
-    bars = await _five_minute(client, cache, symbol, start - timedelta(days=10), end, tz)
-    by_end = {b.t + FIVE: b for b in bars}
+    span = minutes * 60_000
+    bars = await _five_minute(client, cache, symbol, start - timedelta(days=10), end, tz, minutes)
+    scorer = None
+    if trend:
+        from .swingtest import scores_at
+        five5 = await _five_minute(client, cache, symbol, start - timedelta(days=45), end, tz, 5)   # 40-day window
+        daily = to_bars(await cache.get(f"{symbol}_1d_{start}_{end}", lambda: client.aggregates(
+            symbol, 1, "day", start - timedelta(days=700), end)))
+        scorer = lambda t_ms: scores_at(five5, daily, t_ms, tz, *trend)
+    by_end = {b.t + span: b for b in bars}
     days = sorted({_et(b.t, tz).date() for b in bars if start <= _et(b.t, tz).date() <= end})
     trades: list[dict] = []
     setups: list[Setup] = []
     for day in days:
         cut = next((n for n, b in enumerate(bars) if _et(b.t, tz).date() > day), len(bars))
-        day_setups = scan(symbol, bars[:cut], day, tz, rules, retest=retest)
+        day_setups = (scan_fn or scan)(symbol, bars[:cut], day, tz, rules, retest=retest, span=span)
         for su in day_setups:
             if su.status == "pending":
                 su.status = "day_end"                     # crossed too late in the day to finish
@@ -369,10 +448,10 @@ async def backtest(client, symbol: str, start: date, end: date, tz: ZoneInfo, ru
             if not mins:
                 su.status = "no_quotes"
                 continue
-            tr = Trade.open(su, ticker, strike, expiry, mins[0].t, mins[0].o, rules)
+            tr = Trade.open(su, ticker, strike, expiry, mins[0].t, mins[0].o, rules, slip)
             for m in mins:
                 five = by_end.get(m.t)
-                if five and five.t + FIVE > su.entry_t and invalidated(tr, five.c):
+                if five and five.t + span > su.entry_t and invalidated(tr, five.c):
                     tr.exit(m.t, m.o, "invalidated")
                     break
                 tr.on_price(m.t, m.o, m.h, m.l, m.c, rules)
@@ -382,13 +461,20 @@ async def backtest(client, symbol: str, start: date, end: date, tz: ZoneInfo, ru
                 tr.exit(mins[-1].t, mins[-1].c, "time")
             busy_until = tr.closed_t or close_t
             losses = losses + 1 if tr.pnl < 0 else 0
+            sc = scorer(su.entry_t) if scorer else None
+            sw = sc.get("swing") if sc else None
             trades.append({
+                "swing": round(sw, 1) if sw is not None else None,
+                "intraday": round(sc.get("intraday", 0.0), 1) if sc else None,
+                "with_swing": None if sw is None else "with" if su.sign * sw >= 25 else
+                "against" if su.sign * sw <= -25 else "neutral",
+                "mfe_pct": tr.mfe_pct, "mae_pct": tr.mae_pct,
                 "date": day.isoformat(), "side": su.side, "entry_time": _et(su.entry_t, tz).strftime("%H:%M"),
                 "underlying": su.price, "invalidation": su.invalidation, "contract": ticker, "expiry": expiry,
                 "entry": tr.entry, "exit_reason": tr.exit_reason, "exit_time": _et(tr.closed_t, tz).strftime("%H:%M"),
                 "pnl": tr.pnl, "pnl_pct": tr.pnl_pct, "peak_pct": round(100 * (tr.peak / tr.entry - 1)),
                 "low_pct": round(100 * (tr.low / tr.entry - 1)), "vwap": su.vwap, "orb": su.orb, "sma200": su.sma200,
-                "move": su.move})
+                "move": su.move, "regime": su.regime})
     return trades, setups
 
 
@@ -478,12 +564,26 @@ def entry_text(su: Setup, tr: Trade, rules: DayTradeRules, tz: ZoneInfo, losses:
     target = tr.entry * (1 + rules.first_target)
     ctx = [f"VWAP {su.vwap}", f"opening range {su.orb or 'n/a'}"] + ([f"200 SMA {su.sma200}"] if su.sma200 else [])
     ok = lambda v: "✅" if v == "with" else "⚠️" if v == "against" else "·"
+    info = tr.info or {}
+    fill = f"at {tr.entry:.2f}"
+    if tr.ask and tr.entry_mid:
+        fill = f"at {tr.entry:.2f} ask (mid {tr.entry_mid:.2f}, spread {info.get('entry_spread_pct', 0):.1f}%)"
+    stops = f" · chart stop {info['chart_stop_pct']:.2f}% away" if info.get("chart_stop_pct") is not None else ""
+    if info.get("premium_stop_pct") is not None:
+        stops += f", premium stop ≈ {info['premium_stop_pct']:.2f}% stock move"
+    trend = []
+    if info.get("swing") is not None:
+        w = info.get("with_swing")
+        trend.append(f"Trend: swing {info['swing']:+d}" + (f" · intraday {info['intraday']:+d}" if info.get("intraday")
+                                                            is not None else "")
+                     + (" ✅ with it" if w == "with" else " ⚠️ AGAINST the swing trend" if w == "against" else ""))
     return "\n".join([
         f"{'🟢' if sg > 0 else '🔴'} <b>{su.symbol} EMA {rules.fast}/{rules.slow} {word} CROSS + RETEST</b> · day trade (paper)",
         f"Entry {_et(su.entry_t, tz):%H:%M}: {su.symbol} {su.price:.2f} · ATM <b>{tr.strike:g}{kind} {exp:%m/%d}</b> "
-        f"({dte}DTE) at {tr.entry:.2f}",
+        f"({dte}DTE) {fill}",
         f"Stop {tr.stop:.2f} (-{100 * rules.stop:.0f}%) or a 5m close {'below' if sg > 0 else 'above'} "
-        f"{su.invalidation:.2f}",
+        f"{su.invalidation:.2f}{stops}",
+        *trend,
         f"Target: sell {rules.partial} of {rules.contracts} at {target:.2f} (+{100 * rules.first_target:.0f}%), "
         f"runners to breakeven; trail +75%→+50%, +100%→+75%",
         "Context: " + " · ".join(f"{c} {ok(c.split()[-1])}" for c in ctx),
@@ -498,7 +598,8 @@ def event_text(tr: Trade, kind: str, detail: str, value: float, under: float | N
             "breakeven": "RUNNERS OUT AT BREAKEVEN", "trailed": "TRAILED OUT", "target": "ALL SOLD",
             "time": "CLOSED: END OF DAY"}.get(kind, kind.upper())
     k = "C" if tr.side == "bull" else "P"
-    tail = f" · total {_money(tr.pnl)} ({tr.pnl_pct:+}%)" if tr.closed else ""
+    tail = (f" · total {_money(tr.pnl)} ({tr.pnl_pct:+}%) at bid/ask, {_money(tr.pnl_mid)} at mid · "
+            f"best {tr.mfe_pct:+.0f}%, worst {tr.mae_pct:+.0f}%") if tr.closed else ""
     return (f"{icon} <b>{tr.symbol} {tr.strike:g}{k} EMA trade: {head}</b>\n{detail} · option {value:.2f}"
             + (f" · {tr.symbol} {under:.2f}" if under else "") + tail)
 
@@ -509,11 +610,17 @@ def summary_text(st: dict, rules: DayTradeRules, today: date) -> str | None:
     if not closed and not seen:
         return None
     total = sum(t["pnl"] for t in closed)
+    total_mid = sum(t.get("pnl_mid", t["pnl"]) for t in closed)
     lines = [f"📒 <b>EMA {rules.fast}/{rules.slow} day trades (paper)</b> {today:%a %b %d}: "
-             f"{len(closed)} trade{'s' if len(closed) != 1 else ''} · {_money(total)}"]
+             f"{len(closed)} trade{'s' if len(closed) != 1 else ''} · {_money(total)} at bid/ask "
+             f"({_money(total_mid)} at mid)"]
     for t in closed:
+        ex = (f" · best {t['mfe_pct']:+.0f}% {t.get('mfe_at') or ''}, worst {t['mae_pct']:+.0f}% {t.get('mae_at') or ''}"
+              if "mfe_pct" in t else "")
+        tw = {"with": " · with swing", "against": " · ⚠️ against swing"}.get(t.get("with_swing"), "")
         lines.append(f"{'🟢' if t['side'] == 'bull' else '🔴'} {t['symbol']} {t['in']} {t['contract']} "
-                     f"{t['entry']:.2f} → {t['exit_reason']} {t['out']} · {_money(t['pnl'])} ({t['pnl_pct']:+}%)")
+                     f"{t['entry']:.2f} → {t['exit_reason']} {t['out']} · {_money(t['pnl'])} ({t['pnl_pct']:+}%)"
+                     f"{ex}{tw}")
     skipped = st.get("skipped") or {}
     if skipped:
         lines.append("Crosses without a trade: " + ", ".join(f"{k} {v}" for k, v in skipped.items()))
@@ -525,6 +632,15 @@ async def _chain(client, symbol: str, spot: float, today: date) -> list[dict]:
     return rows
 
 
+MAX_SPREAD_PCT = 5.0       # prefer contracts whose bid/ask spread is within this share of the mid
+
+
+def _spread_pct(c: dict) -> float:
+    q = c.get("last_quote") or {}
+    m = _mid(c)
+    return 100 * (q["ask"] - q["bid"]) / m if m and q.get("bid") and q.get("ask") else 999.0
+
+
 def _mid(c: dict) -> float | None:
     q = c.get("last_quote") or {}
     if q.get("bid") and q.get("ask"):
@@ -532,96 +648,198 @@ def _mid(c: dict) -> float | None:
     return q.get("midpoint")
 
 
-async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]]) -> int:
-    """Run once per cycle: open paper trades on new entries, manage open ones, send the day's summary at the
-    close. `five` maps symbol to completed regular-session 5-minute bars (today plus warm-up days)."""
+LOCK = asyncio.Lock()      # the 150 s cycle and the 30 s watcher both update the day's state
+LOG_KEY = "ema_log"        # every closed paper trade, for study (python -m mias ema-log)
+
+
+def _quote(snap: dict) -> tuple[float | None, float | None, float | None]:
+    q = snap.get("last_quote") or {}
+    bid, ask = q.get("bid"), q.get("ask")
+    return bid, ask, _mid(snap)
+
+
+def _close_record(tr: Trade, tz: ZoneInfo, out_t: int) -> dict:
+    k = "C" if tr.side == "bull" else "P"
+    rec = {"symbol": tr.symbol, "side": tr.side, "contract": f"{tr.strike:g}{k}", "ticker": tr.contract,
+           "in": _et(tr.opened_t, tz).strftime("%H:%M"), "out": _et(out_t, tz).strftime("%H:%M"),
+           "entry": tr.entry, "entry_mid": tr.entry_mid, "exit_reason": tr.exit_reason, "pnl": tr.pnl,
+           "pnl_pct": tr.pnl_pct, "pnl_mid": tr.pnl_mid, "mfe_pct": tr.mfe_pct, "mae_pct": tr.mae_pct,
+           "mfe_at": _et(tr.peak_t, tz).strftime("%H:%M") if tr.peak_t else None,
+           "mae_at": _et(tr.low_t, tz).strftime("%H:%M") if tr.low_t else None,
+           "exit_spread_pct": tr.exit_spread_pct, "minutes": round((out_t - tr.opened_t) / 60000, 1)}
+    if tr.under and tr.under_hi and tr.under_lo:
+        sg = 1 if tr.side == "bull" else -1
+        best, worst = (tr.under_hi, tr.under_lo) if sg > 0 else (tr.under_lo, tr.under_hi)
+        rec["under_mfe_pct"] = round(100 * sg * (best / tr.under - 1), 2)
+        rec["under_mae_pct"] = round(100 * sg * (worst / tr.under - 1), 2)
+    rec.update(tr.info)
+    return rec
+
+
+async def manage(client, store, cfg, now: datetime, five: dict[str, list[Bar]]) -> int:
+    """Re-price open paper trades: stops, targets, trails, invalidation, the end-of-day exit. Returns alerts queued."""
+    async with LOCK:
+        st = _state(store, now.astimezone(cfg.tz).date())
+        sent = _manage(await _snapshots(client, st), store, cfg, now, five, st)
+        store.put(KEY, st)
+        return sent
+
+
+async def _snapshots(client, st: dict) -> dict:
+    tickers = [d["contract"] for d in st["open"].values()]
+    if not tickers:
+        return {}
+    try:
+        return await client.snapshots(tickers)
+    except Exception as exc:
+        log.warning("ema quotes failed: %s", exc)
+        return {}
+
+
+def _manage(snaps: dict, store, cfg, now: datetime, five: dict[str, list[Bar]], st: dict) -> int:
     rules: DayTradeRules = cfg.daytrade
     tz = cfg.tz
-    local = now.astimezone(tz)
-    today = local.date()
-    st = _state(store, today)
     now_ms = int(now.timestamp() * 1000)
-    close_ms = _at(today, rules.close, tz)
+    close_ms = _at(now.astimezone(tz).date(), rules.close, tz)
     sent = 0
-
-    # manage open trades first
     for sym, d in list(st["open"].items()):
         tr = Trade(**d)
-        bars = five.get(sym) or []
-        try:
-            snaps = await client.snapshots([tr.contract])
-        except Exception as exc:
-            log.warning("ema %s quote failed: %s", tr.contract, exc)
-            continue
-        snap = snaps.get(tr.contract) or {}
-        value = _mid(snap)
+        snap = (snaps or {}).get(tr.contract) or {}
+        bid, ask, value = _quote(snap)
         under = (snap.get("underlying_asset") or {}).get("price")
         if value is None:
             continue
+        tr.bid, tr.ask = bid, ask
+        tr.mark(now_ms, under)
+        bars = five.get(sym) or []
         last5 = next((b for b in reversed(bars) if b.t + FIVE <= now_ms and b.t + FIVE > tr.opened_t), None)
         if now_ms >= close_ms:
             events = tr.exit(now_ms, value, "time")
         elif last5 and invalidated(tr, last5.c):
+            tr.low = min(tr.low or value, value)
             events = tr.exit(now_ms, value, "invalidated")
         else:
             events = tr.on_price(now_ms, value, value, value, value, rules)
+        if tr.closed and bid and ask and value:
+            tr.exit_spread_pct = round(100 * (ask - bid) / value, 1)
         for kind, detail in events:
             store.enqueue(f"ema_{kind}", event_text(tr, kind, detail, value, under), sym)
             sent += 1
         if tr.closed:
             del st["open"][sym]
             st["losses"][sym] = st["losses"].get(sym, 0) + 1 if tr.pnl < 0 else 0
-            k = "C" if tr.side == "bull" else "P"
-            st["closed"].append({"symbol": sym, "side": tr.side, "contract": f"{tr.strike:g}{k}",
-                                 "in": _et(tr.opened_t, tz).strftime("%H:%M"), "out": local.strftime("%H:%M"),
-                                 "entry": tr.entry, "exit_reason": tr.exit_reason, "pnl": tr.pnl, "pnl_pct": tr.pnl_pct})
+            rec = _close_record(tr, tz, now_ms)
+            st["closed"].append(rec)
+            store.put(LOG_KEY, (store.get(LOG_KEY) or [])[-499:] + [dict(rec, date=st["date"])])
         else:
             st["open"][sym] = asdict(tr)
-
-    # new entries
-    for sym in rules.symbols:
-        bars = [b for b in five.get(sym) or [] if b.t + FIVE <= now_ms]
-        for su in scan(sym, bars, today, tz, rules):
-            if su.key in st["seen"] or su.status == "pending":
-                continue
-            st["seen"].append(su.key)
-            fresh = su.entry_t is not None and now_ms - su.entry_t <= 2 * FIVE
-            if su.status != "entry" or not fresh:
-                why = su.status if su.status != "entry" else "missed"
-                st.setdefault("skipped", {})[why] = st.setdefault("skipped", {}).get(why, 0) + 1
-                continue
-            losses = st["losses"].get(sym, 0)
-            if sym in st["open"] or losses >= rules.max_losses_in_row:
-                why = "in a trade" if sym in st["open"] else "daily limit"
-                st["skipped"][why] = st.setdefault("skipped", {}).get(why, 0) + 1
-                continue
-            try:
-                chain = await _chain(client, sym, su.price, today)
-            except Exception as exc:
-                log.warning("ema %s chain failed: %s", sym, exc)
-                continue
-            kind = "call" if su.side == "bull" else "put"
-            rows = [c for c in chain if (c.get("details") or {}).get("contract_type") == kind and _mid(c)]
-            expiry = pick_expiry(list({c["details"]["expiration_date"] for c in rows}), today, now_ms, tz, rules)
-            rows = [c for c in rows if c["details"]["expiration_date"] == expiry]
-            if not rows:
-                continue
-            spot = (rows[0].get("underlying_asset") or {}).get("price") or su.price
-            c = min(rows, key=lambda c: abs(c["details"]["strike_price"] - spot))
-            tr = Trade.open(su, c["details"]["ticker"], float(c["details"]["strike_price"]), expiry, now_ms,
-                            _mid(c), rules)
-            st["open"][sym] = asdict(tr)
-            store.enqueue("ema_entry", entry_text(su, tr, rules, tz, losses), sym)
-            sent += 1
-
-    if now_ms >= close_ms and not st["open"] and not st["summary"]:
-        text = summary_text(st, rules, today)
-        if text:
-            store.enqueue("ema_summary", text)
-            sent += 1
-        st["summary"] = True
-    store.put(KEY, st)
     return sent
+
+
+async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], results: dict | None = None) -> int:
+    """Run once per cycle: manage open paper trades, open new ones, send the day's summary at the close.
+    `five` maps symbol to completed regular-session 5-minute bars (today plus warm-up days); `results` maps symbol
+    to the cycle's SymbolResult (for the trend at entry)."""
+    rules: DayTradeRules = cfg.daytrade
+    tz = cfg.tz
+    local = now.astimezone(tz)
+    today = local.date()
+    now_ms = int(now.timestamp() * 1000)
+    close_ms = _at(today, rules.close, tz)
+    async with LOCK:
+        st = _state(store, today)
+        sent = _manage(await _snapshots(client, st), store, cfg, now, five, st)
+        for sym in rules.symbols:
+            bars = [b for b in five.get(sym) or [] if b.t + FIVE <= now_ms]
+            for su in scan(sym, bars, today, tz, rules):
+                if su.key in st["seen"] or su.status == "pending":
+                    continue
+                st["seen"].append(su.key)
+                fresh = su.entry_t is not None and now_ms - su.entry_t <= 2 * FIVE
+                if su.status != "entry" or not fresh:
+                    why = su.status if su.status != "entry" else "missed"
+                    st.setdefault("skipped", {})[why] = st.setdefault("skipped", {}).get(why, 0) + 1
+                    continue
+                r = (results or {}).get(sym)
+                swing = r.stock.score if r is not None and r.stock else None
+                intra = r.stock.composites.get("intraday", (None, ""))[0] if r is not None and r.stock else None
+                against = swing is not None and su.sign * swing < cfg.trend_bias
+                losses = st["losses"].get(sym, 0)
+                why = "in a trade" if sym in st["open"] else "daily limit" if losses >= rules.max_losses_in_row \
+                    else "against the swing trend" if rules.swing_filter and against else None
+                if why:
+                    skipped = st.setdefault("skipped", {})
+                    skipped[why] = skipped.get(why, 0) + 1
+                    continue
+                try:
+                    chain = await _chain(client, sym, su.price, today)
+                except Exception as exc:
+                    log.warning("ema %s chain failed: %s", sym, exc)
+                    continue
+                kind = "call" if su.side == "bull" else "put"
+                rows = [c for c in chain if (c.get("details") or {}).get("contract_type") == kind and _mid(c)]
+                expiry = pick_expiry(list({c["details"]["expiration_date"] for c in rows}), today, now_ms, tz, rules)
+                rows = [c for c in rows if c["details"]["expiration_date"] == expiry]
+                if not rows:
+                    continue
+                spot = (rows[0].get("underlying_asset") or {}).get("price") or su.price
+                liquid = [c for c in rows if _spread_pct(c) <= MAX_SPREAD_PCT] or rows     # tight quotes first
+                c = min(liquid, key=lambda c: abs(c["details"]["strike_price"] - spot))
+                bid, ask, mid = _quote(c)
+                tr = Trade.open(su, c["details"]["ticker"], float(c["details"]["strike_price"]), expiry, now_ms,
+                                ask or mid, rules)
+                tr.entry_mid, tr.bid, tr.ask = mid, bid, ask
+                tr.mark(now_ms, spot)
+                delta = abs(((c.get("greeks") or {}).get("delta")) or 0) or None
+                tr.info = entry_info(su, tr, rules, now_ms, spot, delta, swing, intra, cfg)
+                st["open"][sym] = asdict(tr)
+                store.enqueue("ema_entry", entry_text(su, tr, rules, tz, losses), sym)
+                sent += 1
+                try:
+                    from . import scorecard
+                    scorecard.record(store, now.timestamp(), sym, "ema_entry", su.side, su.price, tr.contract,
+                                     tr.entry)
+                except Exception:
+                    log.exception("ema scorecard record failed")
+
+        if now_ms >= close_ms and not st["open"] and not st["summary"]:
+            text = summary_text(st, rules, today)
+            if text:
+                store.enqueue("ema_summary", text)
+                sent += 1
+            st["summary"] = True
+        store.put(KEY, st)
+    return sent
+
+
+def entry_info(su: Setup, tr: Trade, rules: DayTradeRules, now_ms: int, spot: float, delta: float | None,
+               swing: float | None, intra: float | None, cfg) -> dict:
+    """What a study of the trade needs later: why it was taken, how late the fill was, how far each stop sat."""
+    from .trend import label_for
+    tz = cfg.tz
+    retest = f", pullback {_et(su.retest_t, tz):%H:%M}" if su.retest_t else ""
+    prem_stop = tr.entry * rules.stop
+    return {
+        "reason": f"{'bullish' if su.side == 'bull' else 'bearish'} EMA {rules.fast}/{rules.slow} cross "
+                  f"{_et(su.cross_t + FIVE, tz):%H:%M}{retest}, confirmation candle closed {_et(su.entry_t, tz):%H:%M}",
+        "confirmed_close": True,                 # only completed 5-minute candles are ever scanned
+        "candle_close": _et(su.entry_t, tz).strftime("%H:%M:%S"),
+        "fill_at": _et(now_ms, tz).strftime("%H:%M:%S"),
+        "fill_delay_s": round((now_ms - su.entry_t) / 1000),
+        "chart_stop_pct": round(100 * abs(su.price - su.invalidation) / su.price, 2),
+        "premium_stop_pct": round(100 * prem_stop / delta / spot, 2) if delta and spot else None,
+        "delta": round(delta, 2) if delta else None,
+        "entry_bid": tr.bid, "entry_ask": tr.ask,
+        "entry_spread_pct": round(100 * (tr.ask - tr.bid) / tr.entry_mid, 1) if tr.bid and tr.ask and tr.entry_mid
+        else None,
+        "swing": round(swing) if swing is not None else None,
+        "intraday": round(intra) if intra is not None else None,
+        "with_swing": None if swing is None else
+        ("with" if su.sign * swing >= cfg.trend_bias else "against" if su.sign * swing <= -cfg.trend_bias
+         else "neutral"),
+        "swing_label": label_for(swing, cfg.trend_strong, cfg.trend_bias) if swing is not None else None,
+        "vwap": su.vwap, "orb": su.orb, "regime": su.regime,
+    }
 
 
 def status_text(store, cfg, now: datetime, five: dict[str, list[Bar]]) -> str:
@@ -652,7 +870,8 @@ def status_text(store, cfg, now: datetime, five: dict[str, list[Bar]]) -> str:
                          f"{tr.entry:.2f} · stop {tr.stop:.2f} · {tr.open_qty} left · realized {_money(tr.pnl)}")
     for t in st.get("closed") or []:
         lines.append(f"  closed: {t['symbol']} {t['contract']} {t['in']}→{t['out']} {t['exit_reason']} "
-                     f"{_money(t['pnl'])}")
+                     f"{_money(t['pnl'])}" + (f" · best {t['mfe_pct']:+.0f}% / worst {t['mae_pct']:+.0f}%"
+                                              if "mfe_pct" in t else ""))
     lines.append(f"<i>Entries {rules.start}–{rules.last_entry} ET, all closed by {rules.close}. Paper-tracked.</i>")
     return "\n".join(lines)
 

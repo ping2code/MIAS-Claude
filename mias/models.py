@@ -18,6 +18,7 @@ class SymbolResult:
     chain_truncated: bool = False
     errors: list[str] | None = None
     source_note: str | None = None      # e.g. where an index's trend and price come from
+    events: dict | None = None          # earnings estimate, IV event, IV rank (mias/events.py)
 
     @property
     def price(self) -> float | None:
@@ -54,4 +55,5 @@ class SymbolResult:
             "options": self.options.to_dict() if self.options else None,
             "chain_truncated": self.chain_truncated,
             "errors": self.errors or [],
+            "events": self.events,
         }

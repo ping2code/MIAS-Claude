@@ -696,7 +696,7 @@ def _with_unusual(sym, prints):
     return SymbolResult(sym, options=snap)
 
 
-def test_unusual_report_ranks_marks_and_caps():
+def test_unusual_report_ranks_new_activity_and_caps():
     from mias.formatting import unusual_report
     now = datetime.combine(TODAY, time(10, 40), ET)
     res = [_with_unusual("AAA", [("call", 100, "buy", 5000, 9e6, 100), ("put", 90, "buy", 4000, 2e6, 50),
@@ -704,15 +704,75 @@ def test_unusual_report_ranks_marks_and_caps():
            _with_unusual("BBB", [("put", 50, "sell", 8000, 5e6, 300)])]
     text, vols = unusual_report(res, now, None, top=10)
     lines = text.splitlines()
-    assert "AAA 10/16 100C" in lines[2] and "BBB 10/16 50P" in lines[3]       # ranked by premium
-    assert text.count("AAA ") == 3                                              # max 3 per symbol
-    assert "🆕" not in text and "Lean" in text                                  # first report: no markers
-    # Next report: AAA 100C grew, BBB unchanged, AAA 90P dropped from prev so it's "new" again.
+    assert "AAA 10/16 100C" in lines[2] and "BBB 10/16 50P" in lines[3]       # first report: premium since open
+    assert text.count("AAA ") == 3 and "since the open" in text                 # max 3 per symbol
+    assert "possibly new positions" in text and "by last trade" in text and "🆕" not in text
+    assert len(vols) == 4                                                       # every flagged contract tracked
+    # Next report: AAA 100C grew by 1,000, BBB unchanged (quiet, not shown), AAA 90P is new.
     prev = dict(vols); prev["O:AAA0"] = 4000; prev.pop("O:AAA1")
-    text2, _ = unusual_report(res, now, prev, top=10)
-    assert "⬆️ 🟢 AAA 10/16 100C" in text2 and "+1,000 since last" in text2
-    assert "🆕 🔴 AAA 10/16 90P" in text2 and "1 new, 1 growing" in text2
-    assert unusual_report([SymbolResult("ZZZ")], now, None, 10)[0] is None     # nothing unusual: no message
+    text2, _ = unusual_report(res, now, prev, top=10, since=now - timedelta(minutes=5))
+    assert "⬆️ 🟢 AAA 10/16 100C · new $1.8M (+1,000)" in text2
+    assert "🆕 🔴 AAA 10/16 90P" in text2 and "BBB" not in text2 and "1 new, 1 growing" in text2
+    assert "since 10:35" in text2 and "quiet" in text2
+    assert unusual_report(res, now, vols, top=10)[0] is None                    # nothing traded: no message
+    assert unusual_report([SymbolResult("ZZZ")], now, None, 10)[0] is None
+
+
+def test_unusual_report_uses_trade_by_trade_tape():
+    from mias.flow import Tape
+    from mias.formatting import unusual_report
+    now = datetime.combine(TODAY, time(10, 40), ET)
+    res = [_with_unusual("AAA", [("call", 100, "buy", 5000, 9e6, 100)])]
+    # The last trade printed at the ask, but most of the window's premium was sold.
+    tape = Tape("O:AAA0", "call", trades=40, contracts=900, buy=2e5, sell=1.4e6, mid=1e5, multi=3e5, sweeps=2)
+    text, _ = unusual_report(res, now, {"O:AAA0": 4100}, top=10, tapes={"O:AAA0": tape})
+    assert "🔴 AAA 10/16 100C · new $2.0M" in text
+    assert "buy 10% · sell 70% · mid 5% · multi-leg 15% · 2 sweeps" in text
+    assert "trade by trade" in text and "bearish $1.4M" in text and "multi-leg $300K" in text
+
+
+def test_tape_classifies_each_print_against_its_quote():
+    from mias.flow import classify
+    q = [{"sip_timestamp": 1, "bid_price": 1.00, "ask_price": 1.10},
+         {"sip_timestamp": 10, "bid_price": 1.20, "ask_price": 1.30}]
+    trades = [{"sip_timestamp": 2, "price": 1.10, "size": 10, "conditions": [209]},          # at ask: buy
+              {"sip_timestamp": 3, "price": 1.00, "size": 5, "conditions": [209]},           # at bid: sell
+              {"sip_timestamp": 4, "price": 1.05, "size": 4, "conditions": [209]},           # mid
+              {"sip_timestamp": 11, "price": 1.20, "size": 10, "conditions": [219]},         # new quote: bid, sweep
+              {"sip_timestamp": 12, "price": 1.25, "size": 20, "conditions": [232]},         # multi-leg
+              {"sip_timestamp": 13, "price": 9.99, "size": 99, "conditions": [201]}]         # cancelled
+    t = classify("O:X", "put", trades, q)
+    assert t.trades == 5 and t.contracts == 49
+    assert round(t.buy) == 1100 and round(t.sell) == 500 + 1200 and round(t.mid) == 420 and round(t.multi) == 2500
+    assert t.sweeps == 1 and t.bear == t.buy and t.lean == "mixed"
+
+
+def test_oi_verdict_and_lines():
+    from mias.flow import oi_verdict
+    from mias.formatting import oi_lines
+    assert oi_verdict(1000, 500, 1400)[0] == "opened"
+    assert oi_verdict(1000, 500, 700)[0] == "partly"
+    assert oi_verdict(1000, 500, 450)[0] == "closed"
+    checks = [{"symbol": "NVDA", "kind": "call", "strike": 200, "expiry": "2026-11-20", "volume": 25000,
+               "oi": 1000, "oi_after": 22300, "premium": 9e6, "lean": "bull", "verdict": "opened", "share": 0.85},
+              {"symbol": "QQQ", "kind": "put", "strike": 670, "expiry": "2026-11-20", "volume": 8000,
+               "oi": 40000, "oi_after": 39000, "premium": 4e6, "lean": "bear", "verdict": "closed", "share": -0.12}]
+    text = "\n".join(oi_lines(checks))
+    assert "✅ NVDA 11/20 200C · vol 25,000 → OI +21,300 (85%) · opened · was bullish" in text
+    assert "✖️ QQQ 11/20 670P" in text and "closing/turnover" in text
+    assert "Opened 1 · partly 0 · closing/turnover 1" in text and "bullish $9.0M" in text
+
+
+def test_block_lines_trust_the_tape():
+    from mias.flow import Tape
+    from mias.formatting import block_lines
+    b = lambda tk, kind, side, vol: {"symbol": "QQQ", "ticker": tk, "expiry": "2026-11-20", "strike": 600,
+                                     "kind": kind, "side": side, "volume": vol, "price": 5, "premium": 6e6}
+    items = [b("A", "put", "buy", 1000), b("B", "call", "sell", 1000)]
+    tapes = {"A": Tape("A", "put", buy=1e6, sell=1e5, multi=5e6),          # mostly multi-leg: skipped
+             "B": Tape("B", "call", buy=4e6, sell=1e6)}                     # bought, though the last print hit the bid
+    text = "\n".join(block_lines(items, tapes))
+    assert "🟢 QQQ 11/20 600C" in text and "mostly bought" in text and "multi-leg or paired" in text
 
 
 def test_unusual_report_every_10_minutes(cfg):
@@ -726,7 +786,7 @@ def test_unusual_report_every_10_minutes(cfg):
     import mias.formatting as fm
     real = fm.unusual_report
 
-    def spy(results, now, prev, top, per_symbol=3, blocks=None):
+    def spy(results, now, prev, top, per_symbol=3, blocks=None, tapes=None, since=None, oi_lines=None):
         sent.append(now)
         return "🔥 report", {}
     fm.unusual_report = spy

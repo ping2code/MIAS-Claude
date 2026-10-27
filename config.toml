@@ -200,6 +200,17 @@ stop = 0.20
 first_target = 0.30
 trail = [[0.75, 0.50], [1.00, 0.75]]
 max_losses_in_row = 2
+manage_seconds = 30        # open paper trades are re-priced this often between the 150 s cycles
+swing_filter = false       # true: skip entries against the swing trend (see the backtest's swing split first)
+# Paper fills are realistic: bought at the ask, sold at the bid (never above the trigger price); the midpoint
+# result is shown alongside. Every closed trade is logged with MFE/MAE, stop distances, spread, fill delay and the
+# trend at entry: python -m mias ema-log
+
+[brief]
+# The day-trade brief at 09:45 ET (and /brief anytime): SPY/QQQ/IWM opening read, trend or chop day, the leading
+# sector, 3-5 day-trade candidates (relative volume x opening move, liquid options only) and key levels.
+enabled = true
+time = "09:45"
 
 [positions]
 # Rules for positions tracked with /buy (alerts go privately to whoever added the position).

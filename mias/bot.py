@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 _reply_chat: contextvars.ContextVar[str | None] = contextvars.ContextVar("reply_chat", default=None)
 GROUP_TYPES = ("group", "supergroup")
 KNOWN = {"trend", "t", "market", "sector", "sectors", "picks", "list", "status", "help", "start", "whoami",
-         "buy", "sell", "positions", "pos", "ema"}
+         "buy", "sell", "positions", "pos", "ema", "scorecard", "brief"}
 PRIVATE_ONLY = {"buy", "sell", "positions", "pos"}
 # The user and chat type of the message being answered (position commands are per user, private chats only).
 _user: contextvars.ContextVar[str] = contextvars.ContextVar("user", default="")
@@ -48,6 +48,8 @@ COMMANDS = [
     ("sector", "Sector board, or one sector: /sector energy"),
     ("picks", "Today's call and put spread picks"),
     ("ema", "EMA 9/21 day-trade watch and today's paper trades"),
+    ("brief", "Morning day-trade brief: candidates and key levels"),
+    ("scorecard", "How the alerts did: /scorecard 30 for 30 days"),
     ("positions", "Your open positions (private chat)"),
     ("buy", "Track a position: /buy AMZN 11/20 260/280C 6.63 x1"),
     ("sell", "Close a tracked position: /sell AMZN 13.40"),
@@ -62,6 +64,8 @@ Shortcut: just send <code>NVDA</code> or <code>nvda mu</code>
 /market: SPY, QQQ, IWM, watchlist breadth and sectors
 /sector: which sector is strongest (also in every digest); /sector energy for its members
 /picks: today's call and put spread picks (also sent automatically at 10:00 ET)
+/brief: the 09:45 day-trade brief again (candidates, key levels) · /scorecard: how the alerts did
+(/scorecard 30 for 30 days, /scorecard replay for the replayed history)
 /ema: 5-minute EMA 9/21 cross-and-retest watch (SPY, QQQ, NVDA, TSLA, META) and today's paper trades (entries also alert the group)
 /list: watched symbols · /status: health · /whoami: your IDs
 
@@ -191,6 +195,16 @@ class CommandBot:
             await self.reply(await self.market_text())
         elif cmd in ("sector", "sectors"):
             await self.reply(self.sector_text(args[0] if args else None))
+        elif cmd == "scorecard":
+            from . import scorecard
+            now = datetime.now(timezone.utc)
+            if args and args[0].lower() == "replay":
+                await self.reply(scorecard.report(self.svc.store, now, 3650, source="replay"))
+            else:
+                days = int(args[0]) if args and args[0].isdigit() else 7
+                await self.reply(scorecard.report(self.svc.store, now, max(1, min(days, 365))))
+        elif cmd == "brief":
+            await self.reply(self.svc.brief_text(datetime.now(timezone.utc)))
         elif cmd == "ema":
             from . import emacross
             await self.reply(emacross.status_text(self.svc.store, self.svc.cfg, datetime.now(timezone.utc),

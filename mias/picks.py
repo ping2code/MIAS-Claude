@@ -6,6 +6,9 @@ Candidate rules (per side, mirror for puts):
   always  options not thin; index-style instruments (e.g. NDX) are skipped (contracts too large)
 Ranking: swing score + 0.5 x intraday score + 0.5 x options score (signed toward the trade).
 
+Earnings (estimated, mias/events.py): a symbol whose report looks due within 5 trading days is skipped;
+one due before the spread's expiry is picked with a warning.
+
 Spread: expiry 30-60 days (closest to 45), long leg about 0.50 delta, short leg about 0.25 delta further out
 of the money, both with open interest >= 1,000 and a quoted spread <= 5% of mid.
 """
@@ -52,6 +55,7 @@ class Spread:
     intraday: float
     options: float | None
     confidence: str
+    warnings: tuple[str, ...] = ()
 
     @property
     def cost(self) -> float:
@@ -90,9 +94,18 @@ def candidates(results: list[SymbolResult], side: str, cfg) -> list[tuple[str, f
         if verdict(r, tfs).level not in ("HIGH", "MEDIUM"):
             continue
         tier = "A" if swing >= cfg.trend_strong else "B" if swing >= cfg.trend_bias else None
-        if tier:
+        if tier and not earnings_soon(r, today=None):
             out.append((tier, swing + 0.5 * intra + 0.5 * opt, r))
     return sorted(out, key=lambda x: (x[0], -x[1]))
+
+
+def earnings_soon(r: SymbolResult, today: date | None, days: int = 5) -> bool:
+    e = (r.events or {}).get("earnings")
+    if not e:
+        return False
+    today = today or date.today()
+    nxt = date.fromisoformat(e["next"])
+    return today - timedelta(days=1) <= nxt <= add_trading_days(today, days)
 
 
 def closest(results: list[SymbolResult], side: str) -> SymbolResult | None:
@@ -143,8 +156,22 @@ async def pick_side(client: MassiveClient, results: list[SymbolResult], side: st
             r.symbol, side, tier, long.expiry, long.dte, long.strike, short.strike, long.mid, short.mid,
             (round(long.bid - short.ask, 2), round(long.ask - short.bid, 2)), long.oi, short.oi, r.price,
             sign * swing, sign * intra, (sign * opt) if r.bias and r.bias.components else None,
-            verdict(r, list(cfg.trend_profiles[cfg.trend_primary])).level), None
+            verdict(r, list(cfg.trend_profiles[cfg.trend_primary])).level,
+            tuple(w for w in _warnings(r, long.expiry) if w)), None
     return None, closest(results, side)
+
+
+def _warnings(r: SymbolResult, expiry: date) -> list[str]:
+    ctx = r.events or {}
+    out = []
+    e = ctx.get("earnings")
+    if e and date.fromisoformat(e["next"]) <= expiry:
+        out.append(f"⚠️ Earnings ~{date.fromisoformat(e['next']):%b %d} (estimated) before expiry: expect an IV drop "
+                   f"after the report and a gap either way")
+    ev = ctx.get("iv_event")
+    if ev and date.fromisoformat(ev["by"]) <= expiry:
+        out.append(f"⚠️ Options price an event by {date.fromisoformat(ev['by']):%b %d} (±{ev['move']:.0f}% implied)")
+    return out
 
 
 def add_trading_days(start: date, n: int) -> date:

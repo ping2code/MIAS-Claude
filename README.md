@@ -19,6 +19,8 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | `/sector`, `/sector energy` | The sector board, or one sector's members with price, swing, intraday, options and IV |
 | `/buy AMZN 11/20 260/280C 6.63 x1` | Track a position (private chat only; first strike = the one you bought; add `by 10/30` for your own exit date). Single options too: `/buy NVDA 12/18 190C 9.85` |
 | `/positions`, `/sell AMZN 13.40` | Your positions with live value and P&L; close one (by symbol or `#`, no price = current mid) |
+| `/brief` | The day-trade brief (also sent at 09:45): opening read, trend or chop day, candidates, key levels |
+| `/scorecard`, `/scorecard 30`, `/scorecard replay` | How the alerts did: share that went the right way 1 hour, 1 day and 5 days later, and the option's return |
 | `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META): where the EMAs are, the last cross and what became of it, today's paper trades |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
 
@@ -71,7 +73,8 @@ Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 | 1 Day trade (paper) | **EMA 9/21 cross + retest** entries (SPY, QQQ, NVDA, TSLA, META) and their management (first target, trail, stop, invalidated, end of day), then a summary at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
 | 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |
 | 2 Changes | One message every 15 min (09:45, 10:00, …) if anything changed: swing trend changes, options bias flips, call/put wall breaks, IV spikes, alignment ended, market trend, plus the sector ranking with ▲▼. Only the latest change per symbol shows | Group |
-| 3 Context | Unusual activity every 5 min, now with **blocks ≥ $5M** since the last report: one-sided ones listed, matched pairs (spreads, rolls, combos) and mid-price prints skipped. Digests, picks, closing summary as below | Group |
+| 3 Context | **Unusual activity** every 5 min: only contracts that traded since the last report, ranked by that new premium, each classified **trade by trade** (buy / sell / mid / multi-leg, sweeps). The first report of the day checks **yesterday's flow against today's open interest**. Blocks ≥ $5M since the last report, judged by their trades. See [Options flow](#options-flow) | Group |
+| 3 Context | **Day-trade brief** at 09:45 ([Morning brief](#morning-brief)); **scorecard** every Friday at the close ([Scorecard](#alert-scorecard)) | Group |
 
 **Hysteresis** keeps tier 2 quiet when a score wobbles: a trend counts as UP after passing +30 and stays UP until it
 falls back under +15 (STRONG: in at 60, out under 50), confirmed over 2 checks. Options: in at ±50, out inside
@@ -122,6 +125,109 @@ Options: BULLISH (+31)  net prem +$4.2M · P/C 0.44 · IV 45.7%
 Swing call: ... · Day trade call: ...
 ```
 
+## Options flow
+
+The unusual-activity report separates new activity from the day's totals and reads every trade:
+
+- **New, not cumulative**: a contract shows only if it traded since the previous report, ranked by the premium
+  traded in that window. The day's total, volume and open interest follow on the same line.
+- **Trade by trade**: each print in the window is compared with the quote in force when it printed. Buyer-initiated
+  (at or near the ask), seller-initiated (at or near the bid), mid (no side), and **multi-leg** (the exchange flags
+  spreads, rolls and combos; stock-tied trades too) are totalled separately; sweeps are counted. A contract is
+  called bullish or bearish only when 60%+ of its premium is one way. Before, the whole contract took the side of
+  its last trade.
+- **Opening or closing?** Volume above open interest doesn't prove new positions: intraday volume includes closing
+  trades and the same contracts changing hands. Open interest is published once a day, so the first report each
+  morning checks yesterday's flagged contracts: ✅ opened (OI rose by half the volume or more), ↔️ partly, ✖️
+  closing/turnover.
+- Costs two API calls per contract for the top 30 contracts of each window (about 1–2 seconds).
+
+Example (live, 2026-10-26):
+```
+⬆️ 🟢 META 11/20 660C · new $8.8M (+4,193) · buy 97% · sell 2% · mid 1% · 17 sweeps · day $22.2M, vol 10,751 vs OI 3,382
+⬆️ ⚪ QQQ 11/20 714P · new $3.2M (+2,011) · multi-leg 99% · day $6.7M, vol 4,138 vs OI 2,372
+⬆️ 🔴 TSLA 10/30 400C · new $372K (+656) · buy 20% · sell 66% · mid 9% · multi-leg 5% · 2 sweeps · ...
+New flow (trade by trade): bullish $10.1M · bearish $1.6M · no side $480K · multi-leg $3.3M
+```
+
+## Contract choice: IV and earnings
+
+Under every swing contract (`/trend`, pullback and strong-alignment alerts):
+
+- **IV state** (30-day ATM IV against 20-day realized volatility, and its percentile once 20+ days are recorded):
+  *fair* is where the 2-year backtest made its money; *expensive* (1.25× realized or top 30% of its history) and
+  *below realized* (the stock already swinging hard) both did worse, for single options and debit spreads alike.
+  So the advice is to size down or wait, not to switch structures. The debit spread (~0.60Δ long, ~0.30Δ short)
+  is shown as the cheaper way in.
+- **Earnings** (estimated; the data plan has no earnings calendar): earnings show up as a gap or big move on 2×+
+  normal volume about every 91 days, so the next report is estimated from the last one (±1 week; "rough" when
+  the quarterly rhythm isn't confirmed). A warning appears when it falls before the expiry, and a stronger one
+  when it is within a week. The daily picks skip symbols reporting within 5 trading days and warn about later ones.
+- **Events priced in options**: an expiry whose IV implies a forward volatility far above the rest of the curve has
+  an event before it (earnings, a ruling, a launch). The warning gives the implied move.
+
+## Alert scorecard
+
+Every directional alert is logged (pullback entries, strong alignment, trend changes, options flips, wall breaks,
+EMA entries, one-sided flow, flow confirmed by open interest) and scored 1 hour (capped at the close), 1 trading
+day and 5 trading days later: did the stock move the alert's way, and what did the named contract return.
+`/scorecard` (7 days), `/scorecard 30`, every Friday at the close, and `python -m mias scorecard`.
+`python -m mias scorecard --backfill` replays the recorded checks through today's rules; `/scorecard replay`
+shows that history.
+
+## Morning brief
+
+At 09:45 ET (`[brief]`, and `/brief` anytime):
+- SPY, QQQ, IWM: gap, first 15 minutes, VWAP side, opening volume against normal
+- the day's character so far: **trending** (ADX ≥ 25 and a real move from the open) or **choppy**
+- the leading sector
+- **3–5 day-trade candidates**: watchlist stocks with liquid short-dated options and a real opening move (gap or
+  first-15-minute move ≥ 0.5%), ranked by relative opening volume × the move, each with its opening range, VWAP,
+  prior-day high/low/close and a day-trade contract (1–14 days, ~0.45Δ, bid/ask spread ≤ 5%)
+- key levels for SPY and QQQ, with the call and put walls
+
+## Swing entries backtest
+
+`python -m mias pullback-backtest`: 55 symbols, Oct 2024 to Oct 2026, scores rebuilt every 30 minutes from
+5-minute and daily bars, each entry bought at the next hourly option bar (real prices), exits as `[positions]`
+(+50% / 55% of max, −50%, 10 trading days). No options-flow filter (no history that far back). Profit factor:
+
+| Entry | Calls, single | Calls, spread | Puts, single | Puts, spread |
+|---|---|---|---|---|
+| Strong alignment (swing and intraday ≥ 60) | **1.26** | **1.27** | 0.61 | 0.60 |
+| Buy the trend (every 5th day while swing UP) | 1.16 | 1.21 | 0.70 | 0.75 |
+| Pullback over (the tier-1 rule) | 1.09 | 1.19 | 0.62 | 0.60 |
+
+| Calls by IV at entry | Strong, single | Pullback, single | Pullback, spread |
+|---|---|---|---|
+| IV below realized | 0.95 | 0.89 | 1.14 |
+| IV fair | **1.82** | 1.20 | 1.43 |
+| IV expensive | 0.91 | 1.05 | 0.89 |
+
+What it says: the period rose, so calls made money and puts lost almost everywhere; the pullback rule did not beat
+simpler entries over two years (the 12-day replay favoured it, too small a sample); fair IV mattered more than
+the entry rule; spreads did not rescue expensive-IV entries; exiting when the swing trend turned against the trade
+didn't help. Trades held through earnings looked better, but the earnings dates are found from big moves after
+the fact, so that split is biased and isn't used. Full tables in `data/pullback_backtest/report.md`.
+
+## Day-trade setups backtest
+
+`python -m mias daytrade-backtest`: SPY, QQQ, NVDA, TSLA, META, Apr 27 to Oct 23 2026, 5 contracts, the handout's
+management, real option minute bars, 1% slippage on every fill.
+
+| Setup | Trades | Win | Profit factor | P&L |
+|---|---|---|---|---|
+| EMA 9/21 cross + retest, 2-minute candles | 1,265 | 33% | 0.80 | −$36,024 |
+| EMA 9/21, 3-minute | 947 | 31% | 0.64 | −$56,713 |
+| EMA 9/21, 5-minute | 554 | 30% | 0.55 | −$44,766 |
+| Opening-range breakout | 242 | 37% | 0.71 | −$13,530 |
+| VWAP reclaim / lost | 940 | 36% | 0.80 | −$32,542 |
+| VWAP rejection | 606 | 30% | 0.50 | −$53,112 |
+| Prior-day high/low break | 254 | 40% | 0.70 | −$13,993 |
+
+None made money; the trend-day filter applied to few trades and didn't change that. So no setup gets live
+alerts; the EMA paper trades continue as a live test. Per-symbol tables in `data/daytrade_backtest/report.md`.
+
 ## EMA 9/21 day trade (paper)
 
 The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NVDA, TSLA and META (`[daytrade]`, `mias/emacross.py`):
@@ -136,6 +242,22 @@ at +30% and move the runners to breakeven, at +75% protect +50%, at +100% protec
 entries after 2 losses in a row. Puts mirror it. Times are ET.
 
 The service paper-trades it on live option quotes and alerts the group at each step.
+
+How the paper trades are kept honest and studied:
+- **Real fills**: bought at the ask, sold at the bid (never above the trigger price). The midpoint result is shown
+  next to it. On 2026-10-26 the three trades made +$235 at mid but +$110 at bid/ask (META's 4.4% spread alone
+  cost ~$80).
+- **Checked every 30 seconds** (`manage_seconds`) while a paper trade is open, not just every 150-second cycle,
+  so stops and trails are acted on close to where they trigger.
+- **Recorded for study** (`python -m mias ema-log`, CSV in `data/ema_log.csv`): entry reason (cross, pullback,
+  confirmation candle), the confirmed candle-close time and the fill time (delay in seconds), the chart stop and
+  the premium stop each as a % stock move (the −20% premium stop is often several times tighter than the chart
+  stop on same-day options), bid/ask spread at entry and exit, MFE and MAE (best and worst option price, with the
+  time, and the stock's best and worst move), and the swing and intraday trend at entry.
+- **Swing-trend check**: each entry alert says whether it goes with or against the swing trend (META's losing
+  call on 10/26 went against a swing DOWN). `swing_filter = true` skips entries against it. It stays off:
+  in the 6-month backtest, trading only with the swing trend didn't rescue any setup (EMA 5m: with the trend PF
+  0.49, against 0.70; EMA 2m: with 0.88, against 0.59; VWAP reclaim with 0.91). Every split still lost money.
 
 **Backtest** (`python -m mias ema-backtest`, real SPY 5-minute bars and the real option minute bars, Apr 27 to
 Oct 23 2026, no commissions or slippage):
@@ -233,6 +355,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m mias rank --top 20         # rank ~70 candidates by options premium traded
 .venv/bin/python -m mias telegram-test
 .venv/bin/python -m mias ema-backtest --symbols SPY,QQQ --start 2026-04-27 --end 2026-10-23
+.venv/bin/python -m mias daytrade-backtest     # EMA (2/3/5m), ORB, VWAP reclaim/reject, prior-day breaks
+.venv/bin/python -m mias pullback-backtest     # swing entries over 2 years on real option prices
+.venv/bin/python -m mias scorecard --backfill  # replay recorded checks into the scorecard
 .venv/bin/python -m mias run                   # the service
 .venv/bin/python -m pytest -q
 ```
@@ -302,4 +427,9 @@ mias/engine.py      one cycle across all symbols               mias/app.py      
 mias/store.py       SQLite (state, history, alert outbox)      mias/web.py         dashboard
 mias/bot.py         Telegram commands (/trend, /market)        mias/verdict.py     confidence verdict
 mias/emacross.py    EMA 9/21 day trade: detection, backtest, live paper trades
+mias/daysetups.py   other intraday setups (ORB, VWAP, prior-day breaks) and their comparison backtest
+mias/swingtest.py   swing entries backtest (pullback vs strong vs trend, single vs spread)
+mias/flow.py        trade-by-trade flow classification, next-day open-interest check
+mias/events.py      earnings estimate, IV events, IV rank, single-vs-spread advice
+mias/scorecard.py   alert outcomes 1h/1d/5d          mias/brief.py   09:45 day-trade brief
 ```

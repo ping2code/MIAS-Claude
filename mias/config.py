@@ -139,6 +139,8 @@ class Config:
     iv_spike_series: str                 # "month" (~30-day ATM IV) or "front" (nearest expiry, noisy)
     options_confirm_cycles: int          # tiered mode: cycles an options flip must hold
     daytrade: "DayTradeRules"            # [daytrade]: the 5-minute EMA cross-and-retest paper trades
+    brief_enabled: bool                  # [brief]: the morning day-trade brief
+    brief_time: str
     telegram_enabled: bool
     telegram_commands: bool
     web_enabled: bool
@@ -320,6 +322,8 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         iv_spike_series=al.get("iv_spike_series", "month"),
         options_confirm_cycles=max(1, int(al.get("options_confirm_cycles", al.get("confirm_cycles", 2)))),
         daytrade=_daytrade(raw.get("daytrade", {})),
+        brief_enabled=bool(raw.get("brief", {}).get("enabled", True)),
+        brief_time=raw.get("brief", {}).get("time", "09:45"),
         telegram_enabled=bool(tg.get("enabled", True)),
         telegram_commands=bool(tg.get("commands", True)),
         web_enabled=bool(web.get("enabled", True)),
