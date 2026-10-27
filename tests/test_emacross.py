@@ -153,7 +153,13 @@ class FakeClient:
                     "underlying_asset": {"price": self.spot}} for t in tickers}
 
 
+def _only(cfg, *strategies):
+    from dataclasses import replace
+    return replace(cfg, daytrade=replace(cfg.daytrade, strategies=strategies))
+
+
 def test_live_paper_trade_entry_partial_and_close_summary(cfg, tmp_path):
+    cfg = _only(cfg, "retest")
     bars, i = _bars_with_bull_setup()
     store = Store(tmp_path / "live.db")
     client = FakeClient()
@@ -175,7 +181,56 @@ def test_live_paper_trade_entry_partial_and_close_summary(cfg, tmp_path):
     assert rules[-2:] == ["ema_time", "ema_summary"]
     assert "1 trade" in store.pending()[-1][2]
     text = E.status_text(store, cfg, close, {"SPY": bars})
-    assert "EMA 9/21" in text and "closed: SPY" in text
+    assert "EMA 9/21" in text and "EMA retest</b>: 1 closed" in text
+
+
+def _cross_index(bars):
+    closes = [b.c for b in bars]
+    f, s = ema(closes, 9), ema(closes, 21)
+    return next(n for n in range(1, len(bars)) if f[n] > s[n] and f[n - 1] <= s[n - 1]
+                and bars[n].t >= int(datetime.combine(DAY, time(9, 30), ET).timestamp() * 1000))
+
+
+def test_cross_strategy_enters_on_the_cross_with_its_own_record(cfg, tmp_path):
+    bars, i = _bars_with_bull_setup()
+    k = _cross_index(bars)
+    store = Store(tmp_path / "x.db")
+    client = FakeClient()
+    client.spot = bars[k].c
+    at = datetime.fromtimestamp((bars[k].t + E.FIVE) / 1000 + 60, timezone.utc)
+    assert asyncio.run(E.live(client, store, cfg, at, {"SPY": bars[:k + 1]})) == 1
+    rows = store.pending()
+    assert "CROSS (no retest)" in rows[-1][2]
+    assert "SPY" in (store.get("ema_cross_day") or {}).get("open", {})
+    assert not (store.get("ema_day") or {}).get("open")          # the retest strategy is still waiting
+    # Later the retest entry comes too: both strategies hold SPY, in separate records.
+    at2 = datetime.fromtimestamp((bars[i].t + E.FIVE) / 1000 + 60, timezone.utc)
+    client.spot = bars[i].c
+    asyncio.run(E.live(client, store, cfg, at2, {"SPY": bars}))
+    assert "CROSS + RETEST" in store.pending()[-1][2]
+    close = datetime.combine(DAY, time(15, 10), ET)
+    asyncio.run(E.live(client, store, cfg, close, {"SPY": bars}))
+    log = store.get(E.LOG_KEY)
+    assert sorted(t["strategy"] for t in log) == ["cross", "retest"]
+    summaries = [r[2] for r in store.pending() if r[1] == "ema_summary"]
+    assert len(summaries) == 2 and any("cross (no retest)" in s for s in summaries)
+
+
+def test_health_gate_holds_paper_entries(cfg, tmp_path):
+    cfg = _only(cfg, "retest")
+    bars, i = _bars_with_bull_setup()
+    at = datetime.fromtimestamp((bars[i].t + E.FIVE) / 1000 + 60, timezone.utc)
+    store = Store(tmp_path / "h.db")
+    client = FakeClient()
+    client.spot = bars[i].c
+    held = asyncio.run(E.live(client, store, cfg, at, {"SPY": bars}, issues={"SPY": ["stock: ReadTimeout"]}))
+    assert held == 0 and store.get("ema_day")["skipped"] == {"data health": 1}
+    assert store.get(f"health:{DAY}") == {"SPY": {"stock": 1}}
+    # A wide option spread holds the entry too.
+    store2 = Store(tmp_path / "h2.db")
+    client.mid = 0.20                                            # 0.18 / 0.22: a 20% spread
+    assert asyncio.run(E.live(client, store2, cfg, at, {"SPY": bars})) == 0
+    assert store2.get("ema_day")["skipped"] == {"data health": 1}
 
 
 def test_daytrade_config_parses():

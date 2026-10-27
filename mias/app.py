@@ -16,7 +16,7 @@ from .web import WebServer
 
 log = logging.getLogger(__name__)
 
-WINDOW_START, WINDOW_END = dtime(9, 25), dtime(16, 15)
+WINDOW_START, WINDOW_END = dtime(9, 0), dtime(16, 15)   # 09:00-09:30: warm-up cycles, no alerts
 OPEN, CLOSE = dtime(9, 30), dtime(16, 0)
 TAPE_CONTRACTS = 30              # unusual contracts per report that get a trade-by-trade tape
 FLOW_SCORE_PREMIUM = 1_000_000   # one-sided new flow at least this large is logged on the scorecard
@@ -38,6 +38,8 @@ class Service:
         self.telegram = tg
         self.dispatcher = Dispatcher(self.store, tg, cfg.telegram_alert_chats)
         self.engine = Engine(cfg, self.client, self.store, self.dispatcher)
+        self._live_day = None                  # date of the last live cycle (closing summary)
+        self._pre_cache: dict = {}             # daily bars for the pre-market messages, per day
         self.heartbeat = time.time()
         self.market_state = "unknown"
         self.bad_cycles = 0
@@ -59,7 +61,8 @@ class Service:
         web = WebServer(self) if self.cfg.web_enabled else None
         if web:
             await web.start(self.cfg.web_host, self.cfg.web_port)
-        watch_task = asyncio.create_task(self._watch_paper_trades()) if self.cfg.daytrade.enabled else None
+        watch_task = asyncio.create_task(self._watch_paper_trades()) \
+            if self.cfg.daytrade.enabled or self.cfg.closeplay_enabled else None
         bot_task = bot = None
         if self.telegram and self.cfg.telegram_commands:
             from .bot import CommandBot
@@ -112,6 +115,7 @@ class Service:
         today = local.date().isoformat()
         sent = self.store.get(f"digests:{today}", [])
 
+        await self._send_premarket(now)
         if not _in_window(local):
             self.market_state = "closed"
             await self._housekeeping(today)
@@ -134,6 +138,11 @@ class Service:
                 if t not in sent and due <= local < due + timedelta(minutes=30):
                     self.store.enqueue("digest", self.engine.digest_text(f"MIAS digest {t}", now))
                     sent.append(t)
+        elif local.time() < OPEN:
+            # Warm-up before the bell: bar history cached, dashboard and /market on pre-market prices, data problems
+            # caught early. Dry run: no alerts, no recorded checks (options don't trade yet).
+            self.market_state = "pre-market"
+            await self._run_cycle(now, dry_run=True)
         else:
             was_open = self.market_state == "open"
             self.market_state = "closed"
@@ -143,9 +152,14 @@ class Service:
                     await self._run_cycle(now)     # final read after the bell
                 self._send_changes(now, force=True)
                 self.store.enqueue("digest", self.engine.digest_text("Closing summary", now))
+                from . import health
+                held = health.summary_line(health.day_counts(self.store, today))
+                if held:
+                    self.store.enqueue("system", held)
                 if local.weekday() == 4:
-                    from . import scorecard
+                    from . import scorecard, strategies
                     self.store.enqueue("scorecard", scorecard.report(self.store, now, 7))
+                    self.store.enqueue("strategies", strategies.report(self.store, self.cfg, now, 7))
                 sent.append("close")
         self.store.put(f"digests:{today}", sent)
         await self.dispatcher.flush()
@@ -341,6 +355,39 @@ class Service:
         except Exception:
             log.exception("morning brief failed")
 
+    async def _send_premarket(self, now: datetime) -> None:
+        """07:00 heads-up, 09:15 update ([premarket] times), each once in the 30 minutes after its time."""
+        local = now.astimezone(self.cfg.tz)
+        if not self.cfg.premarket_enabled or local.weekday() >= 5 or local.time() >= OPEN:
+            return
+        key = f"premarket:{local.date()}"
+        st = self.store.get(key) or {"sent": []}
+        for n, t in enumerate(self.cfg.premarket_times):
+            due = datetime.combine(local.date(), dtime.fromisoformat(t), self.cfg.tz)
+            if t in st["sent"] or not (due <= local < due + timedelta(minutes=30)):
+                continue
+            st["sent"].append(t)
+            self.store.put(key, st)
+            try:
+                text, snap = await self.premarket_text(now, st.get("first") if n else None)
+            except Exception:
+                log.exception("pre-market %s failed", t)
+                return
+            if not snap.get("sectors") and not n:
+                log.info("pre-market %s: no pre-market trades (holiday?), nothing sent", t)
+                return
+            if not n:
+                st["first"] = snap
+                self.store.put(key, st)
+            self.store.enqueue("premarket", text)
+            log.info("pre-market %s sent: leader %s, sectors %s", t, snap.get("leader"), snap.get("sectors"))
+
+    async def premarket_text(self, now: datetime, earlier: dict | None = None) -> tuple[str, dict]:
+        from . import premarket
+        day = str(now.astimezone(self.cfg.tz).date())
+        self._pre_cache = {k: v for k, v in self._pre_cache.items() if k.endswith(day)}
+        return await premarket.build(self.client, self.store, self.cfg, now, self._pre_cache, earlier)
+
     def brief_text(self, now: datetime) -> str:
         from .brief import text
         return text(self.engine, self.cfg, now)
@@ -390,10 +437,12 @@ class Service:
         self.screen_error = None
         log.info("options screen done: %d screened", result["screened"])
 
-    async def _run_cycle(self, now: datetime) -> None:
+    async def _run_cycle(self, now: datetime, dry_run: bool = False) -> None:
         try:
-            await asyncio.wait_for(self.engine.cycle(now), timeout=self.cfg.interval_seconds * 0.9)
+            await asyncio.wait_for(self.engine.cycle(now, dry_run=dry_run), timeout=self.cfg.interval_seconds * 0.9)
             ok = self.engine.healthy_cycle()
+            if not dry_run:
+                self._live_day = now.astimezone(self.cfg.tz).date()
         except Exception as exc:
             log.exception("cycle failed: %s", exc)
             ok = False
@@ -408,8 +457,8 @@ class Service:
             self.store.enqueue("system", "✅ MIAS recovered: data flowing normally again")
 
     def _cycled_on(self, local: datetime) -> bool:
-        at = self.engine.last_cycle.get("at")
-        return bool(at) and datetime.fromisoformat(at).astimezone(self.cfg.tz).date() == local.date()
+        """A live (market-hours) cycle ran on this day; warm-up cycles don't count."""
+        return self._live_day == local.date()
 
     async def _watch_paper_trades(self) -> None:
         """Between cycles, re-price open EMA paper trades every [daytrade] manage_seconds (stops and trails would
@@ -430,19 +479,27 @@ class Service:
         from .trend import complete_bars, regular_session, to_bars
         if self.market_state != "open":
             return 0
-        st = self.store.get(emacross.KEY) or {}
-        open_syms = list((st.get("open") or {}) if st.get("date") == str(now.astimezone(self.cfg.tz).date()) else [])
+        from . import closeplay
+        sent = await closeplay.manage(self.client, self.store, self.cfg, now)     # the 15:59 exit
+        if sent:
+            await self.dispatcher.flush()
+        day = str(now.astimezone(self.cfg.tz).date())
+        open_syms = []
+        for strategy in self.cfg.daytrade.strategies:
+            st = self.store.get(emacross.STRATEGIES[strategy]["key"]) or {}
+            if st.get("date") == day:
+                open_syms += [s for s in st.get("open") or {} if s not in open_syms]
         if not open_syms:
-            return 0
+            return sent
         today = now.astimezone(self.cfg.tz).date()
         five = {}
         for sym in open_syms:                      # fresh 5-minute closes for the invalidation check
             raw = await self.client.aggregates(sym, 5, "minute", today, today)
             five[sym] = complete_bars(regular_session(to_bars(raw), self.cfg.tz), 5, int(now.timestamp() * 1000))
-        sent = await emacross.manage(self.client, self.store, self.cfg, now, five)
-        if sent:
+        ema = await emacross.manage(self.client, self.store, self.cfg, now, five)
+        if ema:
             await self.dispatcher.flush()
-        return sent
+        return sent + ema
 
     async def _market_open(self, local: datetime) -> bool:
         try:

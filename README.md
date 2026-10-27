@@ -21,7 +21,8 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | `/positions`, `/sell AMZN 13.40` | Your positions with live value and P&L; close one (by symbol or `#`, no price = current mid) |
 | `/brief` | The day-trade brief (also sent at 09:45): opening read, trend or chop day, candidates, key levels |
 | `/scorecard`, `/scorecard 30`, `/scorecard replay` | How the alerts did: share that went the right way 1 hour, 1 day and 5 days later, and the option's return |
-| `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META): where the EMAs are, the last cross and what became of it, today's paper trades |
+| `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META, MSFT): where the EMAs are, the last cross and what became of it, today's paper trades for both strategies |
+| `/strategies`, `/strategies 30` | Each paper strategy's own record: trades, win rate, average win and loss, expectancy after costs, drawdown; signals held by the health gate |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
 
 Example reply (real data, 2026-10-07 close):
@@ -70,11 +71,12 @@ Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 | 1 Act now | **Pullback over / bounce over**: swing UP or STRONG UP, intraday dipped to −15 or lower and recovered to +35 (2 checks), options not against it; mirror for downtrends. With swing and day-trade contracts | Group, instantly (max one per symbol per direction per 2 h) |
 | 1 Act now | **Strong alignment**, as below | Group, instantly |
 | 1 Act now | Both carry the symbol's sector rank, and **⚠️ against market/sector** when SPY/QQQ/IWM or the sector trend the other way | |
-| 1 Day trade (paper) | **EMA 9/21 cross + retest** entries (SPY, QQQ, NVDA, TSLA, META) and their management (first target, trail, stop, invalidated, end of day), then a summary at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
+| 1 Day trade (paper) | **EMA 9/21** entries for two strategies, cross + retest and cross (no retest) (SPY, QQQ, NVDA, TSLA, META, MSFT), and their management (first target, trail, stop, invalidated, end of day), then a summary per strategy at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
 | 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |
 | 2 Changes | One message every 15 min (09:45, 10:00, …) if anything changed: swing trend changes, options bias flips, call/put wall breaks, IV spikes, alignment ended, market trend, plus the sector ranking with ▲▼. Only the latest change per symbol shows | Group |
 | 3 Context | **Unusual activity** every 5 min: only contracts that traded since the last report, ranked by that new premium, each classified **trade by trade** (buy / sell / mid / multi-leg, sweeps). The first report of the day checks **yesterday's flow against today's open interest**. Blocks ≥ $5M since the last report, judged by their trades. See [Options flow](#options-flow) | Group |
-| 3 Context | **Day-trade brief** at 09:45 ([Morning brief](#morning-brief)); **scorecard** every Friday at the close ([Scorecard](#alert-scorecard)) | Group |
+| 1 Close play (paper) | **3:45 PM close fade**: CALL, PUT or NO TRADE at ~15:45 with the SPX strike, the paper trade's exit at 15:59. See [3:45 PM close play](#345-pm-close-play-paper) | Group |
+| 3 Context | **Day-trade brief** at 09:45 ([Morning brief](#morning-brief)); **scorecard** and **strategy report** every Friday at the close ([Scorecard](#alert-scorecard), [Strategy report](#strategy-report)); signals held by the [health gate](#health-gate) at the close | Group |
 
 **Hysteresis** keeps tier 2 quiet when a score wobbles: a trend counts as UP after passing +30 and stays UP until it
 falls back under +15 (STRONG: in at 60, out under 50), confirmed over 2 checks. Options: in at ±50, out inside
@@ -191,6 +193,29 @@ minutes, 30 minutes and 1 hour later (capped at the close), 1 trading day and 5 
 `python -m mias scorecard --backfill` replays the recorded checks through today's rules; `/scorecard replay`
 shows that history.
 
+## Pre-market heads-up
+
+At 07:00 ET (`[premarket]`, and `/premarket` anytime), before the market opens:
+
+- **Yesterday's sector board**: each sector's swing trend at the last check of the previous session, and the focus.
+- **Pre-market moves** against yesterday's close for SPY/QQQ/IWM, each sector ETF and the biggest watchlist gappers
+  (±1%+ with $500K+ traded), each with volume against the same time of day over the last 10 sessions. A sector ETF
+  or stock gapping 0.3%+ against its swing trend is flagged ⚠️; with its trend ✅.
+- **Earnings** estimated in the next 5 days (from past report gaps, ±1 week).
+
+At 09:15 a short update after the 08:30 economic data: the same pre-market lines, each sector marked ✅ held or ⚠️
+flipped against its 07:00 move, and whether the pre-market leader (the sector ETF up the most) is the same.
+Pre-market trades are thin before ~08:00 and there is no options data until 09:30. Weekdays only; nothing is sent
+on a holiday (no pre-market trades). About 2 seconds of API calls.
+
+**/trend and /market before the open** (04:00–09:30 ET) add a pre-market line, e.g.
+`Pre-market: +12.55% · 20.4× normal volume · $218.0M traded · ⚠️ gapping against swing STRONG DOWN`
+(indexes show their trend symbol's move, e.g. NDX via QQQ). The trend scores stay on regular-session data (thin
+pre-market trading would bend the 5-minute EMAs and VWAP), so before the open they are yesterday's close; the
+price is live. **From 09:00 the service runs warm-up cycles** every 150 s: bar history cached, the dashboard and
+/market on pre-market prices, data problems caught before the bell. They send no alerts and record nothing
+(options don't trade until 09:30).
+
 ## Morning brief
 
 At 09:45 ET (`[brief]`, and `/brief` anytime):
@@ -246,7 +271,7 @@ alerts; the EMA paper trades continue as a live test. Per-symbol tables in `data
 
 ## EMA 9/21 day trade (paper)
 
-The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NVDA, TSLA and META (`[daytrade]`, `mias/emacross.py`):
+The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NVDA, TSLA, META and MSFT (`[daytrade]`, `mias/emacross.py`):
 
 1. EMA 9 crosses EMA 21 on a completed 5-minute candle.
 2. Within 6 candles price pulls back into the EMAs (bull: low touches EMA 9) and holds (closes stay above EMA 21).
@@ -255,9 +280,15 @@ The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NV
 
 Management: ATM 0DTE (1DTE from 13:00), 5 contracts, stop −20% or a 5-minute close through the invalidation, sell 3
 at +30% and move the runners to breakeven, at +75% protect +50%, at +100% protect +75%, close all by 15:10 ET, no new
-entries after 2 losses in a row. Puts mirror it. Times are ET.
+entries after 2 losses in a row. Puts mirror it. Times are ET. Entries from 09:35 (the EMAs are warm from earlier
+days; the opening-range check needs 15 minutes, so it reads "n/a" before 09:45).
 
-The service paper-trades it on live option quotes and alerts the group at each step.
+**Two strategies side by side** (`strategies = ["retest", "cross"]`): the same crosses are paper-traded twice,
+with the handout rules (**cross + retest**) and entered at the crossing candle's close (**cross, no retest**). Each
+has its own open trades, loss limit, alerts, closing summary and record, so one can't hide the other. In the
+6-month backtest both lost money; the no-retest version lost less on SPY, NVDA and TSLA and more on META.
+
+The service paper-trades them on live option quotes and alerts the group at each step.
 
 How the paper trades are kept honest and studied:
 - **Real fills**: bought at the ask, sold at the bid (never above the trigger price). The midpoint result is shown
@@ -372,6 +403,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m mias telegram-test
 .venv/bin/python -m mias ema-backtest --symbols SPY,QQQ --start 2026-04-27 --end 2026-10-23
 .venv/bin/python -m mias daytrade-backtest     # EMA (2/3/5m), ORB, VWAP reclaim/reject, prior-day breaks
+.venv/bin/python -m mias close-backtest        # 3:45 PM 0DTE close play, two years of SPY
 .venv/bin/python -m mias pullback-backtest     # swing entries over 2 years on real option prices
 .venv/bin/python -m mias scorecard --backfill  # replay recorded checks into the scorecard
 .venv/bin/python -m mias run                   # the service
@@ -384,8 +416,48 @@ Secrets come from the environment or a `.env` file next to `config.toml` (mode 0
 The service has a dashboard at `http://localhost:8080/` (auto-refreshes; no login, so keep it private).
 `/status` returns JSON and `/healthz` is the health check.
 
+## Strategy report
+
+`mias/strategies.py`, every Friday at the close and `/strategies` (7 days) or `/strategies 30`. One block per paper
+strategy: trades, win rate, average win and loss, **expectancy per trade after costs** (fills are already at the
+bid/ask; `fee_per_contract` $0.65 each way is taken off, $6.50 for a 5-contract trade), total, profit factor and the
+worst drawdown, for the period and since the start, with calls and puts split. A strategy needs 30 trades before
+its numbers are judged. The signals the health gate held that week close the report.
+
+## 3:45 PM close play (paper)
+
+`python -m mias close-backtest` (`mias/closeplay.py`): at 15:45 ET, from completed 5-minute candles, three signs:
+price against the day's open, against the session VWAP, and against 15:00 (the last 45 minutes). Rules compared:
+**trend** (all three agree, trade with them), **strong** (trend, day moved 0.5%+), **fade** (all three agree, trade
+against them), **momentum** (the 45-minute move alone) and **vwap** (the VWAP side alone). Each gives CALL, PUT or
+no trade; the outcome is the 15:45 → 16:00 move, and the option result uses SPY 0DTE ATM options' real minute bars
+(first minute's open from 15:45 + $0.01, 15:59 close − $0.01, commissions). SPX moves the same in percent, about 10×
+the dollars; the plan has no SPX index bars. The report splits the two years in halves so a rule found in the
+first half is checked on the second. Results in `data/close_backtest/`.
+
+**Backtest, SPY 2024-10-28 to 2026-10-26 (495 days):** only **fade** has an edge. Price right 59% of the time,
++$6.4 per contract after costs, PF 1.34, both halves positive (+$6.1, +$6.7), 7 of 9 quarters positive, stronger on
+days that moved 0.7%+ (+$11). Thin: +$2.4 with 3 cents of slippage. Following the trend loses (−$13 a contract).
+
+**Live paper trade** (`[closeplay]`, the fade rule only): every weekday, at the first cycle from 15:45 ET (when the
+15:40 candle is in, up to 15:52), the group gets **CALL**, **PUT** or **NO TRADE** with the three readings and the SPX
+equivalent 0DTE strike. A trade buys `contracts` SPY 0DTE ATM at the ask (health gate and a 10% spread limit
+apply) and sells at the bid at 15:59 (the 30-second watcher), with an alert at each step. Results go to the
+strategy report as "3:45 PM close fade".
+
 **Watchlist:** your 15 focus symbols plus SPY. `/trend` works for any symbol. Use `rank` to compare candidates
 by options activity.
+
+## Health gate
+
+`mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market
+hours a symbol is held when its read this cycle had errors (a failed or truncated request; on 2026-10-27 BAC and
+GS had their 5-minute bars time out for over two hours), its 5-minute bars are more than 15 minutes stale, or fewer
+than half of its option contracts had a live quote. Held: tier 1 and tier 2 alerts (the alert state isn't touched,
+so a change still fires once the data is clean) and EMA paper entries. Paper entries also need a two-sided option
+quote with a spread of at most 10% and, when the feed says, a real-time quote under 2 minutes old. Every held
+signal is logged (`health gate: SYMBOL ... held: reason`), counted per day, and reported at the close and in the
+weekly strategy report.
 
 ## Robustness
 
@@ -447,6 +519,9 @@ mias/daysetups.py   other intraday setups (ORB, VWAP, prior-day breaks) and thei
 mias/swingtest.py   swing entries backtest (pullback vs strong vs trend, single vs spread)
 mias/flow.py        trade-by-trade flow classification, structures, next-day open-interest check
 mias/confirm.py     price check for flow: VWAP side, relative volume, market
+mias/premarket.py   07:00 pre-market heads-up and 09:15 update
+mias/health.py      health gate: hold signals on bad data          mias/strategies.py  per-strategy paper record
+mias/closeplay.py   3:45 PM close fade: backtest and live paper trade
 mias/events.py      earnings estimate, IV events, IV rank, single-vs-spread advice
 mias/scorecard.py   alert outcomes 15m-5d            mias/brief.py   09:45 day-trade brief
 ```

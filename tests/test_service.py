@@ -1206,3 +1206,99 @@ def test_dispatcher_sends_private_alert_only_to_its_chat(tmp_path):
     run(d.flush())
     assert sent == ["1", "-100"]
     store.close()
+
+
+def test_premarket_sent_once_per_time_with_the_first_read_for_the_update(cfg):
+    from mias.app import Service
+    t0 = datetime.combine(TODAY, time(6, 58), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    calls = []
+
+    async def pm(now, earlier=None):
+        calls.append((now.astimezone(ET).strftime("%H:%M"), earlier))
+        return f"pre {len(calls)}", {"sectors": {"tech": 1.0}, "leader": "tech"}
+    svc.premarket_text = pm
+
+    async def go():
+        for h, m in ((6, 58), (7, 0), (7, 1), (7, 40), (9, 15), (9, 16)):
+            await svc._send_premarket(datetime.combine(TODAY, time(h, m), ET))
+        await svc.client.close()
+    run(go())
+    assert [c[0] for c in calls] == ["07:00", "09:15"]
+    assert calls[0][1] is None and calls[1][1] == {"sectors": {"tech": 1.0}, "leader": "tech"}
+    assert [a["rule"] for a in svc.store.recent_alerts()].count("premarket") == 2
+
+
+def test_warm_up_cycles_before_the_open_send_nothing(cfg):
+    from mias.app import Service
+    cfg = dataclasses.replace(cfg, premarket_enabled=False)
+    t0 = datetime.combine(TODAY, time(9, 5), ET)
+    fake = FakeMassive(TODAY, t0, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+    orig = fake.handler
+
+    def pre(req):
+        if req.url.path == "/v1/marketstatus/now":
+            return httpx.Response(200, json={"market": "extended-hours"})
+        return orig(req)
+    svc.client._http._transport = httpx.MockTransport(pre)
+
+    async def go():
+        await svc._tick(t0)                                                    # warm-up: data, no alerts
+        await svc._tick(datetime.combine(TODAY, time(16, 5), ET))             # a holiday: no closing summary
+        await svc.client.close()
+    run(go())
+    assert svc.engine.last_results and svc.market_state == "closed"
+    assert [a for a in svc.store.recent_alerts() if a["rule"] != "system"] == []
+    assert svc.store.db.execute("SELECT COUNT(*) FROM metrics").fetchone()[0] == 0
+
+
+def test_premarket_line_in_trend_reply(cfg):
+    from mias.formatting import premarket_line
+    from types import SimpleNamespace as NS
+    r = SymbolResult("AAA", stock_price=100.0, prev_close=98.0)
+    r.stock = NS(score=-45.0, label="DOWN", timeframes={}, composites={})
+    r.premarket = {"change": 2.04, "rvol": 1.8, "dollars": 4.5e7}
+    assert premarket_line(r, cfg) == ("Pre-market: +2.04% · 1.8× normal volume · $45.0M traded · "
+                                      "⚠️ gapping against swing DOWN")
+    r.premarket = {"change": -0.5, "rvol": None, "dollars": 2e6, "via": "QQQ"}
+    assert premarket_line(r, cfg) == "Pre-market (QQQ): -0.50% · $2.0M traded · ✅ with swing DOWN"
+    r.premarket = None
+    assert premarket_line(r, cfg) is None
+
+
+# ---- health gate --------------------------------------------------------------------------------
+
+def test_health_gate_issues():
+    from mias import health
+    now = datetime.combine(TODAY, time(11, 0), ET)
+    r = _result(70, 70)
+    r.options.quote_coverage = 1.0
+    fresh = [{"t": int((now - timedelta(minutes=7)).timestamp() * 1000)}]
+    assert health.symbol_issues(r, fresh, now, ET) == []
+    stale = [{"t": int((now - timedelta(minutes=40)).timestamp() * 1000)}]
+    assert health.symbol_issues(r, stale, now, ET) == ["5-minute bars stale (35 min)"]
+    r.errors = ["stock: ReadTimeout"]
+    assert health.symbol_issues(r, fresh, now, ET)[0] == "stock: ReadTimeout"
+    r.errors, r.options.quote_coverage = [], 0.2
+    assert "few live option quotes" in health.symbol_issues(r, fresh, now, ET)[0]
+    assert health.spread_issue(1.0, 1.04) is None and "too wide" in health.spread_issue(0.18, 0.22)
+    assert health.spread_issue(None, 1.0) == "no two-sided option quote"
+    old = {"last_quote": {"last_updated": (now.timestamp() - 600) * 1e9}}
+    assert "stale" in health.quote_issue(old, now) and health.quote_issue({"last_quote": {}}, now) is None
+    line = health.summary_line({"BAC": {"stock": 3}, "GS": {"stock": 1}})
+    assert line.startswith("🩺 Health gate held 4 signals") and "BAC ×3 (stock)" in line
+
+
+def test_health_gate_holds_alerts_without_touching_state(cfg):
+    cfg = dataclasses.replace(cfg, alert_mode="all")
+    now = datetime.combine(TODAY, time(11, 0), ET)
+    fake = FakeMassive(TODAY, now, {"AAA": 100.0})
+    eng, store, _ = _engine(cfg, fake)
+    r = _result(70, 70)
+    r.errors = ["stock: ReadTimeout"]
+    eng._evaluate([r], now)
+    assert store.get("state:AAA") is None and store.pending() == []
+    assert store.get(f"health:{TODAY}") == {"AAA": {"stock": 1}}

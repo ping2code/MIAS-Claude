@@ -15,6 +15,8 @@
                                      every closed EMA paper trade with MFE/MAE, stop distances, spread, fill delay
   python -m mias ema-backtest [--symbols SPY] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
                                      backtest the 5-minute EMA 9/21 cross-and-retest day trade on real option bars
+  python -m mias close-backtest [--symbol SPY] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+                                     backtest the 3:45 PM 0DTE close play (CALL / PUT / no trade) on real option bars
 """
 from __future__ import annotations
 
@@ -72,6 +74,11 @@ def main(argv: list[str] | None = None) -> int:
     dt.add_argument("--start", help="first day (default: six months back)")
     dt.add_argument("--end", help="last day (default: yesterday)")
     dt.add_argument("--out", default="data/daytrade_backtest")
+    cp = sub.add_parser("close-backtest")
+    cp.add_argument("--symbol", default="SPY")
+    cp.add_argument("--start", help="first day (default: two years back)")
+    cp.add_argument("--end", help="last day (default: yesterday)")
+    cp.add_argument("--out", default="data/close_backtest")
     bt = sub.add_parser("ema-backtest")
     bt.add_argument("--symbols", help="comma-separated (default: [daytrade] symbols)")
     bt.add_argument("--start", help="first day (default: six months back)")
@@ -139,6 +146,15 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_daytrade_backtest(cfg, args))
     elif args.cmd == "ema-backtest":
         return asyncio.run(_ema_backtest(cfg, args))
+    elif args.cmd == "close-backtest":
+        from datetime import date
+        from pathlib import Path
+
+        from .closeplay import run_backtest
+        today = datetime.now(cfg.tz).date()
+        end = date.fromisoformat(args.end) if args.end else today - timedelta(days=1)
+        start = date.fromisoformat(args.start) if args.start else end - timedelta(days=730)
+        print(asyncio.run(run_backtest(cfg, args.symbol.upper(), start, end, Path(args.out))))
     return 0
 
 

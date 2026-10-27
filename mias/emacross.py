@@ -53,6 +53,8 @@ class DayTradeRules:
     max_losses_in_row: int = 2
     manage_seconds: int = 30        # open paper trades are re-priced this often (the main cycle is 150 s)
     swing_filter: bool = False      # only take entries in the direction of the swing trend (see the backtest split)
+    fee_per_contract: float = 0.65  # commission per contract per side, for expectancy after costs
+    strategies: tuple[str, ...] = ("retest",)   # live paper strategies, each with its own record (STRATEGIES)
 
 
 def _hm(text: str) -> time:
@@ -544,9 +546,18 @@ def write_csv(path: Path, trades: list[dict]) -> None:
 
 KEY = "ema_day"
 
+# Live paper strategies, run side by side on the same crosses with separate state and records:
+#   retest: the handout setup (cross, pullback into the EMAs, confirmation candle)
+#   cross:  the control group, entered at the close of the crossing candle (no retest)
+STRATEGIES = {
+    "retest": {"key": KEY, "retest": True, "title": "CROSS + RETEST", "short": "EMA retest", "rule": "ema_entry"},
+    "cross": {"key": "ema_cross_day", "retest": False, "title": "CROSS (no retest)", "short": "EMA cross",
+              "rule": "ema_cross_entry"},
+}
 
-def _state(store, today: date) -> dict:
-    st = store.get(KEY) or {}
+
+def _state(store, today: date, strategy: str = "retest") -> dict:
+    st = store.get(STRATEGIES[strategy]["key"]) or {}
     if st.get("date") != today.isoformat():
         st = {"date": today.isoformat(), "seen": [], "open": {}, "closed": [], "losses": {}, "summary": False}
     return st
@@ -556,7 +567,8 @@ def _money(x: float) -> str:
     return f"{'+' if x >= 0 else '-'}${abs(x):,.0f}"
 
 
-def entry_text(su: Setup, tr: Trade, rules: DayTradeRules, tz: ZoneInfo, losses: int) -> str:
+def entry_text(su: Setup, tr: Trade, rules: DayTradeRules, tz: ZoneInfo, losses: int,
+               strategy: str = "retest") -> str:
     sg, word = su.sign, ("BULLISH" if su.side == "bull" else "BEARISH")
     kind = "C" if su.side == "bull" else "P"
     exp = date.fromisoformat(tr.expiry)
@@ -578,7 +590,8 @@ def entry_text(su: Setup, tr: Trade, rules: DayTradeRules, tz: ZoneInfo, losses:
                                                             is not None else "")
                      + (" ✅ with it" if w == "with" else " ⚠️ AGAINST the swing trend" if w == "against" else ""))
     return "\n".join([
-        f"{'🟢' if sg > 0 else '🔴'} <b>{su.symbol} EMA {rules.fast}/{rules.slow} {word} CROSS + RETEST</b> · day trade (paper)",
+        f"{'🟢' if sg > 0 else '🔴'} <b>{su.symbol} EMA {rules.fast}/{rules.slow} {word} "
+        f"{STRATEGIES[strategy]['title']}</b> · day trade (paper)",
         f"Entry {_et(su.entry_t, tz):%H:%M}: {su.symbol} {su.price:.2f} · ATM <b>{tr.strike:g}{kind} {exp:%m/%d}</b> "
         f"({dte}DTE) {fill}",
         f"Stop {tr.stop:.2f} (-{100 * rules.stop:.0f}%) or a 5m close {'below' if sg > 0 else 'above'} "
@@ -591,7 +604,8 @@ def entry_text(su: Setup, tr: Trade, rules: DayTradeRules, tz: ZoneInfo, losses:
         f"PAPER ONLY: this setup lost money in the 6-month backtest; tracked live to see how it does</i>"])
 
 
-def event_text(tr: Trade, kind: str, detail: str, value: float, under: float | None) -> str:
+def event_text(tr: Trade, kind: str, detail: str, value: float, under: float | None,
+               strategy: str = "retest") -> str:
     icon = {"partial": "💰", "trail": "📈", "stop": "🛑", "invalidated": "🛑", "breakeven": "⚖️", "trailed": "🎯",
             "target": "🎯", "time": "⏰"}.get(kind, "•")
     head = {"partial": "FIRST TARGET", "trail": "TRAIL RAISED", "stop": "STOPPED OUT", "invalidated": "INVALIDATED",
@@ -600,18 +614,19 @@ def event_text(tr: Trade, kind: str, detail: str, value: float, under: float | N
     k = "C" if tr.side == "bull" else "P"
     tail = (f" · total {_money(tr.pnl)} ({tr.pnl_pct:+}%) at bid/ask, {_money(tr.pnl_mid)} at mid · "
             f"best {tr.mfe_pct:+.0f}%, worst {tr.mae_pct:+.0f}%") if tr.closed else ""
-    return (f"{icon} <b>{tr.symbol} {tr.strike:g}{k} EMA trade: {head}</b>\n{detail} · option {value:.2f}"
+    return (f"{icon} <b>{tr.symbol} {tr.strike:g}{k} {STRATEGIES[strategy]['short']} trade: {head}</b>\n{detail} · option {value:.2f}"
             + (f" · {tr.symbol} {under:.2f}" if under else "") + tail)
 
 
-def summary_text(st: dict, rules: DayTradeRules, today: date) -> str | None:
+def summary_text(st: dict, rules: DayTradeRules, today: date, strategy: str = "retest") -> str | None:
     closed = st.get("closed") or []
     seen = len(st.get("seen") or [])
     if not closed and not seen:
         return None
     total = sum(t["pnl"] for t in closed)
     total_mid = sum(t.get("pnl_mid", t["pnl"]) for t in closed)
-    lines = [f"📒 <b>EMA {rules.fast}/{rules.slow} day trades (paper)</b> {today:%a %b %d}: "
+    lines = [f"📒 <b>EMA {rules.fast}/{rules.slow} {STRATEGIES[strategy]['title'].lower()} day trades (paper)</b> "
+             f"{today:%a %b %d}: "
              f"{len(closed)} trade{'s' if len(closed) != 1 else ''} · {_money(total)} at bid/ask "
              f"({_money(total_mid)} at mid)"]
     for t in closed:
@@ -649,7 +664,8 @@ def _mid(c: dict) -> float | None:
 
 
 LOCK = asyncio.Lock()      # the 150 s cycle and the 30 s watcher both update the day's state
-LOG_KEY = "ema_log"        # every closed paper trade, for study (python -m mias ema-log)
+LOG_KEY = "ema_log"        # every closed paper trade, for study (python -m mias ema-log) and the weekly report
+LOG_MAX = 3000
 
 
 def _quote(snap: dict) -> tuple[float | None, float | None, float | None]:
@@ -678,11 +694,13 @@ def _close_record(tr: Trade, tz: ZoneInfo, out_t: int) -> dict:
 
 async def manage(client, store, cfg, now: datetime, five: dict[str, list[Bar]]) -> int:
     """Re-price open paper trades: stops, targets, trails, invalidation, the end-of-day exit. Returns alerts queued."""
+    sent = 0
     async with LOCK:
-        st = _state(store, now.astimezone(cfg.tz).date())
-        sent = _manage(await _snapshots(client, st), store, cfg, now, five, st)
-        store.put(KEY, st)
-        return sent
+        for strategy in cfg.daytrade.strategies:
+            st = _state(store, now.astimezone(cfg.tz).date(), strategy)
+            sent += _manage(await _snapshots(client, st), store, cfg, now, five, st, strategy)
+            store.put(STRATEGIES[strategy]["key"], st)
+    return sent
 
 
 async def _snapshots(client, st: dict) -> dict:
@@ -696,7 +714,8 @@ async def _snapshots(client, st: dict) -> dict:
         return {}
 
 
-def _manage(snaps: dict, store, cfg, now: datetime, five: dict[str, list[Bar]], st: dict) -> int:
+def _manage(snaps: dict, store, cfg, now: datetime, five: dict[str, list[Bar]], st: dict,
+            strategy: str = "retest") -> int:
     rules: DayTradeRules = cfg.daytrade
     tz = cfg.tz
     now_ms = int(now.timestamp() * 1000)
@@ -723,92 +742,120 @@ def _manage(snaps: dict, store, cfg, now: datetime, five: dict[str, list[Bar]], 
         if tr.closed and bid and ask and value:
             tr.exit_spread_pct = round(100 * (ask - bid) / value, 1)
         for kind, detail in events:
-            store.enqueue(f"ema_{kind}", event_text(tr, kind, detail, value, under), sym)
+            store.enqueue(f"ema_{kind}", event_text(tr, kind, detail, value, under, strategy), sym)
             sent += 1
         if tr.closed:
             del st["open"][sym]
             st["losses"][sym] = st["losses"].get(sym, 0) + 1 if tr.pnl < 0 else 0
             rec = _close_record(tr, tz, now_ms)
             st["closed"].append(rec)
-            store.put(LOG_KEY, (store.get(LOG_KEY) or [])[-499:] + [dict(rec, date=st["date"])])
+            store.put(LOG_KEY, (store.get(LOG_KEY) or [])[-(LOG_MAX - 1):] + [dict(rec, date=st["date"],
+                                                                                   strategy=strategy)])
         else:
             st["open"][sym] = asdict(tr)
     return sent
 
 
-async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], results: dict | None = None) -> int:
-    """Run once per cycle: manage open paper trades, open new ones, send the day's summary at the close.
-    `five` maps symbol to completed regular-session 5-minute bars (today plus warm-up days); `results` maps symbol
-    to the cycle's SymbolResult (for the trend at entry)."""
+async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], results: dict | None = None,
+               issues: dict[str, list[str]] | None = None) -> int:
+    """Run once per cycle for each paper strategy: manage open trades, open new ones, send each strategy's
+    summary at the close. `five` maps symbol to completed regular-session 5-minute bars (today plus warm-up days);
+    `results` maps symbol to the cycle's SymbolResult (for the trend at entry); `issues` maps symbol to health
+    problems (mias/health.py), which hold new entries."""
+    rules: DayTradeRules = cfg.daytrade
+    today = now.astimezone(cfg.tz).date()
+    sent = 0
+    async with LOCK:
+        for strategy in rules.strategies:
+            st = _state(store, today, strategy)
+            sent += _manage(await _snapshots(client, st), store, cfg, now, five, st, strategy)
+            sent += await _enter(client, store, cfg, now, five, results or {}, issues or {}, st, strategy)
+            if int(now.timestamp() * 1000) >= _at(today, rules.close, cfg.tz) and not st["open"] \
+                    and not st["summary"]:
+                text = summary_text(st, rules, today, strategy)
+                if text:
+                    store.enqueue("ema_summary", text)
+                    sent += 1
+                st["summary"] = True
+            store.put(STRATEGIES[strategy]["key"], st)
+    return sent
+
+
+def _skip(st: dict, why: str) -> None:
+    skipped = st.setdefault("skipped", {})
+    skipped[why] = skipped.get(why, 0) + 1
+
+
+async def _enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], results: dict,
+                 issues: dict[str, list[str]], st: dict, strategy: str) -> int:
+    from . import health
     rules: DayTradeRules = cfg.daytrade
     tz = cfg.tz
-    local = now.astimezone(tz)
-    today = local.date()
+    today = now.astimezone(tz).date()
     now_ms = int(now.timestamp() * 1000)
-    close_ms = _at(today, rules.close, tz)
-    async with LOCK:
-        st = _state(store, today)
-        sent = _manage(await _snapshots(client, st), store, cfg, now, five, st)
-        for sym in rules.symbols:
-            bars = [b for b in five.get(sym) or [] if b.t + FIVE <= now_ms]
-            for su in scan(sym, bars, today, tz, rules):
-                if su.key in st["seen"] or su.status == "pending":
-                    continue
-                st["seen"].append(su.key)
-                fresh = su.entry_t is not None and now_ms - su.entry_t <= 2 * FIVE
-                if su.status != "entry" or not fresh:
-                    why = su.status if su.status != "entry" else "missed"
-                    st.setdefault("skipped", {})[why] = st.setdefault("skipped", {}).get(why, 0) + 1
-                    continue
-                r = (results or {}).get(sym)
-                swing = r.stock.score if r is not None and r.stock else None
-                intra = r.stock.composites.get("intraday", (None, ""))[0] if r is not None and r.stock else None
-                against = swing is not None and su.sign * swing < cfg.trend_bias
-                losses = st["losses"].get(sym, 0)
-                why = "in a trade" if sym in st["open"] else "daily limit" if losses >= rules.max_losses_in_row \
-                    else "against the swing trend" if rules.swing_filter and against else None
-                if why:
-                    skipped = st.setdefault("skipped", {})
-                    skipped[why] = skipped.get(why, 0) + 1
-                    continue
-                try:
-                    chain = await _chain(client, sym, su.price, today)
-                except Exception as exc:
-                    log.warning("ema %s chain failed: %s", sym, exc)
-                    continue
-                kind = "call" if su.side == "bull" else "put"
-                rows = [c for c in chain if (c.get("details") or {}).get("contract_type") == kind and _mid(c)]
-                expiry = pick_expiry(list({c["details"]["expiration_date"] for c in rows}), today, now_ms, tz, rules)
-                rows = [c for c in rows if c["details"]["expiration_date"] == expiry]
-                if not rows:
-                    continue
-                spot = (rows[0].get("underlying_asset") or {}).get("price") or su.price
-                liquid = [c for c in rows if _spread_pct(c) <= MAX_SPREAD_PCT] or rows     # tight quotes first
-                c = min(liquid, key=lambda c: abs(c["details"]["strike_price"] - spot))
-                bid, ask, mid = _quote(c)
-                tr = Trade.open(su, c["details"]["ticker"], float(c["details"]["strike_price"]), expiry, now_ms,
-                                ask or mid, rules)
-                tr.entry_mid, tr.bid, tr.ask = mid, bid, ask
-                tr.mark(now_ms, spot)
-                delta = abs(((c.get("greeks") or {}).get("delta")) or 0) or None
-                tr.info = entry_info(su, tr, rules, now_ms, spot, delta, swing, intra, cfg)
-                st["open"][sym] = asdict(tr)
-                store.enqueue("ema_entry", entry_text(su, tr, rules, tz, losses), sym)
-                sent += 1
-                try:
-                    from . import scorecard
-                    scorecard.record(store, now.timestamp(), sym, "ema_entry", su.side, su.price, tr.contract,
-                                     tr.entry)
-                except Exception:
-                    log.exception("ema scorecard record failed")
-
-        if now_ms >= close_ms and not st["open"] and not st["summary"]:
-            text = summary_text(st, rules, today)
-            if text:
-                store.enqueue("ema_summary", text)
-                sent += 1
-            st["summary"] = True
-        store.put(KEY, st)
+    sent = 0
+    for sym in rules.symbols:
+        bars = [b for b in five.get(sym) or [] if b.t + FIVE <= now_ms]
+        for su in scan(sym, bars, today, tz, rules, retest=STRATEGIES[strategy]["retest"]):
+            if su.key in st["seen"] or su.status == "pending":
+                continue
+            st["seen"].append(su.key)
+            fresh = su.entry_t is not None and now_ms - su.entry_t <= 2 * FIVE
+            if su.status != "entry" or not fresh:
+                _skip(st, su.status if su.status != "entry" else "missed")
+                continue
+            r = results.get(sym)
+            swing = r.stock.score if r is not None and r.stock else None
+            intra = r.stock.composites.get("intraday", (None, ""))[0] if r is not None and r.stock else None
+            against = swing is not None and su.sign * swing < cfg.trend_bias
+            losses = st["losses"].get(sym, 0)
+            why = "in a trade" if sym in st["open"] else "daily limit" if losses >= rules.max_losses_in_row \
+                else "against the swing trend" if rules.swing_filter and against else None
+            if why:
+                _skip(st, why)
+                continue
+            if issues.get(sym):
+                _skip(st, "data health")
+                health.record(store, now, tz, sym, f"{strategy} entry", issues[sym])
+                continue
+            try:
+                chain = await _chain(client, sym, su.price, today)
+            except Exception as exc:
+                log.warning("ema %s chain failed: %s", sym, exc)
+                _skip(st, "data health")
+                health.record(store, now, tz, sym, f"{strategy} entry", [f"option chain failed: {exc}"])
+                continue
+            kind = "call" if su.side == "bull" else "put"
+            rows = [c for c in chain if (c.get("details") or {}).get("contract_type") == kind and _mid(c)]
+            expiry = pick_expiry(list({c["details"]["expiration_date"] for c in rows}), today, now_ms, tz, rules)
+            rows = [c for c in rows if c["details"]["expiration_date"] == expiry]
+            if not rows:
+                _skip(st, "no contract")
+                continue
+            spot = (rows[0].get("underlying_asset") or {}).get("price") or su.price
+            liquid = [c for c in rows if _spread_pct(c) <= MAX_SPREAD_PCT] or rows     # tight quotes first
+            c = min(liquid, key=lambda c: abs(c["details"]["strike_price"] - spot))
+            bid, ask, mid = _quote(c)
+            bad = health.spread_issue(bid, ask) or health.quote_issue(c, now)
+            if bad:
+                _skip(st, "data health")
+                health.record(store, now, tz, sym, f"{strategy} entry", [f"{c['details']['ticker']}: {bad}"])
+                continue
+            tr = Trade.open(su, c["details"]["ticker"], float(c["details"]["strike_price"]), expiry, now_ms,
+                            ask or mid, rules)
+            tr.entry_mid, tr.bid, tr.ask = mid, bid, ask
+            tr.mark(now_ms, spot)
+            delta = abs(((c.get("greeks") or {}).get("delta")) or 0) or None
+            tr.info = entry_info(su, tr, rules, now_ms, spot, delta, swing, intra, cfg)
+            st["open"][sym] = asdict(tr)
+            store.enqueue("ema_entry", entry_text(su, tr, rules, tz, losses, strategy), sym)
+            sent += 1
+            try:
+                from . import scorecard
+                scorecard.record(store, now.timestamp(), sym, STRATEGIES[strategy]["rule"], su.side, su.price,
+                                 tr.contract, tr.entry)
+            except Exception:
+                log.exception("ema scorecard record failed")
     return sent
 
 
@@ -818,10 +865,12 @@ def entry_info(su: Setup, tr: Trade, rules: DayTradeRules, now_ms: int, spot: fl
     from .trend import label_for
     tz = cfg.tz
     retest = f", pullback {_et(su.retest_t, tz):%H:%M}" if su.retest_t else ""
+    how = (f"confirmation candle closed {_et(su.entry_t, tz):%H:%M}" if su.retest_t
+           else "entered at the crossing candle's close")
     prem_stop = tr.entry * rules.stop
     return {
         "reason": f"{'bullish' if su.side == 'bull' else 'bearish'} EMA {rules.fast}/{rules.slow} cross "
-                  f"{_et(su.cross_t + FIVE, tz):%H:%M}{retest}, confirmation candle closed {_et(su.entry_t, tz):%H:%M}",
+                  f"{_et(su.cross_t + FIVE, tz):%H:%M}{retest}, {how}",
         "confirmed_close": True,                 # only completed 5-minute candles are ever scanned
         "candle_close": _et(su.entry_t, tz).strftime("%H:%M:%S"),
         "fill_at": _et(now_ms, tz).strftime("%H:%M:%S"),
@@ -846,7 +895,7 @@ def status_text(store, cfg, now: datetime, five: dict[str, list[Bar]]) -> str:
     """/ema: where each day-trade symbol stands right now."""
     rules: DayTradeRules = cfg.daytrade
     tz, today = cfg.tz, now.astimezone(cfg.tz).date()
-    st = _state(store, today)
+    states = {k: _state(store, today, k) for k in rules.strategies}
     now_ms = int(now.timestamp() * 1000)
     lines = [f"📐 <b>EMA {rules.fast}/{rules.slow} day-trade watch</b> (5m)  {now.astimezone(tz):%a %H:%M} ET"]
     for sym in rules.symbols:
@@ -856,7 +905,7 @@ def status_text(store, cfg, now: datetime, five: dict[str, list[Bar]]) -> str:
             continue
         closes = [b.c for b in bars]
         f, s = ema(closes, rules.fast)[-1], ema(closes, rules.slow)[-1]
-        setups = scan(sym, bars, today, tz, rules)
+        setups = scan(sym, bars, today, tz, rules)                # the retest view of the last cross
         last = setups[-1] if setups else None
         side = "above" if f > s else "below"
         line = f"<b>{sym}</b> {closes[-1]:.2f} · EMA9 {f:.2f} {side} EMA21 {s:.2f}"
@@ -864,14 +913,21 @@ def status_text(store, cfg, now: datetime, five: dict[str, list[Bar]]) -> str:
             line += (f" · last cross {'↑' if last.side == 'bull' else '↓'} {_et(last.cross_t + FIVE, tz):%H:%M}: "
                      f"{last.status.replace('_', ' ')}")
         lines.append(line)
-        if sym in st["open"]:
-            tr = Trade(**st["open"][sym])
-            lines.append(f"  open: {tr.strike:g}{'C' if tr.side == 'bull' else 'P'} {tr.expiry[5:]} entry "
-                         f"{tr.entry:.2f} · stop {tr.stop:.2f} · {tr.open_qty} left · realized {_money(tr.pnl)}")
-    for t in st.get("closed") or []:
-        lines.append(f"  closed: {t['symbol']} {t['contract']} {t['in']}→{t['out']} {t['exit_reason']} "
-                     f"{_money(t['pnl'])}" + (f" · best {t['mfe_pct']:+.0f}% / worst {t['mae_pct']:+.0f}%"
-                                              if "mfe_pct" in t else ""))
+        for k, st in states.items():
+            if sym in st["open"]:
+                tr = Trade(**st["open"][sym])
+                lines.append(f"  open ({k}): {tr.strike:g}{'C' if tr.side == 'bull' else 'P'} {tr.expiry[5:]} "
+                             f"entry {tr.entry:.2f} · stop {tr.stop:.2f} · {tr.open_qty} left · realized "
+                             f"{_money(tr.pnl)}")
+    for k, st in states.items():
+        closed = st.get("closed") or []
+        if closed:
+            lines.append(f"<b>{STRATEGIES[k]['short']}</b>: {len(closed)} closed · "
+                         f"{_money(sum(t['pnl'] for t in closed))}")
+        for t in closed:
+            lines.append(f"  {t['symbol']} {t['contract']} {t['in']}→{t['out']} {t['exit_reason']} "
+                         f"{_money(t['pnl'])}" + (f" · best {t['mfe_pct']:+.0f}% / worst {t['mae_pct']:+.0f}%"
+                                                  if "mfe_pct" in t else ""))
     lines.append(f"<i>Entries {rules.start}–{rules.last_entry} ET, all closed by {rules.close}. Paper-tracked.</i>")
     return "\n".join(lines)
 

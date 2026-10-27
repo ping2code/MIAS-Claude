@@ -144,6 +144,11 @@ class Config:
     daytrade: "DayTradeRules"            # [daytrade]: the 5-minute EMA cross-and-retest paper trades
     brief_enabled: bool                  # [brief]: the morning day-trade brief
     brief_time: str
+    premarket_enabled: bool              # [premarket]: 07:00 heads-up and 09:15 update
+    premarket_times: list[str]
+    closeplay_enabled: bool              # [closeplay]: the 3:45 PM 0DTE fade, paper-traded
+    closeplay_symbol: str
+    closeplay_contracts: int
     telegram_enabled: bool
     telegram_commands: bool
     web_enabled: bool
@@ -189,6 +194,12 @@ def _daytrade(raw: dict):
             raise ConfigError(f"daytrade.{k} is not a setting")
         if k == "symbols":
             v = tuple(x.upper() for x in v)
+        elif k == "strategies":
+            from .emacross import STRATEGIES
+            bad = [x for x in v if x not in STRATEGIES]
+            if bad or not v:
+                raise ConfigError(f"daytrade.strategies must be from {', '.join(STRATEGIES)}")
+            v = tuple(v)
         elif k == "trail":
             v = tuple((float(a), float(b)) for a, b in v)
         else:
@@ -336,6 +347,11 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         daytrade=_daytrade(raw.get("daytrade", {})),
         brief_enabled=bool(raw.get("brief", {}).get("enabled", True)),
         brief_time=raw.get("brief", {}).get("time", "09:45"),
+        premarket_enabled=bool(raw.get("premarket", {}).get("enabled", True)),
+        premarket_times=[str(t) for t in raw.get("premarket", {}).get("times", ["07:00", "09:15"])],
+        closeplay_enabled=bool(raw.get("closeplay", {}).get("enabled", True)),
+        closeplay_symbol=str(raw.get("closeplay", {}).get("symbol", "SPY")).upper(),
+        closeplay_contracts=max(1, int(raw.get("closeplay", {}).get("contracts", 1))),
         telegram_enabled=bool(tg.get("enabled", True)),
         telegram_commands=bool(tg.get("commands", True)),
         web_enabled=bool(web.get("enabled", True)),

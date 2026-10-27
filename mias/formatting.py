@@ -5,7 +5,7 @@ from datetime import datetime
 from html import escape
 
 from .models import SymbolResult
-from .trend import direction
+from .trend import direction, label_for
 
 LABELS = {
     "strong_up": "STRONG UP", "up": "UP", "neutral": "NEUTRAL", "down": "DOWN", "strong_down": "STRONG DOWN",
@@ -48,6 +48,25 @@ def price_line(r: SymbolResult) -> str:
     tag = "live" if r.price_is_live else "delayed"
     chg = f" ({num(r.day_change_pct, '.2f', True)}%)" if r.day_change_pct is not None else ""
     return f"Price {num(r.price)} {tag}{chg}"
+
+
+def premarket_line(r: SymbolResult, cfg) -> str | None:
+    """Before the open: the pre-market move, its volume against normal for the time of day, and whether it goes
+    with or against the swing trend. Trend scores stay on regular-session data."""
+    x = r.premarket
+    if not x:
+        return None
+    parts = [f"Pre-market{' (' + x['via'] + ')' if x.get('via') else ''}: {x['change']:+.2f}%"]
+    if x.get("rvol"):
+        parts.append(f"{x['rvol']:.1f}× normal volume")
+    parts.append(f"${x['dollars'] / 1e6:,.1f}M traded")
+    if r.stock:
+        from .premarket import AGAINST_MIN
+        lbl = label_for(r.stock.score, cfg.trend_strong, cfg.trend_bias)
+        if abs(r.stock.score) >= cfg.trend_bias and abs(x["change"]) >= AGAINST_MIN:
+            with_trend = (r.stock.score > 0) == (x["change"] > 0)
+            parts.append(("✅ with" if with_trend else "⚠️ gapping against") + f" swing {label(lbl)}")
+    return " · ".join(parts)
 
 
 TF_ORDER = ["1w", "1d", "1h", "15m", "5m"]
@@ -164,8 +183,9 @@ def trend_reply(r: SymbolResult, cfg, now: datetime, watched: bool, market_open:
         why = "; ".join(r.errors or []) or "no data"
         return f"❓ <b>{escape(r.symbol)}</b>: no data ({escape(why[:200])}). Check the ticker."
     v = verdict(r, list(cfg.trend_profiles[cfg.trend_primary]))
+    pre = premarket_line(r, cfg)
     lines = [f"{ICON[v.direction]} <b>{escape(r.symbol)}</b>  {now:%a %H:%M} ET", price_line(r),
-             *stock_lines(r, cfg.trend_profiles, cfg.trend_primary), options_line(r),
+             *([escape(pre)] if pre else []), *stock_lines(r, cfg.trend_profiles, cfg.trend_primary), options_line(r),
              f"<b>{escape(v.line())}</b>", ""]
     for extra in (iv_line(r), levels_line(r), idea_line(r, "swing", v.direction, cfg, "Swing")):
         if extra:
@@ -175,7 +195,8 @@ def trend_reply(r: SymbolResult, cfg, now: datetime, watched: bool, market_open:
         lines += ["", *day]
     notes = [r.source_note] if r.source_note else []
     if not market_open:
-        notes.append("market closed: last session data")
+        notes.append("pre-market: trend from yesterday's close, options open at 09:30" if r.premarket
+                     else "market closed: last session data")
     if not watched:
         notes.append("not on the watchlist: options flow history is not tracked")
     if cfg.stock_delay_minutes:

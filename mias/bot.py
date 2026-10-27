@@ -34,7 +34,8 @@ log = logging.getLogger(__name__)
 _reply_chat: contextvars.ContextVar[str | None] = contextvars.ContextVar("reply_chat", default=None)
 GROUP_TYPES = ("group", "supergroup")
 KNOWN = {"trend", "t", "market", "sector", "sectors", "picks", "list", "status", "help", "start", "whoami",
-         "buy", "sell", "positions", "pos", "ema", "scorecard", "brief"}
+         "buy", "sell", "positions", "pos", "ema", "scorecard", "brief", "premarket",
+         "strategies"}
 PRIVATE_ONLY = {"buy", "sell", "positions", "pos"}
 # The user and chat type of the message being answered (position commands are per user, private chats only).
 _user: contextvars.ContextVar[str] = contextvars.ContextVar("user", default="")
@@ -49,7 +50,9 @@ COMMANDS = [
     ("picks", "Today's call and put spread picks"),
     ("ema", "EMA 9/21 day-trade watch and today's paper trades"),
     ("brief", "Morning day-trade brief: candidates and key levels"),
+    ("premarket", "Pre-market heads-up: sectors, gappers, earnings"),
     ("scorecard", "How the alerts did: /scorecard 30 for 30 days"),
+    ("strategies", "Paper strategies' records: expectancy after costs (/strategies 30)"),
     ("positions", "Your open positions (private chat)"),
     ("buy", "Track a position: /buy AMZN 11/20 260/280C 6.63 x1"),
     ("sell", "Close a tracked position: /sell AMZN 13.40"),
@@ -64,9 +67,10 @@ Shortcut: just send <code>NVDA</code> or <code>nvda mu</code>
 /market: SPY, QQQ, IWM, watchlist breadth and sectors
 /sector: which sector is strongest (also in every digest); /sector energy for its members
 /picks: today's call and put spread picks (also sent automatically at 10:00 ET)
-/brief: the 09:45 day-trade brief again (candidates, key levels) · /scorecard: how the alerts did
+/premarket: the 07:00 pre-market heads-up now (sectors, gappers, earnings) · /brief: the 09:45 day-trade brief again (candidates, key levels) · /scorecard: how the alerts did
 (/scorecard 30 for 30 days, /scorecard replay for the replayed history)
-/ema: 5-minute EMA 9/21 cross-and-retest watch (SPY, QQQ, NVDA, TSLA, META) and today's paper trades (entries also alert the group)
+/strategies: each paper strategy's own record (win rate, expectancy after costs, drawdown); /strategies 30 for 30 days
+/ema: 5-minute EMA 9/21 cross-and-retest watch (SPY, QQQ, NVDA, TSLA, META, MSFT) and today's paper trades (entries also alert the group)
 /list: watched symbols · /status: health · /whoami: your IDs
 
 <b>Your positions</b> (private chat with the bot; alerts come to you only)
@@ -203,8 +207,15 @@ class CommandBot:
             else:
                 days = int(args[0]) if args and args[0].isdigit() else 7
                 await self.reply(scorecard.report(self.svc.store, now, max(1, min(days, 365))))
+        elif cmd == "strategies":
+            from . import strategies
+            days = int(args[0]) if args and args[0].isdigit() else 7
+            await self.reply(strategies.report(self.svc.store, self.svc.cfg, datetime.now(timezone.utc),
+                                               max(1, min(days, 365))))
         elif cmd == "brief":
             await self.reply(self.svc.brief_text(datetime.now(timezone.utc)))
+        elif cmd == "premarket":
+            await self.reply((await self.svc.premarket_text(datetime.now(timezone.utc)))[0])
         elif cmd == "ema":
             from . import emacross
             await self.reply(emacross.status_text(self.svc.store, self.svc.cfg, datetime.now(timezone.utc),
@@ -262,6 +273,9 @@ class CommandBot:
             opts = f" · options {formatting.label(r.bias.label)}" if r.bias and r.bias.components else ""
             lines.append(f"{formatting.ICON[direction(r.stock.label)]} <b>{r.symbol}</b> {formatting.num(r.price)} "
                          f"({formatting.num(r.day_change_pct, '.2f', True)}%)\n   {comp}{opts} · {v.icon} {v.level}")
+            pre = formatting.premarket_line(r, cfg)
+            if pre:
+                lines.append(f"   {escape(pre)}")
         if scores:
             avg = sum(scores) / len(scores)
             lbl = formatting.label_for_score(avg, cfg)

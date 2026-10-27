@@ -33,7 +33,8 @@ INTRADAY_GAP_S = 20 * 60
 DEDUPE_S = 30 * 60
 OPTION_FRESH_S = 30 * 60      # an option value is only taken this close to the horizon (it can't be looked up later)
 NAMES = {"pullback_entry": "Pullback entry", "strong_alignment": "Strong alignment", "trend_change": "Trend change",
-         "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA day trade",
+         "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA day trade (retest)",
+         "ema_cross_entry": "EMA day trade (cross)",
          "flow": "One-sided flow", "flow_confirmed": "Flow, price confirms",
          "flow_unconfirmed": "Flow, price disagrees", "flow_opened": "Flow confirmed by OI"}
 

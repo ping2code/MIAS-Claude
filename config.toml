@@ -193,12 +193,12 @@ block_cooldown_minutes = 60     # per contract
 # management go to the group as PAPER trades, tracked on live option quotes, with a summary at the close.
 # Backtest: python -m mias ema-backtest --symbols SPY --start 2026-04-27 --end 2026-10-23
 enabled = true
-symbols = ["SPY", "QQQ", "NVDA", "TSLA", "META"]
+symbols = ["SPY", "QQQ", "NVDA", "TSLA", "META", "MSFT"]
 fast = 9
 slow = 21
 retest_bars = 6            # the pullback into the EMAs must come within 6 candles (30 min) of the cross
 confirm_bars = 3           # ... and the confirmation candle within 3 candles of the pullback
-start = "09:45"            # ET; times in the handout read as ET (3:10 PM Central would be after the close)
+start = "09:35"            # ET, first entry (was 09:45; EMAs are warm from earlier days, the range check needs 15 min)
 last_entry = "15:00"
 close = "15:10"
 one_dte_after = "13:00"
@@ -210,9 +210,31 @@ trail = [[0.75, 0.50], [1.00, 0.75]]
 max_losses_in_row = 2
 manage_seconds = 30        # open paper trades are re-priced this often between the 150 s cycles
 swing_filter = false       # true: skip entries against the swing trend (see the backtest's swing split first)
+# Two paper strategies on the same crosses, each with its own record, alerts and closing summary:
+# retest = cross, pullback into the EMAs, confirmation candle; cross = enter at the crossing candle's close.
+strategies = ["retest", "cross"]
+fee_per_contract = 0.65    # commission per contract per side, taken off in the weekly strategy report
 # Paper fills are realistic: bought at the ask, sold at the bid (never above the trigger price); the midpoint
 # result is shown alongside. Every closed trade is logged with MFE/MAE, stop distances, spread, fill delay and the
 # trend at entry: python -m mias ema-log
+
+[closeplay]
+# 3:45 PM close play, paper-traded (python -m mias close-backtest): at 15:45 ET, when the day's move, the VWAP side
+# and the last 45 minutes all point the same way, buy the 0DTE ATM option AGAINST them (the closing pullback) and
+# sell at 15:59. Otherwise NO TRADE. Posted to the group every day at ~15:45 with the SPX equivalent strike.
+# Backtest, SPY 2024-10 to 2026-10: right 59% of the time, +$6.4 per contract after costs, PF 1.34, both years
+# positive; thin (+$2.4 with 3 cents of slippage).
+enabled = true
+symbol = "SPY"
+contracts = 1
+
+[premarket]
+# Pre-market heads-up (and /premarket anytime): the first time gets yesterday's sector board, pre-market moves of
+# SPY/QQQ/IWM, the sector ETFs and the biggest gappers (volume vs normal for the time of day, gaps against the
+# trend flagged) and estimated earnings; later times are short updates marking each sector ✅ held / ⚠️ flipped
+# against the first read. Weekdays only; nothing is sent on a holiday (no pre-market trades).
+enabled = true
+times = ["07:00", "09:15"]
 
 [brief]
 # The day-trade brief at 09:45 ET (and /brief anytime): SPY/QQQ/IWM opening read, trend or chop day, the leading

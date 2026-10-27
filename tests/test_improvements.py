@@ -229,3 +229,176 @@ def test_scorecard_short_horizons_need_a_nearby_check(tmp_path):
     assert st["15m"] == [-0.5] and st["30m"] == [1.0] and st["1h"] == []      # no check within 20 min of 12:00
     text = scorecard.report(store, datetime.fromtimestamp(t0 + 7200, timezone.utc), 7)
     assert "Flow, price confirms" in text and "15m 0% right" in text and "30m 100% right" in text
+
+
+# ---- pre-market ----------------------------------------------------------------------------------
+
+def _pre_bars(d: date, prev_close: float, pre: list[tuple[int, int, float, float]]) -> list[dict]:
+    out = []
+    if prev_close:
+        out.append({"t": _ms(d, 15, 55), "o": prev_close, "h": prev_close, "l": prev_close, "c": prev_close,
+                    "v": 1000})
+    for h, m, c, v in pre:
+        out.append({"t": _ms(d, h, m), "o": c, "h": c, "l": c, "c": c, "v": v, "vw": c})
+    return out
+
+
+def test_premarket_read_change_and_relative_volume():
+    from mias.premarket import read
+    d0, d1, d2 = date(2026, 10, 22), date(2026, 10, 23), date(2026, 10, 26)
+    raw = (_pre_bars(d0, 100.0, [(7, 0, 100.0, 500)]) + _pre_bars(d1, 100.0, [(7, 0, 100.0, 1500)])
+           + _pre_bars(d2, 0, [(6, 30, 101.0, 1000), (7, 5, 102.0, 3000), (8, 0, 103.0, 9999)]))
+    x = read(raw, d2, ET, datetime.combine(d2, time(7, 15), ET))
+    assert x["price"] == 102.0 and x["change"] == pytest.approx(2.0) and x["volume"] == 4000
+    assert x["rvol"] == pytest.approx(4.0) and x["dollars"] == pytest.approx(101 * 1000 + 102 * 3000)
+    assert read(raw, d2, ET, datetime.combine(d2, time(6, 0), ET)) is None          # nothing traded yet
+
+
+def test_premarket_text_flags_and_update(cfg):
+    from mias.premarket import text
+    prior = [NS(symbol=s, stock=NS(score=sc, label="UP" if sc > 0 else "DOWN", composites={}), price=1)
+             for s, sc in (("NVDA", 60), ("MU", 50), ("XOM", -60), ("CVX", -50), ("SOFI", -70))]
+    mv = lambda c, dollars=2e6: {"change": c, "rvol": 1.5, "dollars": dollars, "price": 1, "prev_close": 1,
+                                 "volume": 1}
+    reads = {"SPY": mv(0.2), "QQQ": mv(0.4), "IWM": mv(-0.1), "SMH": mv(1.2), "XLE": mv(0.9), "SOFI": mv(9.5),
+             "MU": mv(2.0, 1e5)}
+    now = datetime.combine(date(2026, 10, 27), time(7, 0), ET)
+    msg, snap = text(cfg, reads, prior, [("MSFT", {"next": "2026-10-29", "quality": "confirmed"})], now)
+    assert "Pre-market heads-up" in msg and "Yesterday's close: sector trend" in msg
+    assert "SMH +1.20%, 1.5× vol · ✅ with its trend" in msg
+    assert "XLE +0.90%, 1.5× vol · ⚠️ gapping against its trend" in msg
+    assert "SOFI +9.50%" in msg and "⚠️ against its trend" in msg and "MU +2.00%" not in msg   # MU: too thin
+    assert "MSFT ~Oct 29" in msg and snap["leader"] == "tech" and snap["sectors"]["energy"] == 0.9
+    reads["XLE"] = mv(-0.4)
+    upd, _ = text(cfg, reads, prior, [], now.replace(hour=9, minute=15), earlier=snap)
+    assert "Pre-market update" in upd and "Earnings" not in upd
+    assert "SMH +1.20%, 1.5× vol · ✅ with its trend · ✅ held (07:00 +1.20%)" in upd
+    assert "⚠️ flipped (07:00 +0.90%)" in upd and "✅ same as 07:00" in upd
+
+
+# ---- 3:45 close play -----------------------------------------------------------------------------
+
+def test_close_play_read_and_rules():
+    from datetime import date as _date, datetime as _dt, time as _time, timedelta as _td
+    from zoneinfo import ZoneInfo
+    from mias import closeplay
+    from mias.indicators import Bar
+    et = ZoneInfo("America/New_York")
+    day = _date(2026, 10, 26)
+    bars, t, p = [], _dt.combine(day, _time(9, 30), et), 100.0
+    while t.time() < _time(16, 0):
+        up = 0.05 if t.time() < _time(15, 45) else -0.1          # rising all day, dips in the last 15 minutes
+        bars.append(Bar(int(t.timestamp() * 1000), p, p + 0.1, p - 0.1, p + up, 1000))
+        p, t = p + up, t + _td(minutes=5)
+    x = closeplay.read(bars, et)
+    assert x["day"] == x["vwap_side"] == x["momentum"] == 1 and x["move_pct"] < 0
+    assert closeplay.decide(x, "trend") == 1 and closeplay.decide(x, "fade") == -1
+    assert closeplay.decide(x, "strong") == (1 if x["day_pct"] >= closeplay.STRONG_DAY else 0)
+    assert closeplay.read(bars[:60], et) is None                  # half day: no 15:40 candle
+    rows = [dict(x, date="2026-10-26", **{f"rule_{r}": closeplay.decide(x, r) for r in closeplay.RULES},
+                 call_pnl=-30.0, put_pnl=80.0)]
+    s = closeplay.summary(rows, "fade")
+    assert s["signals"] == 1 and s["hit"] == 100 and s["expectancy"] == 80.0
+    assert closeplay.summary(rows, "trend")["hit"] == 0
+
+
+# ---- strategy report -----------------------------------------------------------------------------
+
+def test_strategy_report_separates_strategies(tmp_path, monkeypatch):
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path as _P
+    from mias import config as config_mod, emacross, strategies
+    from mias.store import Store
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    monkeypatch.setenv("MIAS_DB_PATH", str(tmp_path / "s.db"))
+    cfg = config_mod.load(_P(__file__).resolve().parent.parent / "config.toml")
+    store = Store(tmp_path / "s.db")
+    log = [{"date": "2026-10-27", "side": "bull", "pnl": 200.0},
+           {"date": "2026-10-27", "side": "bear", "pnl": -100.0, "strategy": "retest"},
+           {"date": "2026-10-27", "side": "bull", "pnl": -50.0, "strategy": "cross"}]
+    store.put(emacross.LOG_KEY, log)
+    store.put("health:2026-10-27", {"BAC": {"stock": 2}})
+    text = strategies.report(store, cfg, _dt(2026, 10, 27, 21, 0, tzinfo=_tz.utc))
+    retest, cross = text.split("cross + retest")[1].split("cross (no retest)")
+    assert "2 trades" in retest and "win 50%" in retest and "expectancy +$44/trade" in retest  # (193.5-106.5)/2
+    assert "1 trade ·" in cross and "-$56" in cross
+    assert "Health gate held 2 signals" in text
+    s = strategies.stats([{"pnl": 100.0}, {"pnl": -300.0}, {"pnl": 50.0}], 0)
+    assert s["max_dd"] == -300 and round(s["pf"], 2) == 0.5
+
+
+def _close_day_raw(day, et, drift_after=-0.1, turn=(15, 45)):
+    from datetime import datetime as _dt, time as _time, timedelta as _td
+    raw, t, p = [], _dt.combine(day, _time(9, 30), et), 100.0
+    while t.time() < _time(16, 0):
+        up = 0.05 if t.time() < _time(*turn) else drift_after
+        raw.append({"t": int(t.timestamp() * 1000), "o": p, "h": p + 0.1, "l": p - 0.1, "c": p + up, "v": 1000})
+        p, t = p + up, t + _td(minutes=5)
+    return raw
+
+
+class _CloseClient:
+    def __init__(self, day):
+        self.day, self.bid, self.ask = day, 0.50, 0.52
+
+    async def option_chain(self, symbol, *, spot, today, **kw):
+        return [{"details": {"contract_type": k, "expiration_date": today.isoformat(), "strike_price": s,
+                             "ticker": f"O:SPY{today:%y%m%d}{k[0].upper()}{int(s * 1000):08d}"},
+                 "last_quote": {"bid": self.bid, "ask": self.ask}, "underlying_asset": {"price": spot}}
+                for k in ("call", "put") for s in (round(spot) - 1, round(spot), round(spot) + 1)], False
+
+    async def snapshots(self, tickers):
+        return {t: {"last_quote": {"bid": self.bid, "ask": self.ask}, "underlying_asset": {"price": 104.0}}
+                for t in tickers}
+
+
+def _close_cfg(tmp_path, monkeypatch):
+    from pathlib import Path as _P
+    from mias import config as config_mod
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    monkeypatch.setenv("MIAS_DB_PATH", str(tmp_path / "c.db"))
+    return config_mod.load(_P(__file__).resolve().parent.parent / "config.toml")
+
+
+def test_close_play_live_fade_trade(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import date as _date, datetime as _dt, time as _time
+    from mias import closeplay, strategies
+    from mias.store import Store
+    cfg = _close_cfg(tmp_path, monkeypatch)
+    et = cfg.tz
+    day = _date(2026, 10, 28)
+    raw = _close_day_raw(day, et)
+    store, client = Store(tmp_path / "c.db"), _CloseClient(day)
+    at = lambda h, m: _dt.combine(day, _time(h, m), et)
+    early = [b for b in raw if b["t"] + 300_000 <= at(15, 44).timestamp() * 1000]
+    assert asyncio.run(closeplay.live(client, store, cfg, at(15, 45), early)) == 0     # 15:40 candle not in yet
+    assert asyncio.run(closeplay.live(client, store, cfg, at(15, 46), raw, [], 6880.0)) == 1
+    text = store.pending()[-1][2]
+    assert "PUT" in text and "fade it" in text and "SPX equivalent: 0DTE 6880P" in text and "0.52 ask" in text
+    assert asyncio.run(closeplay.live(client, store, cfg, at(15, 48), raw)) == 0       # once a day
+    assert asyncio.run(closeplay.manage(client, store, cfg, at(15, 58))) == 0           # not before 15:59
+    client.bid, client.ask = 0.90, 0.92
+    assert asyncio.run(closeplay.manage(client, store, cfg, at(15, 59))) == 1
+    assert "SOLD" in store.pending()[-1][2] and "+$38" in store.pending()[-1][2]
+    log = store.get(closeplay.LOG_KEY)
+    assert log[0]["pnl"] == 38.0 and log[0]["side"] == "bear" and log[0]["qty"] == 1
+    text = strategies.report(store, cfg, at(16, 30))
+    assert "3:45 PM close fade" in text and "expectancy +$37/trade" in text           # 38 - 2 x 0.65
+
+
+def test_close_play_no_trade_and_health_hold(tmp_path, monkeypatch):
+    import asyncio
+    from datetime import date as _date, datetime as _dt, time as _time
+    from mias import closeplay
+    from mias.store import Store
+    cfg = _close_cfg(tmp_path, monkeypatch)
+    day = _date(2026, 10, 28)
+    at = _dt.combine(day, _time(15, 46), cfg.tz)
+    raw = _close_day_raw(day, cfg.tz, -0.02, (15, 0))     # up on the day, down the last 45 minutes: mixed
+    store = Store(tmp_path / "n.db")
+    assert asyncio.run(closeplay.live(_CloseClient(day), store, cfg, at, raw)) == 1
+    assert "NO TRADE" in store.pending()[-1][2] and store.get(closeplay.KEY)["status"] == "no_trade"
+    store2 = Store(tmp_path / "h.db")
+    asyncio.run(closeplay.live(_CloseClient(day), store2, cfg, at, _close_day_raw(day, cfg.tz), ["stock: timeout"]))
+    assert "health gate" in store2.pending()[-1][2] and store2.get(closeplay.KEY)["status"] == "held"

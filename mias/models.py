@@ -19,6 +19,7 @@ class SymbolResult:
     errors: list[str] | None = None
     source_note: str | None = None      # e.g. where an index's trend and price come from
     events: dict | None = None          # earnings estimate, IV event, IV rank (mias/events.py)
+    premarket: dict | None = None       # 04:00-09:30 only: the pre-market move (mias/premarket.read)
 
     @property
     def price(self) -> float | None:

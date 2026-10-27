@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import emacross, events, formatting, positions, scorecard, sectors, signals
+from . import closeplay, emacross, events, formatting, health, positions, premarket, scorecard, sectors, signals
 from .config import Config
 from .massive import MassiveClient
 from .models import SymbolResult
@@ -38,6 +38,7 @@ class Engine:
         self.swing_changes: dict[str, tuple[str, str, float]] = {}
         self.five: dict[str, list] = {}       # day-trade symbols: regular-session 5-minute bars (emacross)
         self.today5: dict[str, list[dict]] = {}   # today's raw 5-minute bars per symbol (morning brief)
+        self.pre: dict[str, dict | None] = {}     # pre-market read per symbol, set only before the open
         self._ivhist: dict | None = None             # IV history, read once per cycle (mias/events.py)
 
     # ---- public -----------------------------------------------------------------------------
@@ -69,12 +70,23 @@ class Engine:
                 await positions.check_all(self.client, self.store, self.cfg, now, self.swing_changes)
             except Exception:
                 log.exception("position check failed")
+            by_sym = {r.symbol: r for r in results}
             if self.cfg.daytrade.enabled:
                 try:
-                    await emacross.live(self.client, self.store, self.cfg, now, self.five,
-                                        {r.symbol: r for r in results})
+                    issues = {s: self.health_issues(by_sym[s], now) for s in self.cfg.daytrade.symbols
+                              if s in by_sym}
+                    await emacross.live(self.client, self.store, self.cfg, now, self.five, by_sym, issues)
                 except Exception:
                     log.exception("EMA day-trade check failed")
+            if self.cfg.closeplay_enabled:
+                try:
+                    sym = self.cfg.closeplay_symbol
+                    r = by_sym.get(sym)
+                    spx = by_sym.get("SPX")
+                    await closeplay.live(self.client, self.store, self.cfg, now, self.today5.get(sym),
+                                         self.health_issues(r, now) if r else [], spx.price if spx else None)
+                except Exception:
+                    log.exception("close play failed")
             try:
                 await scorecard.update(self.client, self.store, self.cfg.tz, now)
             except Exception:
@@ -128,6 +140,7 @@ class Engine:
         try:
             trend = await self._stock(sym, now, today)
             r.stock = trend if trend.timeframes else None
+            r.premarket = self.pre.get(sym)
             if r.stock is None:
                 r.errors.append("stock: not enough price history")
             if r.stock_price is None and r.stock and r.stock.last_close:
@@ -162,6 +175,8 @@ class Engine:
         try:
             trend = await self._stock(inst.trend_symbol, now, today)
             r.stock = trend if trend.timeframes else None
+            pre = self.pre.get(inst.trend_symbol)
+            r.premarket = dict(pre, via=inst.trend_symbol) if pre else None
         except Exception as exc:
             r.errors.append(f"trend ({inst.trend_symbol}): {exc}")
             log.warning("%s trend via %s failed: %s", sym, inst.trend_symbol, exc)
@@ -227,6 +242,12 @@ class Engine:
             self._daily[sym] = daily
         today5 = await self.client.aggregates(sym, 5, "minute", today, today)
         self.today5[sym] = today5
+        self.pre[sym] = None
+        if premarket.is_premarket(now, cfg.tz):
+            try:
+                self.pre[sym] = premarket.read(hist[1] + today5, today, cfg.tz, now)
+            except Exception as exc:
+                log.warning("%s pre-market read failed: %s", sym, exc)
 
         available_until = int((now.timestamp() - cfg.stock_delay_minutes * 60) * 1000)
         five = hist[1] + today5
@@ -311,6 +332,11 @@ class Engine:
                               "premium": p.premium, "ts": ts} for p in big]
         self.store.put("blocks", pending)
 
+    def health_issues(self, r: SymbolResult, now: datetime) -> list[str]:
+        inst = self.cfg.instruments.get(r.symbol)
+        src = inst.trend_symbol if inst else r.symbol
+        return health.symbol_issues(r, self.today5.get(src), now, self.cfg.tz)
+
     def _evaluate(self, results: list[SymbolResult], now: datetime) -> None:
         cfg, ts = self.cfg, now.timestamp()
         local = now.astimezone(cfg.tz)
@@ -320,6 +346,10 @@ class Engine:
         for r in results:
             if not r.ok:
                 continue
+            issues = self.health_issues(r, now)
+            if issues:
+                health.record(self.store, now, cfg.tz, r.symbol, "alerts", issues)
+                continue                          # state untouched: the change fires once the data is clean
             key = f"state:{r.symbol}"
             state = _for_mode(self.store.get(key, {}), cfg.alert_mode)
             iv_hist = []
