@@ -216,3 +216,16 @@ def test_brief_read_measures_the_open():
     x = read("AAA", raw, [], d1, ET)
     assert x["gap"] == pytest.approx(2.0) and x["rvol"] == pytest.approx(3.0)
     assert x["pdh"] == 100.5 and x["orb_high"] == 102.5 and x["move15"] == pytest.approx(100 * 0.3 / 102)
+
+
+def test_scorecard_short_horizons_need_a_nearby_check(tmp_path):
+    store = Store(tmp_path / "s.db")
+    t0 = datetime(2026, 10, 19, 11, 0, tzinfo=ET).timestamp()
+    for dt, p in ((0, 100.0), (900, 100.5), (1800, 99.0)):
+        store.add_metrics(t0 + dt, "x", {"AAA": {"price": p}})
+    scorecard.record(store, t0, "AAA", "flow_confirmed", "bear", 100.0)
+    asyncio.run(scorecard.update(None, store, ET, datetime.fromtimestamp(t0 + 7200, timezone.utc)))
+    st = scorecard.stats(store, t0 - 1)["flow_confirmed"]
+    assert st["15m"] == [-0.5] and st["30m"] == [1.0] and st["1h"] == []      # no check within 20 min of 12:00
+    text = scorecard.report(store, datetime.fromtimestamp(t0 + 7200, timezone.utc), 7)
+    assert "Flow, price confirms" in text and "15m 0% right" in text and "30m 100% right" in text

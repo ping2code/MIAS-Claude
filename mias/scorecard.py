@@ -1,8 +1,10 @@
 """Alert scorecard: every directional alert is logged with what the stock (and a matching option) did after it.
 
 Logged: tier-1 pullback entries and strong alignment, tier-2 trend changes, options flips and wall breaks, EMA
-day-trade entries, one-sided unusual flow, and unusual flow that next-day open interest confirmed as opening.
-Each gets the stock price 1 hour later (capped at the close), 1 trading day later and 5 trading days later, from
+day-trade entries, one-sided unusual flow (also split by whether price confirmed it: the stock's side of VWAP and
+the market), and unusual flow that next-day open interest confirmed as opening.
+Each gets the stock price 15 and 30 minutes and 1 hour later (capped at the close; a check within 20 minutes of the
+horizon is needed), 1 trading day later and 5 trading days later, from
 the recorded checks (metrics), signed in the alert's direction. Alerts that name a contract also get the
 contract's live value at each horizon. `python -m mias scorecard --backfill` replays the recorded checks through
 the current tiered rules to seed the card with history (stock moves only).
@@ -25,12 +27,15 @@ CREATE TABLE IF NOT EXISTS signals (
     outcome TEXT NOT NULL DEFAULT '{}', done INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS signals_open ON signals(done, ts);
 """
-HORIZONS = ("1h", "1d", "5d")
+HORIZONS = ("15m", "30m", "1h", "1d", "5d")
+INTRADAY = {"15m": 900, "30m": 1800, "1h": 3600}
+INTRADAY_GAP_S = 20 * 60
 DEDUPE_S = 30 * 60
 OPTION_FRESH_S = 30 * 60      # an option value is only taken this close to the horizon (it can't be looked up later)
 NAMES = {"pullback_entry": "Pullback entry", "strong_alignment": "Strong alignment", "trend_change": "Trend change",
          "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA day trade",
-         "flow": "One-sided flow", "flow_opened": "Flow confirmed by OI"}
+         "flow": "One-sided flow", "flow_confirmed": "Flow, price confirms",
+         "flow_unconfirmed": "Flow, price disagrees", "flow_opened": "Flow confirmed by OI"}
 
 
 def ensure(store) -> None:
@@ -63,16 +68,20 @@ def _add_trading_days(d, n):
 def due(ts: float, tz: ZoneInfo) -> dict[str, float]:
     t = datetime.fromtimestamp(ts, timezone.utc).astimezone(tz)
     close = datetime.combine(t.date(), time(16, 0), tz).timestamp()
-    out = {"1h": min(ts + 3600, close)}
+    out = {h: min(ts + secs, close) for h, secs in INTRADAY.items()}
     for h, n in (("1d", 1), ("5d", 5)):
         out[h] = datetime.combine(_add_trading_days(t.date(), n), t.timetz()).timestamp()
     return out
 
 
-def price_at(store, symbol: str, t: float) -> tuple[float, float] | None:
-    """(ts, price) of the first recorded check at or after t, within 4 days."""
+def _within(h: str) -> float:
+    return INTRADAY_GAP_S if h in INTRADAY else 4 * 86400
+
+
+def price_at(store, symbol: str, t: float, within: float = 4 * 86400) -> tuple[float, float] | None:
+    """(ts, price) of the first recorded check at or after t, within `within` seconds (default 4 days)."""
     for ts, data in store.db.execute("SELECT ts, data FROM metrics WHERE symbol=? AND ts>=? AND ts<? ORDER BY ts "
-                                     "LIMIT 3", (symbol, t, t + 4 * 86400)):
+                                     "LIMIT 3", (symbol, t, t + within)):
         p = json.loads(data).get("price")
         if p:
             return ts, p
@@ -112,9 +121,9 @@ async def update(client, store, tz: ZoneInfo, now: datetime) -> int:
     outs: dict[int, dict] = {}
     for sid, h, t, sym, d, price, contract, premium, out in pending:
         out = outs.setdefault(sid, out)
-        got = price_at(store, sym, t)
+        got = price_at(store, sym, t, _within(h))
         if not got:
-            if now_ts - t > 4 * 86400:
+            if now_ts - t > _within(h):
                 out[h] = {"missing": True}
                 filled += 1
             continue
@@ -168,7 +177,8 @@ def report(store, now: datetime, days: int = 7, source: str = "live") -> str:
     lines.append("<i>Right = the stock moved the alert's way. Option = the named contract's return.</i>")
     for rule, s in sorted(st.items(), key=lambda kv: -kv[1]["n"]):
         lines.append(f"\n<b>{NAMES.get(rule, rule)}</b> ({s['n']})")
-        lines.append("  stock: " + " · ".join(f"{h} {_cell(s[h])}" for h in HORIZONS))
+        lines.append("  stock: " + " · ".join(f"{h} {_cell(s[h])}" for h in HORIZONS
+                                              if s[h] or h not in ("15m", "30m")))
         opt = [f"{h} {_cell(s['opt_' + h])}" for h in HORIZONS if s["opt_" + h]]
         if opt:
             lines.append("  option: " + " · ".join(opt))
@@ -217,7 +227,7 @@ def backfill(store, cfg) -> int:
             "SELECT id, ts, symbol, dir, price FROM signals WHERE source='replay'").fetchall():
         out = {}
         for h, t in due(ts, cfg.tz).items():
-            got = price_at(store, sym, t)
+            got = price_at(store, sym, t, _within(h))
             if got:
                 sign = 1 if dr == "bull" else -1
                 out[h] = {"price": got[1], "move": round(sign * 100 * (got[1] / price - 1), 3)}

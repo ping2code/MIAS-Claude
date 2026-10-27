@@ -775,6 +775,74 @@ def test_block_lines_trust_the_tape():
     assert "🟢 QQQ 11/20 600C" in text and "mostly bought" in text and "multi-leg or paired" in text
 
 
+def test_unusual_report_sends_only_material_activity():
+    from mias.formatting import unusual_report
+    now = datetime.combine(TODAY, time(14, 15), ET)
+    res = [_with_unusual("AAA", [("call", 100, "buy", 5000, 9e6, 100), ("put", 90, "buy", 4000, 2e6, 50)])]
+    prev = {"O:AAA0": 4990, "O:AAA1": 3900}         # +10 and +100 contracts: $18K and $50K of new premium
+    info = {}
+    text, _ = unusual_report(res, now, prev, 10, since=now - timedelta(minutes=15), material=1e6, row_min=2.5e5,
+                             info=info)
+    assert text.startswith("🔥 14:15 ET · no material new flow since 14:00. Largest: AAA 10/16 90P new $50K (+100)")
+    assert "2 contracts traded, none ≥ $1.0M" in text and info["material"] is False and info["minor"] == 2
+    assert unusual_report(res, now, prev, 10, material=1e6, row_min=2.5e5, quiet="skip")[0] is None
+    prev = {"O:AAA0": 4000, "O:AAA1": 3900}         # +1,000 calls = $1.8M: material; the put is minor, not listed
+    text, _ = unusual_report(res, now, prev, 10, material=1e6, row_min=2.5e5)
+    assert "AAA 10/16 100C" in text and "90P" not in text and "1 minor" in text
+
+
+def test_unusual_report_price_check_and_structures():
+    from mias.flow import Tape
+    from mias.formatting import unusual_report
+    now = datetime.combine(TODAY, time(14, 15), ET)
+    res = [_with_unusual("AAA", [("call", 100, "buy", 5000, 9e6, 100)]),
+           _with_unusual("SPX", [("put", 7800, "buy", 3000, 6e6, 10), ("put", 7775, "sell", 6000, 9e6, 10)])]
+    reads = {"AAA": {"side": -1, "rvol": 1.6}, "SPY": {"side": -1, "rvol": 1.1}, "QQQ": {"side": -1, "rvol": 1.0},
+             "IWM": {"side": 1, "rvol": 0.9}}
+    structs = [{"symbol": "SPX", "expiry": "2026-10-16", "tickers": ["O:SPX0", "O:SPX1"],
+                "legs": [("put", 7800.0), ("put", 7775.0)], "premium": 1.5e7, "matched": 3000}]
+    text, _ = unusual_report(res, now, None, 10, structures=structs, confirm=reads, market=["SPY", "QQQ", "IWM"])
+    assert "Market: SPY below VWAP (1.1× vol) · QQQ below VWAP (1.0× vol) · IWM above VWAP (0.9× vol)" in text
+    assert "🟢 AAA 10/16 100C" in text and "⚠️ below VWAP, 1.6× vol · ⚠️ vs market" in text
+    assert "⚪ SPX 10/16 7800P" in text and "🧩 part of a structure" in text
+    assert "🧩 SPX 10/16 7800P/7775P · $15.0M · 3,000 contracts matched" in text
+    assert "structures $15.0M" in text and "bearish $0" in text and "price confirms 0, disagrees 1" in text
+
+
+def test_structures_link_legs_printed_together():
+    from mias.flow import Tape, structures
+    s = 10**9
+    a = Tape("A", "put", contracts=300, buy=3e5, prints=[(1 * s, 100), (5 * s, 200)])
+    b = Tape("B", "put", contracts=600, sell=6e5, prints=[(1 * s + 2e8, 200), (1 * s + 3e8, 100), (5 * s, 200),
+                                                         (9 * s, 200)])
+    c = Tape("C", "put", contracts=300, buy=3e5, prints=[(5 * s + 5e8, 200), (30 * s, 100)])
+    d = Tape("D", "call", contracts=500, buy=5e5, prints=[(40 * s, 500)])          # alone: no structure
+    meta = {"A": ("SPX", "2026-11-09", "put", 7800.0), "B": ("SPX", "2026-11-09", "put", 7775.0),
+            "C": ("SPX", "2026-11-09", "put", 7750.0), "D": ("SPX", "2026-11-09", "call", 7900.0)}
+    out = structures({"A": a, "B": b, "C": c, "D": d}, meta)
+    assert len(out) == 1 and out[0]["tickers"] == ["A", "B", "C"]
+    assert out[0]["legs"] == [("put", 7800.0), ("put", 7775.0), ("put", 7750.0)]
+    other = {"A": ("SPX", "2026-11-09", "put", 7800.0), "B": ("SPX", "2026-11-16", "put", 7775.0)}
+    assert structures({"A": a, "B": b}, other) == []                                 # different expiries
+
+
+def test_price_confirmation_read_and_verdict():
+    from mias.confirm import market_lean, read, verdict
+    def bars(d, closes, vol):
+        t0 = int(datetime.combine(d, time(9, 30), ET).timestamp() * 1000)
+        return [{"t": t0 + i * 300_000, "o": c, "h": c + 0.1, "l": c - 0.1, "c": c, "v": vol} for i, c in
+                enumerate(closes)]
+    prev = bars(TODAY - timedelta(days=1), [100.0] * 78, 1000)
+    today = bars(TODAY, [100.0, 100.5, 101.0, 101.5], 2000)
+    x = read(prev, today, ET, TODAY)
+    assert x["side"] == 1 and x["price"] == 101.5 and x["rvol"] == pytest.approx(2.0)
+    assert verdict("bull", x, 0) == (True, "✅ above VWAP, 2.0× vol")
+    assert verdict("bear", x, 0)[0] is False
+    assert verdict("bull", x, -1) == (False, "✅ above VWAP, 2.0× vol · ⚠️ vs market")
+    assert verdict("neutral", x, 0) == (None, "")
+    assert market_lean({"SPY": {"side": 1}, "QQQ": {"side": 1}, "IWM": {"side": -1}}, ["SPY", "QQQ", "IWM"]) == 1
+
+
 def test_unusual_report_every_10_minutes(cfg):
     from mias.app import Service
     cfg = dataclasses.replace(cfg, unusual_every_minutes=10, reports={})
@@ -786,7 +854,7 @@ def test_unusual_report_every_10_minutes(cfg):
     import mias.formatting as fm
     real = fm.unusual_report
 
-    def spy(results, now, prev, top, per_symbol=3, blocks=None, tapes=None, since=None, oi_lines=None):
+    def spy(results, now, prev, top, per_symbol=3, blocks=None, tapes=None, since=None, oi_lines=None, **kw):
         sent.append(now)
         return "🔥 report", {}
     fm.unusual_report = spy

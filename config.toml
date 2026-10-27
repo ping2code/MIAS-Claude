@@ -124,13 +124,21 @@ note = "trend from SPY bars · price from SPX option quotes"
 
 [reports]
 # A full /trend-style report sent every N minutes while the market is open, aligned to 09:30.
-every_minutes = { NDX = 60, META = 10, MSFT = 10 }
-# Optional last day (inclusive) for a report; after it the report stops by itself.
-until = { META = "2026-10-13", MSFT = "2026-10-13" }
+every_minutes = { NDX = 60 }
+# Optional last day (inclusive) for a report; after it the report stops by itself, e.g. { META = "2026-10-13" }.
+until = {}
 # Unusual options activity across the watchlist (volume > open interest, >= unusual_min_premium, no same-day
 # expiries) every N minutes, marking contracts that are new or growing since the previous report. 0 = off.
 unusual_every_minutes = 15
 unusual_top = 10
+# Only material new activity is sent. A report goes out when one contract traded >= unusual_material of new premium
+# since the previous report (or a one-sided block, a new structure, or the morning open-interest check). Contracts
+# with less than unusual_row_min of new premium are counted as minor, not listed. Otherwise one line says nothing
+# material happened ("line"), or nothing is sent ("skip"). Each line carries a price check: the stock against its
+# VWAP and relative volume, and SPY/QQQ/IWM (market_symbols) against theirs.
+unusual_material = 1_000_000
+unusual_row_min = 250_000
+unusual_quiet = "line"
 
 [picks]
 # Daily spread picks to Telegram: up to one bull call spread and one bear put spread (30-60 days,

@@ -100,9 +100,9 @@ All modes:
 |---|---|
 | **Strong alignment** (`[alerts] mode = "strong_alignment"` only) | Swing **STRONG UP** + intraday **STRONG UP** + options **BULLISH**, or the bearish mirror. It must hold for 2 checks (5 min), with a 30-minute cooldown per symbol. The alert includes swing and day-trade contract picks. |
 | Alignment ended | (strong_alignment mode) When that state breaks (confirmed over 2 checks). Turn off with `alignment_end_alert = false`. |
-| **NDX report** | A full NDX reading every 10 minutes from 09:30 to 16:00, with the change since the previous report (`[reports]`) |
+| **NDX report** | A full NDX reading every hour from 09:30 to 16:00, with the change since the previous report (`[reports]`) |
 | **Daily spread picks** | 10:00 ET (and `/picks` anytime): up to one bull call spread and one bear put spread. Rules: swing UP/STRONG UP (or DOWN), confidence MEDIUM+, options not against, 30–60 days, ~0.50/0.25 delta legs with OI ≥ 1,000. Includes a limit price, breakeven, take-profit (55% of max), a 10-trading-day time stop and a hard exit 7 days before expiry. "No trade today" when nothing qualifies. |
-| **Unusual activity** | Every 10 minutes (`[reports] unusual_every_minutes`): the top 10 contracts across the watchlist where today's volume exceeds open interest (≥ $500K premium, no same-day expiries, max 3 per symbol), with 🆕 new / ⬆️ growing markers, volume added since the previous report, and a bullish/bearish lean by last-trade side |
+| **Unusual activity** | Every 15 minutes (`[reports] unusual_every_minutes`), only when something material happened (see [Options flow](#options-flow)); otherwise one line. Up to 10 contracts where today's volume exceeds open interest (≥ $500K premium, no same-day expiries, max 3 per symbol), with 🆕 new / ⬆️ growing markers, trade-by-trade lean and a price check |
 | Digest | 09:50, 11:30, 13:30, 15:30 ET: every symbol's price, swing/intraday/options scores, IV, top unusual contracts |
 | Closing summary | At the close (handles early closes) |
 | System | Started; degraded after 3 bad cycles in a row; recovered |
@@ -140,6 +140,22 @@ The unusual-activity report separates new activity from the day's totals and rea
   trades and the same contracts changing hands. Open interest is published once a day, so the first report each
   morning checks yesterday's flagged contracts: ✅ opened (OI rose by half the volume or more), ↔️ partly, ✖️
   closing/turnover.
+- **Only material news**: a full report goes out only when one contract traded ≥ $1M of new premium since the
+  previous report (`unusual_material`), or there is a one-sided block, a new structure, or the morning
+  open-interest check. Contracts under $250K of new premium (`unusual_row_min`) are counted as "minor", not listed.
+  Otherwise one line: `🔥 14:15 ET · no material new flow since 14:00. Largest: MSFT 01/15 585C new $740K (+411).
+  18 contracts traded, none ≥ $1.0M.` (`unusual_quiet = "skip"` sends nothing instead.) Each decision is logged
+  (`journalctl --user -u mias-claude | grep unusual`).
+- **Price check**: each line says whether the stock agrees with the flow: ✅ above VWAP for bullish flow (below
+  for bearish), ⚠️ when not, with relative volume (today's volume so far against the same time of day over 20
+  sessions), and ⚠️ vs market when SPY/QQQ/IWM (`market_symbols`) are mostly on the other side of their VWAP. A
+  "Market:" line heads the report. The scorecard tracks confirmed and unconfirmed flow separately, to learn whether
+  the check matters.
+- **Structures**: spreads legged as separate prints aren't flagged by the exchange. Contracts of the same symbol and
+  expiry whose prints keep landing within a second of each other in the same size (half the smaller leg's
+  contracts or more) are grouped as one structure, shown under 🧩 Structures, and left out of the bullish/bearish
+  totals and the scorecard. On 2026-10-26 13:30–14:00 this grouped the SPX 11/09 7750P/7725P spread (2,900
+  contracts matched, $62M).
 - Costs two API calls per contract for the top 30 contracts of each window (about 1–2 seconds).
 
 Example (live, 2026-10-26):
@@ -169,8 +185,8 @@ Under every swing contract (`/trend`, pullback and strong-alignment alerts):
 ## Alert scorecard
 
 Every directional alert is logged (pullback entries, strong alignment, trend changes, options flips, wall breaks,
-EMA entries, one-sided flow, flow confirmed by open interest) and scored 1 hour (capped at the close), 1 trading
-day and 5 trading days later: did the stock move the alert's way, and what did the named contract return.
+EMA entries, one-sided flow split by whether price confirmed it, flow confirmed by open interest) and scored 15
+minutes, 30 minutes and 1 hour later (capped at the close), 1 trading day and 5 trading days later: did the stock move the alert's way, and what did the named contract return.
 `/scorecard` (7 days), `/scorecard 30`, every Friday at the close, and `python -m mias scorecard`.
 `python -m mias scorecard --backfill` replays the recorded checks through today's rules; `/scorecard replay`
 shows that history.
@@ -429,7 +445,8 @@ mias/bot.py         Telegram commands (/trend, /market)        mias/verdict.py  
 mias/emacross.py    EMA 9/21 day trade: detection, backtest, live paper trades
 mias/daysetups.py   other intraday setups (ORB, VWAP, prior-day breaks) and their comparison backtest
 mias/swingtest.py   swing entries backtest (pullback vs strong vs trend, single vs spread)
-mias/flow.py        trade-by-trade flow classification, next-day open-interest check
+mias/flow.py        trade-by-trade flow classification, structures, next-day open-interest check
+mias/confirm.py     price check for flow: VWAP side, relative volume, market
 mias/events.py      earnings estimate, IV events, IV rank, single-vs-spread advice
-mias/scorecard.py   alert outcomes 1h/1d/5d          mias/brief.py   09:45 day-trade brief
+mias/scorecard.py   alert outcomes 15m-5d            mias/brief.py   09:45 day-trade brief
 ```

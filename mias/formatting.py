@@ -316,37 +316,72 @@ def _mix(t) -> str:
 
 def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, float] | None, top: int,
                    per_symbol: int = 3, blocks: list[dict] | None = None, tapes: dict | None = None,
-                   since: datetime | None = None, oi_lines: list[str] | None = None) -> tuple[str | None, dict[str, float]]:
+                   since: datetime | None = None, oi_lines: list[str] | None = None, *, material: float = 0.0,
+                   row_min: float = 0.0, quiet: str = "line", structures: list[dict] | None = None,
+                   confirm: dict | None = None, market: list[str] | None = None,
+                   info: dict | None = None) -> tuple[str | None, dict[str, float]]:
     """Unusual contracts (volume above open interest) that traded since the previous report, ranked by the premium
-    traded in that window. Returns (text or None when nothing new, every flagged contract's volume for next time).
+    traded in that window. Returns (text or None when nothing to send, every flagged contract's volume for next time).
 
     prev: each contract's volume at the previous report (None = first report of the day, so "new" = since the open).
     tapes: trade-by-trade classification per contract for the window (mias/flow.py); without one, a contract is
     signed by where its last trade printed. blocks: large prints since the previous report. oi_lines: the morning
-    check of yesterday's flow against today's open interest."""
+    check of yesterday's flow against today's open interest. structures: contracts legged together (flow.structures),
+    shown as one structure and left out of the bullish/bearish totals.
+
+    Only material activity makes a full report: a contract with >= `material` new premium (not part of a structure),
+    a one-sided block, a structure or the open-interest check. Contracts under `row_min` new premium are counted,
+    not listed. Otherwise one line (quiet="line") or nothing (quiet="skip").
+    confirm: symbol -> price read (mias/confirm.py) to tag each line with the stock's side of VWAP and relative
+    volume; market: the market symbols whose reads give the market line. info, if given, is filled with counts."""
+    from .confirm import market_lean, market_line, verdict
     rows = [(r.symbol, p) for r in results if r.options for p in r.options.unusual[:per_symbol]]
     volumes = {p.ticker: p.volume for _, p in rows}
+    struct_of = {tk: c for c in structures or [] for tk in c["tickers"]}
     active = [(s, p) for s, p in rows if _new_volume(p, prev) > 0]
     active.sort(key=lambda sp: -_new_premium(sp[1], prev, tapes))
-    quiet = len(rows) - len(active)
-    shown = active[:top]
+    listed = [sp for sp in active if _new_premium(sp[1], prev, tapes) >= row_min]
+    minor = len(active) - len(listed)
+    quiet_n = len(rows) - len(active)
+    shown = listed[:top]
     extra = block_lines(blocks, tapes) if blocks else []
-    if not shown and not extra and not oi_lines:
-        return None, volumes
+    big = [sp for sp in shown if _new_premium(sp[1], prev, tapes) >= material and sp[1].ticker not in struct_of]
+    is_material = bool(big or extra or oi_lines or structures)
+    if info is not None:
+        info.update(active=len(active), listed=len(shown), minor=minor, quiet=quiet_n, material=is_material,
+                    big=len(big), structures=len(structures or []), blocks=len(extra) > 0)
     window = f"since {since:%H:%M}" if since else "since the open"
+    if not is_material:
+        if quiet == "skip" or not active:
+            return None, volumes
+        sym, p = active[0]
+        return (escape(f"🔥 {now:%H:%M} ET · no material new flow {window}. Largest: {sym} "
+                       f"{p.expiry[5:].replace('-', '/')} {p.strike:g}{p.kind[0].upper()} new "
+                       f"{money(_new_premium(p, prev, tapes)).lstrip('+')} (+{_new_volume(p, prev):,.0f}). "
+                       f"{len(active)} contracts traded, none ≥ {money(material).lstrip('+')}.")), volumes
+    reads = confirm or {}
+    mkt = market_lean(reads, market or []) if confirm else 0
     lines = [f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET"]
     if oi_lines:
         lines += [*oi_lines, ""]
     if shown:
         lines.append(f"<i>volume &gt; open interest today: possibly new positions (tomorrow's open interest "
                      f"confirms) · ranked by premium {window}</i>")
-    new = grew = 0
-    bull = bear = mixed = multi = 0.0
+        ml = market_line(reads, market or []) if confirm else None
+        if ml:
+            lines.append(escape(ml))
+    new = grew = agree = against = 0
+    bull = bear = mixed = multi = struct = 0.0
     by_tape = False
     for sym, p in shown:
         t = (tapes or {}).get(p.ticker)
         prem = _new_premium(p, prev, tapes)
-        if t is not None and t.total > 0:
+        if p.ticker in struct_of:
+            side = "neutral"
+            struct += prem
+            how = "🧩 part of a structure"
+            by_tape = by_tape or t is not None
+        elif t is not None and t.total > 0:
             by_tape = True
             side = {"bull": "bull", "bear": "bear"}.get(t.lean, "neutral")
             bull += t.bull
@@ -366,19 +401,34 @@ def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, f
                 tag, new = "🆕 ", new + 1
             else:
                 tag, grew = "⬆️ ", grew + 1
+        ok, check = verdict(side, reads.get(sym), mkt) if confirm else (None, "")
+        agree += ok is True
+        against += ok is False
         icon = {"bull": "🟢", "bear": "🔴", "neutral": "⚪"}[side]
         lines.append(escape(f"{tag}{icon} {sym} {p.expiry[5:].replace('-', '/')} {p.strike:g}{p.kind[0].upper()} · "
                             f"new {money(prem).lstrip('+')} (+{_new_volume(p, prev):,.0f}) · {how} · "
-                            f"day {money(p.premium).lstrip('+')}, vol {p.volume:,.0f} vs OI {p.oi:,.0f}"))
+                            f"day {money(p.premium).lstrip('+')}, vol {p.volume:,.0f} vs OI {p.oi:,.0f}"
+                            + (f" · {check}" if check else "")))
     if shown:
         how = "trade by trade" if by_tape else "by last trade"
         summary = (f"New flow ({how}): bullish {money(bull).lstrip('+')} · bearish {money(bear).lstrip('+')} · "
-                   f"no side {money(mixed).lstrip('+')}" + (f" · multi-leg {money(multi).lstrip('+')}" if multi else ""))
+                   f"no side {money(mixed).lstrip('+')}" + (f" · multi-leg {money(multi).lstrip('+')}" if multi else "")
+                   + (f" · structures {money(struct).lstrip('+')}" if struct else ""))
         if prev is not None:
             summary += f" · {new} new, {grew} growing"
-        if quiet:
-            summary += f" · {quiet} quiet"
+        if minor:
+            summary += f" · {minor} minor"
+        if quiet_n:
+            summary += f" · {quiet_n} quiet"
+        if agree or against:
+            summary += f" · price confirms {agree}, disagrees {against}"
         lines += ["", escape(summary)]
+    if structures:
+        lines += ["", "<b>Structures</b> (legs traded together: no direction counted)"]
+        for c in structures[:4]:
+            legs = "/".join(f"{k:g}{kind[0].upper()}" for kind, k in c["legs"])
+            lines.append(escape(f"🧩 {c['symbol']} {c['expiry'][5:].replace('-', '/')} {legs} · "
+                                f"{money(c['premium']).lstrip('+')} · {c['matched']:,.0f} contracts matched"))
     if extra:
         lines += ["", *extra]
     return "\n".join(lines), volumes

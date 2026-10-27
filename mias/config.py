@@ -128,6 +128,9 @@ class Config:
     report_until: dict[str, date]
     unusual_every_minutes: int
     unusual_top: int
+    unusual_material: float              # new premium in one contract that makes a report worth sending
+    unusual_row_min: float               # smaller new premium per contract is counted, not listed
+    unusual_quiet: str                   # "line": one line when nothing is material; "skip": send nothing
     picks_enabled: bool
     picks_time: str
     confirm_cycles: int
@@ -192,6 +195,12 @@ def _daytrade(raw: dict):
             v = type(getattr(DayTradeRules, k))(v)
         kw[k] = v
     return DayTradeRules(**kw)
+
+
+def _choice(value, allowed: tuple, name: str) -> str:
+    if value not in allowed:
+        raise ConfigError(f"{name} must be one of {', '.join(allowed)}")
+    return value
 
 
 def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> Config:
@@ -311,6 +320,9 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         report_until=report_until,
         unusual_every_minutes=int(rep.get("unusual_every_minutes", 0)),
         unusual_top=int(rep.get("unusual_top", 10)),
+        unusual_material=float(rep.get("unusual_material", 0)),
+        unusual_row_min=float(rep.get("unusual_row_min", 0)),
+        unusual_quiet=_choice(rep.get("unusual_quiet", "line"), ("line", "skip"), "reports.unusual_quiet"),
         picks_enabled=bool(raw.get("picks", {}).get("enabled", True)),
         picks_time=raw.get("picks", {}).get("time", "10:00"),
         confirm_cycles=max(1, int(al.get("confirm_cycles", 2))),

@@ -179,7 +179,7 @@ class Service:
         minutes = self.cfg.unusual_every_minutes
         if not minutes or self.engine.last_cycle.get("at") != now.isoformat():
             return
-        from . import flow, scorecard
+        from . import confirm, flow, scorecard
         from .formatting import oi_lines, unusual_report
         local = now.astimezone(self.cfg.tz)
         today = str(local.date())
@@ -224,11 +224,30 @@ class Service:
         if not day:
             day = {"date": today, "contracts": {}}
 
+        meta = {p.ticker: (s, p.expiry, p.kind, p.strike) for s, p in rows}
+        meta.update({b["ticker"]: (b["symbol"], b["expiry"], b["kind"], b["strike"]) for b in blocks or []})
+        structs = flow.structures(tapes, meta)
+        in_struct = {tk for c in structs for tk in c["tickers"]}
+        market = self.cfg.market_symbols
+        reads = confirm.reads(self.engine, self.cfg, {s for s, _ in rows} | set(market), local.date())
+        info: dict = {}
         text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top, blocks=blocks,
-                                       tapes=tapes, since=since if same_day else None, oi_lines=oi_lines(checks))
+                                       tapes=tapes, since=since if same_day else None, oi_lines=oi_lines(checks),
+                                       material=self.cfg.unusual_material, row_min=self.cfg.unusual_row_min,
+                                       quiet=self.cfg.unusual_quiet, structures=structs, confirm=reads,
+                                       market=market, info=info)
+        log.info("unusual %s: %s · %d active, %d listed (%d >= material), %d minor, %d quiet, %d structures, "
+                 "blocks %s, %d tapes", local.strftime("%H:%M"), "SENT" if info.get("material") else
+                 ("quiet line" if text else "skipped"), info.get("active", 0), info.get("listed", 0),
+                 info.get("big", 0), info.get("minor", 0), info.get("quiet", 0), info.get("structures", 0),
+                 "yes" if info.get("blocks") else "no", len(tapes))
+        for c in structs:
+            log.info("unusual structure %s %s %s: %d contracts matched, premium %.0f", c["symbol"], c["expiry"],
+                     "/".join(f"{k:g}{kind[0].upper()}" for kind, k in c["legs"]), c["matched"], c["premium"])
         if text:
             self.store.enqueue("unusual", text)
         price = {r.symbol: r.price for r in self.engine.last_results}
+        mkt = confirm.market_lean(reads, market)
         for sym, p in rows:
             c = day["contracts"].setdefault(p.ticker, {"symbol": sym, "kind": p.kind, "strike": p.strike,
                                                        "expiry": p.expiry, "oi": p.oi, "bull": 0.0, "bear": 0.0,
@@ -236,14 +255,21 @@ class Service:
             c["volume"], c["premium"] = p.volume, p.premium
             t = tapes.get(p.ticker)
             if t is not None:
-                c["bull"] += t.bull
-                c["bear"] += t.bear
+                if p.ticker not in in_struct:
+                    c["bull"] += t.bull
+                    c["bear"] += t.bear
                 c["total"] += t.total
                 c["lean"] = "bull" if c["bull"] >= 0.6 * c["total"] else "bear" if c["bear"] >= 0.6 * c["total"] \
                     else "mixed"
-                if t.lean in ("bull", "bear") and t.total >= FLOW_SCORE_PREMIUM and price.get(sym):
-                    scorecard.record(self.store, now.timestamp(), sym, "flow", t.lean, price[sym], p.ticker,
-                                     t.total / t.contracts / 100 if t.contracts else None)
+                if (t.lean in ("bull", "bear") and t.total >= FLOW_SCORE_PREMIUM and price.get(sym)
+                        and p.ticker not in in_struct):
+                    cost = t.total / t.contracts / 100 if t.contracts else None
+                    scorecard.record(self.store, now.timestamp(), sym, "flow", t.lean, price[sym], p.ticker, cost)
+                    ok, _ = confirm.verdict(t.lean, reads.get(sym), mkt)
+                    if ok is not None:
+                        scorecard.record(self.store, now.timestamp(), sym,
+                                         "flow_confirmed" if ok else "flow_unconfirmed", t.lean, price[sym],
+                                         p.ticker, cost)
         self.store.put("unusual_day", day)
         self.store.put("unusual_report", {"tag": tag, "date": today, "volumes": volumes, "ts": now.timestamp()})
         self.store.put("blocks", {"date": today, "items": []})
