@@ -59,7 +59,25 @@ class Instrument:
     note: str = ""
 
 
-ALERT_MODES = ("strong_alignment", "all")
+@dataclass(frozen=True)
+class PositionRules:
+    take_profit: float = 0.55        # spreads: share of max profit
+    single_take_profit: float = 0.50 # single legs: gain on the premium paid
+    stop_loss: float = 0.50          # loss on the premium paid
+    near_strike_pct: float = 1.5     # underlying within this % of the short strike
+    time_stop_days: int = 10         # trading days after entry, unless the position has its own exit date
+    hard_exit_days: int = 7          # calendar days before expiry
+
+
+@dataclass(frozen=True)
+class Sector:
+    key: str                       # config key and /sector argument, e.g. "energy"
+    name: str                      # display name, e.g. "Energy"
+    etf: str | None                # sector gauge, e.g. "XLE"
+    symbols: list[str]
+
+
+ALERT_MODES = ("tiered", "strong_alignment", "all")
 
 
 @dataclass(frozen=True)
@@ -92,7 +110,20 @@ class Config:
     options_bias: float
     alert_mode: str
     alignment_end_alert: bool
+    change_enter: float
+    change_exit: float
+    strong_exit: float
+    options_enter: float
+    options_exit: float
+    changes_every_minutes: int
+    tier1_merge_minutes: int
+    pullback_dip: float
+    pullback_recover: float
+    pullback_cooldown_minutes: int
+    report_block_premium: float
+    positions: "PositionRules"
     instruments: dict[str, Instrument]
+    sectors: list[Sector]
     reports: dict[str, int]
     report_until: dict[str, date]
     unusual_every_minutes: int
@@ -105,6 +136,9 @@ class Config:
     iv_spike_points: float
     iv_spike_window_minutes: int
     block_cooldown_minutes: int
+    iv_spike_series: str                 # "month" (~30-day ATM IV) or "front" (nearest expiry, noisy)
+    options_confirm_cycles: int          # tiered mode: cycles an options flip must hold
+    daytrade: "DayTradeRules"            # [daytrade]: the 5-minute EMA cross-and-retest paper trades
     telegram_enabled: bool
     telegram_commands: bool
     web_enabled: bool
@@ -142,6 +176,22 @@ def _ids(name: str) -> list[str]:
     return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
 
 
+def _daytrade(raw: dict):
+    from .emacross import DayTradeRules
+    kw = {}
+    for k, v in raw.items():
+        if not hasattr(DayTradeRules, k):
+            raise ConfigError(f"daytrade.{k} is not a setting")
+        if k == "symbols":
+            v = tuple(x.upper() for x in v)
+        elif k == "trail":
+            v = tuple((float(a), float(b)) for a, b in v)
+        else:
+            v = type(getattr(DayTradeRules, k))(v)
+        kw[k] = v
+    return DayTradeRules(**kw)
+
+
 def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> Config:
     path = Path(path)
     if not path.is_file():
@@ -163,6 +213,15 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         raise ConfigError("watchlist.symbols is empty")
     if len(set(symbols)) != len(symbols):
         raise ConfigError("watchlist.symbols contains duplicates")
+    sectors = []
+    for key, sct in raw.get("sectors", {}).items():
+        members = [x.upper() for x in sct.get("symbols", [])]
+        if not members:
+            raise ConfigError(f"sectors.{key}.symbols is empty")
+        etf = sct.get("etf", "").upper() or None
+        sectors.append(Sector(key.lower(), sct.get("name", key), etf, members))
+        if not os.environ.get("MIAS_SYMBOLS"):
+            symbols += [x for x in [*members, *([etf] if etf else [])] if x not in symbols]
 
     profiles = {name: {k: float(v) for k, v in w.items()}
                 for name, w in tr.get("profiles", DEFAULT_PROFILES).items()}
@@ -174,7 +233,7 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
     if primary not in profiles:
         raise ConfigError(f"trend.profile {primary!r} is not one of {sorted(profiles)}")
 
-    mode = al.get("mode", "strong_alignment")
+    mode = al.get("mode", "tiered")
     if mode not in ALERT_MODES:
         raise ConfigError(f"alerts.mode must be one of {ALERT_MODES}, got {mode!r}")
     instruments = {}
@@ -231,7 +290,21 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         options_bias=float(opt.get("bias_threshold", 25)),
         alert_mode=mode,
         alignment_end_alert=bool(al.get("alignment_end_alert", True)),
+        change_enter=float(al.get("change_enter", 30)),
+        change_exit=float(al.get("change_exit", 15)),
+        strong_exit=float(al.get("strong_exit", 50)),
+        options_enter=float(al.get("options_enter", 40)),
+        options_exit=float(al.get("options_exit", 20)),
+        changes_every_minutes=max(5, int(al.get("changes_every_minutes", 15))),
+        tier1_merge_minutes=int(al.get("tier1_merge_minutes", 30)),
+        pullback_dip=float(al.get("pullback_dip", 15)),
+        pullback_recover=float(al.get("pullback_recover", 25)),
+        pullback_cooldown_minutes=int(al.get("pullback_cooldown_minutes", 120)),
+        report_block_premium=float(al.get("report_block_premium", 5_000_000)),
+        positions=PositionRules(**{k: type(getattr(PositionRules, k))(v)
+                                   for k, v in raw.get("positions", {}).items()}),
         instruments=instruments,
+        sectors=sectors,
         reports=reports,
         report_until=report_until,
         unusual_every_minutes=int(rep.get("unusual_every_minutes", 0)),
@@ -244,6 +317,9 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         iv_spike_points=float(al.get("iv_spike_points", 3.0)),
         iv_spike_window_minutes=int(al.get("iv_spike_window_minutes", 30)),
         block_cooldown_minutes=int(al.get("block_cooldown_minutes", 60)),
+        iv_spike_series=al.get("iv_spike_series", "month"),
+        options_confirm_cycles=max(1, int(al.get("options_confirm_cycles", al.get("confirm_cycles", 2)))),
+        daytrade=_daytrade(raw.get("daytrade", {})),
         telegram_enabled=bool(tg.get("enabled", True)),
         telegram_commands=bool(tg.get("commands", True)),
         web_enabled=bool(web.get("enabled", True)),

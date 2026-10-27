@@ -7,7 +7,7 @@ import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 
-from . import formatting, signals
+from . import emacross, formatting, positions, sectors, signals
 from .config import Config
 from .massive import MassiveClient
 from .models import SymbolResult
@@ -33,6 +33,8 @@ class Engine:
         self.last_results: list[SymbolResult] = []
         self.last_market: tuple[str, float, float | None] | None = None
         self.last_cycle: dict = {}
+        self.swing_changes: dict[str, tuple[str, str, float]] = {}
+        self.five: dict[str, list] = {}       # day-trade symbols: regular-session 5-minute bars (emacross)
 
     # ---- public -----------------------------------------------------------------------------
 
@@ -55,6 +57,15 @@ class Engine:
             ts = now.timestamp()
             self.store.add_metrics(ts, today.isoformat(), {r.symbol: r.to_dict() for r in results if r.ok})
             self._evaluate(results, now)
+            try:
+                await positions.check_all(self.client, self.store, self.cfg, now, self.swing_changes)
+            except Exception:
+                log.exception("position check failed")
+            if self.cfg.daytrade.enabled:
+                try:
+                    await emacross.live(self.client, self.store, self.cfg, now, self.five)
+                except Exception:
+                    log.exception("EMA day-trade check failed")
             if self.dispatcher:
                 await self.dispatcher.flush()
 
@@ -198,6 +209,9 @@ class Engine:
         five = hist[1] + today5
         days = list(daily[1])
         today_bar = _session_bar(today5, cfg.tz, available_until)
+        if sym in cfg.daytrade.symbols:
+            from .trend import complete_bars, regular_session, to_bars
+            self.five[sym] = complete_bars(regular_session(to_bars(five), cfg.tz), 5, available_until)
         if today_bar:
             days.append(today_bar)
         return stock_trend(five, days, tz=cfg.tz, available_until_ms=available_until,
@@ -258,21 +272,52 @@ class Engine:
 
     # ---- alerts -----------------------------------------------------------------------------
 
+    def _collect_blocks(self, r: SymbolResult, ts: float) -> None:
+        """Tiered mode: large one-sided blocks wait for the unusual-activity report instead of alerting."""
+        if not r.options:
+            return
+        big = [p for p in r.options.blocks if p.premium >= self.cfg.report_block_premium]
+        if not big:
+            return
+        day = datetime.fromtimestamp(ts, self.cfg.tz).date().isoformat()
+        pending = self.store.get("blocks") or {}
+        if pending.get("date") != day:
+            pending = {"date": day, "items": []}
+        pending["items"] += [{"symbol": r.symbol, "ticker": p.ticker, "expiry": p.expiry, "strike": p.strike,
+                              "kind": p.kind, "side": p.side, "volume": p.volume, "price": p.price,
+                              "premium": p.premium, "ts": ts} for p in big]
+        self.store.put("blocks", pending)
+
     def _evaluate(self, results: list[SymbolResult], now: datetime) -> None:
         cfg, ts = self.cfg, now.timestamp()
         local = now.astimezone(cfg.tz)
+        mc = signals.market_composite(results, cfg.market_symbols)
+        events: list[dict] = []
+        self.swing_changes = {}
         for r in results:
             if not r.ok:
                 continue
             key = f"state:{r.symbol}"
-            state = self.store.get(key, {})
+            state = _for_mode(self.store.get(key, {}), cfg.alert_mode)
             iv_hist = []
             for hts, d in self.store.history(r.symbol, ts - cfg.iv_spike_window_minutes * 60):
-                iv = (d.get("options") or {}).get("atm_iv_front")
+                iv = signals.spike_iv(d.get("options") or {}, cfg.iv_spike_series)
                 if iv is not None and hts < ts:
                     iv_hist.append((hts, iv))
             try:
-                if cfg.alert_mode == "strong_alignment":
+                if cfg.alert_mode == "tiered":
+                    old_swing = (state.get("swing") or {}).get("cls")
+                    reasons, later = signals.evaluate_tiered(r, state, cfg, ts, iv_hist)
+                    if reasons and not signals._cooled(state, f"tier1_{reasons[0].direction}", ts,
+                                                       cfg.tier1_merge_minutes):
+                        later, reasons = reasons + later, []     # just alerted this symbol: batch it instead
+                    events += [{"symbol": r.symbol, "rule": x.rule, "dir": x.direction, "text": x.text}
+                               for x in later]
+                    for x in later:
+                        if x.rule == "trend_change":
+                            self.swing_changes[r.symbol] = (old_swing, state["swing"]["cls"], r.stock.score)
+                    self._collect_blocks(r, ts)
+                elif cfg.alert_mode == "strong_alignment":
                     reasons = signals.evaluate_strong(r, state, cfg, ts)
                 else:
                     reasons = signals.evaluate(r, state, cfg, ts, iv_hist)
@@ -281,14 +326,31 @@ class Engine:
                 continue
             self.store.put(key, state)
             if reasons:
-                text = formatting.symbol_alert(r, [(x.direction, x.text) for x in reasons], local, cfg)
+                ctx = context_lines(r, reasons[0].direction, mc, results, cfg) if cfg.alert_mode == "tiered" else []
+                text = formatting.symbol_alert(r, [(x.direction, x.text) for x in reasons], local, cfg, ctx)
                 self.store.enqueue(",".join(sorted({x.rule for x in reasons})), text, r.symbol)
 
-        mc = signals.market_composite(results, cfg.market_symbols)
+        if mc and cfg.alert_mode == "tiered":
+            mstate = _for_mode(self.store.get("state:__market__", {}), cfg.alert_mode)
+            new = signals.hysteresis((mstate.get("trend") or {}).get("cls"), mc[0], (cfg.trend_strong, cfg.change_enter),
+                                     (cfg.strong_exit, cfg.change_exit))
+            change = signals._confirm(mstate.setdefault("trend", {}), new, cfg.confirm_cycles)
+            if change:
+                names = "/".join(s for s in cfg.market_symbols if s in cfg.symbols)
+                events.append({"symbol": "MARKET", "rule": "market", "dir": direction(change[1]),
+                               "text": f"{names} {signals.WORD[change[0]]} → {signals.WORD[change[1]]} ({mc[0]:+.0f})"})
+            self.store.put("state:__market__", mstate)
+        if events:
+            pending = self.store.get("changes") or {}
+            if pending.get("date") != local.date().isoformat():
+                pending = {"date": local.date().isoformat(), "events": []}
+            pending["events"] += events
+            self.store.put("changes", pending)
+
         if mc and cfg.alert_mode == "all":
             stock, opts = mc
             new = label_for(stock, cfg.trend_strong, cfg.trend_bias)
-            mstate = self.store.get("state:__market__", {})
+            mstate = _for_mode(self.store.get("state:__market__", {}), cfg.alert_mode)
             change = signals._confirm(mstate.setdefault("trend", {}), direction(new), cfg.confirm_cycles)
             if change and signals._cooled(mstate, "market", ts, cfg.cooldown_minutes):
                 old_label = {"bull": "up", "bear": "down", "neutral": "neutral"}[change[0]]
@@ -298,7 +360,39 @@ class Engine:
 
     def digest_text(self, title: str, now: datetime) -> str:
         return formatting.digest(self.last_results, self.last_market, title, now.astimezone(self.cfg.tz),
-                                 self.cfg.stock_delay_minutes)
+                                 self.cfg.stock_delay_minutes,
+                                 sectors.board_lines(self.last_results, self.cfg.sectors, self.cfg))
+
+
+def context_lines(r: SymbolResult, side: str, mc, results: list[SymbolResult], cfg) -> list[str]:
+    """Where a tier-1 signal stands against the market and its sector; a warning when either disagrees."""
+    if side not in ("bull", "bear"):
+        return []
+    sign = 1 if side == "bull" else -1
+    lines, against = [], []
+    if mc:
+        names = "/".join(s for s in cfg.market_symbols if s in cfg.symbols) or "market"
+        lbl = label_for(mc[0], cfg.trend_strong, cfg.trend_bias)
+        if sign * mc[0] <= -cfg.trend_bias:
+            against.append(f"market {names} {signals.WORD[lbl]} ({mc[0]:+.0f})")
+    reads = [x for x in sectors.read(results, cfg.sectors) if x.swing is not None]
+    for rank, sr in enumerate(reads, 1):
+        if r.symbol in sr.sector.symbols or r.symbol == sr.sector.etf:
+            lbl = label_for(sr.swing, cfg.trend_strong, cfg.trend_bias)
+            lines.append(f"{sr.sector.name} sector #{rank} of {len(reads)}: {signals.WORD[lbl]} ({sr.swing:+.0f})")
+            if sign * sr.swing <= -cfg.trend_bias:
+                against.append(f"{sr.sector.name} {signals.WORD[lbl]} ({sr.swing:+.0f})")
+    if against:
+        lines.insert(0, "⚠️ against " + " · ".join(against))
+    return lines
+
+
+def _for_mode(state: dict, mode: str) -> dict:
+    """Alert state is only valid for the mode that built it. After a mode switch, start fresh (keeping cooldowns),
+    so trends confirmed days ago under the other mode don't fire a burst of stale 'changed' alerts."""
+    if state.get("mode") == mode:
+        return state
+    return {"mode": mode, "last": state.get("last", {})}
 
 
 def _num(x) -> float | None:

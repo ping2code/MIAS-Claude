@@ -5,6 +5,8 @@
   python -m mias rank [--top 20]     rank candidate symbols by options activity
   python -m mias screen [--top 30]   best underlyings for options trading (liquidity, spreads, movement, IV)
   python -m mias telegram-test       send a test message
+  python -m mias ema-backtest [--symbols SPY] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
+                                     backtest the 5-minute EMA 9/21 cross-and-retest day trade on real option bars
 """
 from __future__ import annotations
 
@@ -43,6 +45,11 @@ def main(argv: list[str] | None = None) -> int:
     scr.add_argument("--top", type=int, default=30)
     scr.add_argument("--add", help="extra comma-separated symbols to include")
     sub.add_parser("telegram-test")
+    bt = sub.add_parser("ema-backtest")
+    bt.add_argument("--symbols", help="comma-separated (default: [daytrade] symbols)")
+    bt.add_argument("--start", help="first day (default: six months back)")
+    bt.add_argument("--end", help="last day (default: yesterday)")
+    bt.add_argument("--out", default="data/ema_backtest", help="report, CSV and cache directory")
     args = p.parse_args(argv)
 
     logging.basicConfig(level=args.log_level.upper(), stream=sys.stdout,
@@ -68,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_screen(cfg, args.top, args.add))
     elif args.cmd == "telegram-test":
         return asyncio.run(_telegram_test(cfg))
+    elif args.cmd == "ema-backtest":
+        return asyncio.run(_ema_backtest(cfg, args))
     return 0
 
 
@@ -140,6 +149,20 @@ async def _screen(cfg, top: int, add: str | None) -> int:
                              max_concurrency=10) as client:
         rows = await screen.collect(client, screen.universe(extra), cfg.tz, now.date())
     print(screen.report(screen.score(rows), top, now))
+    return 0
+
+
+async def _ema_backtest(cfg, args) -> int:
+    from datetime import date
+    from pathlib import Path
+
+    from .emacross import run_backtest
+    today = datetime.now(cfg.tz).date()
+    end = date.fromisoformat(args.end) if args.end else today - timedelta(days=1)
+    start = date.fromisoformat(args.start) if args.start else end - timedelta(days=182)
+    syms = [s.strip().upper() for s in args.symbols.split(",")] if args.symbols else list(cfg.daytrade.symbols)
+    print(await run_backtest(cfg, syms, start, end, Path(args.out)))
+    print(f"\nReports and trade CSVs in {args.out}/")
     return 0
 
 

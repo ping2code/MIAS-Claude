@@ -15,7 +15,11 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | Send | You get |
 |---|---|
 | `NVDA` or `/trend NVDA` (up to 5: `nvda mu amd`) | A fresh read of the symbol, watched or not: swing and intraday trend, options bias, a confidence verdict, IV vs realized volatility, key strikes, and a swing contract to look at |
-| `/market` | SPY, QQQ, IWM and watchlist breadth |
+| `/market` | SPY, QQQ, IWM, watchlist breadth and the sector board |
+| `/sector`, `/sector energy` | The sector board, or one sector's members with price, swing, intraday, options and IV |
+| `/buy AMZN 11/20 260/280C 6.63 x1` | Track a position (private chat only; first strike = the one you bought; add `by 10/30` for your own exit date). Single options too: `/buy NVDA 12/18 190C 9.85` |
+| `/positions`, `/sell AMZN 13.40` | Your positions with live value and P&L; close one (by symbol or `#`, no price = current mid) |
+| `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META): where the EMAs are, the last cross and what became of it, today's paper trades |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
 
 Example reply (real data, 2026-10-07 close):
@@ -57,10 +61,42 @@ the confidence verdict, and their options flip alerts are suppressed.
 
 ## What you receive
 
+Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
+
+| Tier | Message | Where, when |
+|---|---|---|
+| 1 Act now | **Pullback over / bounce over**: swing UP or STRONG UP, intraday dipped to −15 or lower and recovered to +35 (2 checks), options not against it; mirror for downtrends. With swing and day-trade contracts | Group, instantly (max one per symbol per direction per 2 h) |
+| 1 Act now | **Strong alignment**, as below | Group, instantly |
+| 1 Act now | Both carry the symbol's sector rank, and **⚠️ against market/sector** when SPY/QQQ/IWM or the sector trend the other way | |
+| 1 Day trade (paper) | **EMA 9/21 cross + retest** entries (SPY, QQQ, NVDA, TSLA, META) and their management (first target, trail, stop, invalidated, end of day), then a summary at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
+| 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |
+| 2 Changes | One message every 15 min (09:45, 10:00, …) if anything changed: swing trend changes, options bias flips, call/put wall breaks, IV spikes, alignment ended, market trend, plus the sector ranking with ▲▼. Only the latest change per symbol shows | Group |
+| 3 Context | Unusual activity every 5 min, now with **blocks ≥ $5M** since the last report: one-sided ones listed, matched pairs (spreads, rolls, combos) and mid-price prints skipped. Digests, picks, closing summary as below | Group |
+
+**Hysteresis** keeps tier 2 quiet when a score wobbles: a trend counts as UP after passing +30 and stays UP until it
+falls back under +15 (STRONG: in at 60, out under 50), confirmed over 2 checks. Options: in at ±50, out inside
+±25, confirmed over 3 checks. IV spikes watch the ~30-day ATM IV (+4 points in 30 min). A symbol already alerted in
+tier 1 in the last 30 minutes has further tier-1 signals moved to the next batch.
+
+**Tuning (2026-10-26)**: replaying every recorded check from Oct 8 to 23 through the tiered rules:
+
+| Per day (average) | Before | Now |
+|---|---|---|
+| Tier 1 messages | 10.2 | 10.2 |
+| Options flips | 88 | 26 |
+| IV spikes (front-expiry IV jumped 3+ points ~300 times a day, mostly 0–2 DTE noise) | 52 | 5 |
+| Tier 2 lines after de-duplication (~3 per batch) | 159 | 53 |
+
+Forward moves after replayed tier-1 alerts (12 days, small sample): pullback entries went the right way 64% of
+the time to the close and 61% after 3 days (median +0.5%) with the +35 recovery; strong alignment 63% to the
+close but only 45% after 3 days, so treat it as an intraday signal, not a swing entry.
+
+All modes:
+
 | Message | When |
 |---|---|
-| **Strong alignment** (default alert mode) | Swing **STRONG UP** + intraday **STRONG UP** + options **BULLISH**, or the bearish mirror. It must hold for 2 checks (5 min), with a 30-minute cooldown per symbol. The alert includes swing and day-trade contract picks. |
-| Alignment ended | When that state breaks (confirmed over 2 checks). Turn off with `alignment_end_alert = false`. |
+| **Strong alignment** (`[alerts] mode = "strong_alignment"` only) | Swing **STRONG UP** + intraday **STRONG UP** + options **BULLISH**, or the bearish mirror. It must hold for 2 checks (5 min), with a 30-minute cooldown per symbol. The alert includes swing and day-trade contract picks. |
+| Alignment ended | (strong_alignment mode) When that state breaks (confirmed over 2 checks). Turn off with `alignment_end_alert = false`. |
 | **NDX report** | A full NDX reading every 10 minutes from 09:30 to 16:00, with the change since the previous report (`[reports]`) |
 | **Daily spread picks** | 10:00 ET (and `/picks` anytime): up to one bull call spread and one bear put spread. Rules: swing UP/STRONG UP (or DOWN), confidence MEDIUM+, options not against, 30–60 days, ~0.50/0.25 delta legs with OI ≥ 1,000. Includes a limit price, breakeven, take-profit (55% of max), a 10-trading-day time stop and a hard exit 7 days before expiry. "No trade today" when nothing qualifies. |
 | **Unusual activity** | Every 10 minutes (`[reports] unusual_every_minutes`): the top 10 contracts across the watchlist where today's volume exceeds open interest (≥ $500K premium, no same-day expiries, max 3 per symbol), with 🆕 new / ⬆️ growing markers, volume added since the previous report, and a bullish/bearish lean by last-trade side |
@@ -68,9 +104,10 @@ the confidence verdict, and their options flip alerts are suppressed.
 | Closing summary | At the close (handles early closes) |
 | System | Started; degraded after 3 bad cycles in a row; recovered |
 
-Set `[alerts] mode = "all"` to restore every rule: trend and options-bias flips, aligned/divergence, ≥ $1M blocks,
-IV spikes, call/put wall breaks and the SPY/QQQ/IWM market trend. Checkpoint `checkpoint-2026-10-12` is the last
-version where that was the default.
+**Other alert modes** (`[alerts] mode`): `"all"` (used 2026-10-24) sends every rule: trend and options-bias flips,
+aligned/divergence, ≥ $1M blocks, IV spikes, call/put wall breaks and the SPY/QQQ/IWM market trend.
+`"strong_alignment"` (used 2026-10-12 to 10-24) sends only the strong-alignment and alignment-ended alerts above.
+Switching modes resets the alert state quietly, so a switch never sends a burst of stale alerts.
 
 Example:
 ```
@@ -83,6 +120,63 @@ Intraday: STRONG UP (+66)  ...
 Options: BULLISH (+31)  net prem +$4.2M · P/C 0.44 · IV 45.7%
 ✅ Confidence HIGH: every timeframe UP and options bullish
 Swing call: ... · Day trade call: ...
+```
+
+## EMA 9/21 day trade (paper)
+
+The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NVDA, TSLA and META (`[daytrade]`, `mias/emacross.py`):
+
+1. EMA 9 crosses EMA 21 on a completed 5-minute candle.
+2. Within 6 candles price pulls back into the EMAs (bull: low touches EMA 9) and holds (closes stay above EMA 21).
+   A close through EMA 21 or an opposite cross cancels it; no pullback means no trade (no chase).
+3. A green candle closing above EMA 9 and the prior close is the entry. Invalidation: the retest's lowest low.
+
+Management: ATM 0DTE (1DTE from 13:00), 5 contracts, stop −20% or a 5-minute close through the invalidation, sell 3
+at +30% and move the runners to breakeven, at +75% protect +50%, at +100% protect +75%, close all by 15:10 ET, no new
+entries after 2 losses in a row. Puts mirror it. Times are ET.
+
+The service paper-trades it on live option quotes and alerts the group at each step.
+
+**Backtest** (`python -m mias ema-backtest`, real SPY 5-minute bars and the real option minute bars, Apr 27 to
+Oct 23 2026, no commissions or slippage):
+
+| | Trades | Win | P&L (5 contracts) | Profit factor |
+|---|---|---|---|---|
+| SPY, handout rules | 116 | 30% | −$4,486 | 0.63 |
+| SPY, control: enter on the cross | 207 | 38% | −$2,315 | 0.86 |
+| QQQ, handout rules | 113 | 35% | −$1,684 | 0.88 |
+| NVDA, handout rules (weekly expiry) | 104 | 32% | −$2,574 | 0.74 |
+| TSLA, handout rules | 111 | 30% | −$9,653 | 0.58 |
+| META, handout rules | 111 | 34% | −$9,801 | 0.67 |
+
+No variant tried (stop 35% or 50%, target +50%, 0DTE all day, mornings only, a 3-candle retest) made money on SPY.
+VWAP and opening-range alignment made it worse, not better. Only 29% of crosses moved $2 their way before the next
+opposite cross (median $0.96). Read the live alerts as a test, not as signals. The report, the trade list and a CSV
+are written to `data/ema_backtest/`.
+
+## Sectors
+
+Four sectors that tend to rotate are configured under `[sectors]` in `config.toml`, each with an ETF as its gauge.
+Members and ETFs join the watchlist automatically.
+
+| Sector | Members | Gauge |
+|---|---|---|
+| Tech & Semis | NVDA, MU, AMD, AVGO, META, MSFT, AMZN, GOOGL, AAPL, PLTR | SMH |
+| Financials | GS, JPM, V, HOOD, COIN | XLF |
+| Energy | XOM, CVX, OXY, USO | XLE |
+| Defensive | LLY, UNH, COST, WMT, PG | XLV |
+
+The **sector board** ranks them by the members' average swing score, with intraday score, how many members are up
+and down, the ETF's score and the leading member (the strongest in an up sector, the weakest in a down one), and
+ends with a "Focus" line naming the strongest sector. It heads every digest (09:50, 11:30, 13:30, 15:30 ET) and the
+closing summary, and is in `/market` and `/sector`.
+
+```
+🟢 Energy STRONG UP (+90) · intraday +66 · 4↑ 0↓ · XLE +82 · lead CVX +98
+🟢 Defensive UP (+56) · intraday +1 · 5↑ 0↓ · XLV +68 · lead LLY +62
+⚪ Tech & Semis NEUTRAL (-10) · intraday -45 · 3↑ 6↓ · SMH -58 · lead AVGO -72
+⚪ Financials NEUTRAL (-15) · intraday -54 · 1↑ 3↓ · XLF +42 · lead GS -68
+Focus: Energy · weakest: Financials
 ```
 
 ## NDX (and other index-style symbols)
@@ -138,6 +232,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m mias once --send           # ... and sends it to Telegram
 .venv/bin/python -m mias rank --top 20         # rank ~70 candidates by options premium traded
 .venv/bin/python -m mias telegram-test
+.venv/bin/python -m mias ema-backtest --symbols SPY,QQQ --start 2026-04-27 --end 2026-10-23
 .venv/bin/python -m mias run                   # the service
 .venv/bin/python -m pytest -q
 ```
@@ -206,4 +301,5 @@ mias/signals.py     alert rules, confirmation, cooldowns       mias/formatting.p
 mias/engine.py      one cycle across all symbols               mias/app.py         scheduler, health
 mias/store.py       SQLite (state, history, alert outbox)      mias/web.py         dashboard
 mias/bot.py         Telegram commands (/trend, /market)        mias/verdict.py     confidence verdict
+mias/emacross.py    EMA 9/21 day trade: detection, backtest, live paper trades
 ```

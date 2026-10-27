@@ -6,7 +6,9 @@ allow-listed chat such as the private group (TELEGRAM_ALLOWED_CHATS). Everyone e
 In groups the bot reacts to /commands only, so normal conversation never triggers it.
 
   /trend NVDA [MU ...]   fresh trend + options read + confidence (also: /t NVDA, or just send "NVDA")
-  /market                SPY / QQQ / IWM and watchlist breadth
+  /market                SPY / QQQ / IWM, watchlist breadth and the sector board
+  /sector [energy]       sector board, or one sector's members
+  /buy, /sell, /positions   track your own option positions (private chat only); alerts come privately
   /list                  watchlist
   /status                service health
   /help
@@ -22,7 +24,7 @@ from html import escape
 
 import httpx
 
-from . import formatting
+from . import formatting, positions, sectors
 from .trend import direction
 from .verdict import verdict
 
@@ -31,14 +33,24 @@ log = logging.getLogger(__name__)
 # The chat currently being answered; set per incoming message so concurrent replies never cross chats.
 _reply_chat: contextvars.ContextVar[str | None] = contextvars.ContextVar("reply_chat", default=None)
 GROUP_TYPES = ("group", "supergroup")
-KNOWN = {"trend", "t", "market", "picks", "list", "status", "help", "start", "whoami"}
+KNOWN = {"trend", "t", "market", "sector", "sectors", "picks", "list", "status", "help", "start", "whoami",
+         "buy", "sell", "positions", "pos", "ema"}
+PRIVATE_ONLY = {"buy", "sell", "positions", "pos"}
+# The user and chat type of the message being answered (position commands are per user, private chats only).
+_user: contextvars.ContextVar[str] = contextvars.ContextVar("user", default="")
+_private: contextvars.ContextVar[bool] = contextvars.ContextVar("private", default=True)
 
 TICKER = re.compile(r"^\$?([A-Z]{1,5}(?:\.[A-Z])?)$")
 MAX_SYMBOLS = 5
 COMMANDS = [
     ("trend", "Trend, options and confidence for symbols, e.g. /trend NVDA MU"),
     ("market", "Overall market: SPY, QQQ, IWM and breadth"),
+    ("sector", "Sector board, or one sector: /sector energy"),
     ("picks", "Today's call and put spread picks"),
+    ("ema", "EMA 9/21 day-trade watch and today's paper trades"),
+    ("positions", "Your open positions (private chat)"),
+    ("buy", "Track a position: /buy AMZN 11/20 260/280C 6.63 x1"),
+    ("sell", "Close a tracked position: /sell AMZN 13.40"),
     ("list", "Watched symbols"),
     ("status", "Service health"),
     ("help", "How to use this bot"),
@@ -47,9 +59,18 @@ COMMANDS = [
 HELP = """<b>MIAS bot</b>
 /trend NVDA: trend, options read and confidence (up to 5: /trend NVDA MU AMD)
 Shortcut: just send <code>NVDA</code> or <code>nvda mu</code>
-/market: SPY, QQQ, IWM and watchlist breadth
+/market: SPY, QQQ, IWM, watchlist breadth and sectors
+/sector: which sector is strongest (also in every digest); /sector energy for its members
 /picks: today's call and put spread picks (also sent automatically at 10:00 ET)
+/ema: 5-minute EMA 9/21 cross-and-retest watch (SPY, QQQ, NVDA, TSLA, META) and today's paper trades (entries also alert the group)
 /list: watched symbols · /status: health · /whoami: your IDs
+
+<b>Your positions</b> (private chat with the bot; alerts come to you only)
+<code>/buy AMZN 11/20 260/280C 6.63 x1</code> debit spread, first strike = the one you bought
+<code>/buy NVDA 12/18 190C 9.85 x2</code> single option · add <code>by 10/30</code> for your own exit date
+<code>/sell AMZN 13.40</code> (or <code>/sell 3</code> by number; no price = current mid) · /positions
+Alerts: take-profit (55% of max, +50% single), stop (-50%), near short strike, time stop (10 trading days),
+7 days to expiry, swing trend turned against you
 In the group, use commands: <code>/trend NVDA</code> or <code>/t nvda mu</code>
 
 <b>Reading the answer</b>
@@ -139,6 +160,8 @@ class CommandBot:
             return                                   # ordinary group conversation
         cmd, args = parse(text)
         _reply_chat.set(chat)
+        _user.set(user)
+        _private.set(chat_info.get("type", "private") == "private")
         if cmd == "whoami":
             ok = self.authorized(user, chat)
             await self.reply(f"Your user ID: <code>{escape(user)}</code>\nThis chat ID: <code>{escape(chat)}</code>\n"
@@ -166,6 +189,20 @@ class CommandBot:
             await asyncio.gather(*(self._trend(s) for s in dict.fromkeys(syms[:MAX_SYMBOLS])))
         elif cmd == "market":
             await self.reply(await self.market_text())
+        elif cmd in ("sector", "sectors"):
+            await self.reply(self.sector_text(args[0] if args else None))
+        elif cmd == "ema":
+            from . import emacross
+            await self.reply(emacross.status_text(self.svc.store, self.svc.cfg, datetime.now(timezone.utc),
+                                                  self.svc.engine.five))
+        elif cmd in PRIVATE_ONLY and not _private.get():
+            await self.reply("Positions are personal: send that to me in a private chat.")
+        elif cmd == "buy":
+            await self.reply(self.buy_text(args))
+        elif cmd == "sell":
+            await self.reply(await self.sell_text(args))
+        elif cmd in ("positions", "pos"):
+            await self.reply(await self.positions_text())
         elif cmd == "picks":
             if not self.svc.engine.last_results:
                 await self.reply("No market data yet: picks need a completed check (market hours).")
@@ -220,9 +257,86 @@ class CommandBot:
             down = sum(1 for r in eng.last_results if r.stock and direction(r.stock.label) == "bear")
             lines.append(f"Watchlist ({cfg.trend_primary}): {up} up · {down} down · "
                          f"{len(eng.last_results) - up - down} sideways")
+        board = sectors.board_lines(eng.last_results, cfg.sectors, cfg) if eng.last_results else []
+        if board:
+            lines += ["", "<b>Sectors</b>", *board]
         if self.svc.market_state != "open":
             lines.append("<i>market closed: last session data</i>")
         return "\n".join(lines)
+
+    def _today(self):
+        return datetime.now(timezone.utc).astimezone(self.svc.cfg.tz).date()
+
+    def buy_text(self, args: list[str]) -> str:
+        try:
+            p = positions.open_position(self.svc.store, _user.get(), args, self._today())
+        except positions.PositionError as exc:
+            return f"⛔ {exc}"
+        rules = self.svc.cfg.positions
+        mp = positions.max_profit(p)
+        target = p["entry"] + rules.take_profit * mp if mp else p["entry"] * (1 + rules.single_take_profit)
+        stop = p["entry"] * (1 - rules.stop_loss)
+        from .picks import add_trading_days
+        from datetime import date
+        by = date.fromisoformat(p["exit_by"]) if p["exit_by"] else \
+            add_trading_days(date.fromisoformat(p["opened"]), rules.time_stop_days)
+        return (f"✅ Tracking #{p['id']} <b>{escape(positions.name(p))}</b> @ {p['entry']:.2f}\n"
+                f"Take profit ≈{target:.2f} · stop ≈{stop:.2f} · time stop {by:%a %b %d}"
+                + (f" · max profit ${100 * mp * p['qty']:,.0f}" if mp else "")
+                + "\nAlerts come to this chat. /positions to check, /sell when you close it.")
+
+    async def sell_text(self, args: list[str]) -> str:
+        if not args:
+            return "Use: <code>/sell AMZN 13.40</code> or <code>/sell 3</code> (number from /positions)"
+        found = positions.find_open(self.svc.store, _user.get(), args[0])
+        if not found:
+            return f"No open position {escape(args[0])}. /positions lists yours."
+        if len(found) > 1:
+            return "More than one: use the number.\n" + "\n".join(
+                f"#{p['id']} {escape(positions.name(p))}" for p in found)
+        p = found[0]
+        if len(args) > 1:
+            try:
+                price = float(args[1].lstrip("$@"))
+            except ValueError:
+                return f"Can't read the price {escape(args[1])!r}"
+        else:
+            price, _ = await positions.quote(self.svc.client, p)
+            if price is None:
+                return "No live quote right now: add the price, e.g. <code>/sell AMZN 13.40</code>"
+        closed = positions.close_position(self.svc.store, p, price, self._today())
+        icon = "🟢" if closed["pnl"] >= 0 else "🔴"
+        return (f"{icon} Closed #{p['id']} <b>{escape(positions.name(p))}</b> @ {price:.2f} "
+                f"(entry {p['entry']:.2f}) · P&amp;L <b>{positions._money(closed['pnl'])}</b>")
+
+    async def positions_text(self) -> str:
+        mine = positions.mine(self.svc.store, _user.get())
+        if not mine:
+            return "No open positions. Add one: <code>/buy AMZN 11/20 260/280C 6.63 x1</code>"
+        lines = ["📒 <b>Your positions</b>"]
+        total = 0.0
+        for p in mine:
+            try:
+                value, under = await positions.quote(self.svc.client, p)
+            except Exception:
+                value, under = None, None
+            if value is not None:
+                total += positions.pnl(p, value)
+            lines.append(f"#{p['id']} {positions.status_line(p, value, under)}")
+        lines.append(f"Open P&amp;L: <b>{positions._money(total)}</b>")
+        return "\n".join(lines)
+
+    def sector_text(self, name: str | None) -> str:
+        cfg, results = self.svc.cfg, self.svc.engine.last_results
+        now = datetime.now(timezone.utc).astimezone(cfg.tz)
+        if not cfg.sectors:
+            return "No sectors configured."
+        if not name:
+            return sectors.board(results or [], cfg.sectors, cfg, now)
+        sector = sectors.find(cfg.sectors, name)
+        if not sector:
+            return "Sectors: " + ", ".join(s.key for s in cfg.sectors)
+        return sectors.detail(results or [], sector, cfg, now)
 
     async def reply(self, html: str) -> None:
         if self.svc.telegram:

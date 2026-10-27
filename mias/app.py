@@ -117,6 +117,7 @@ class Service:
             self.market_state = "open"
             await self._run_cycle(now)
             self._send_reports(now)
+            self._send_changes(now)
             self._send_unusual(now)
             await self._send_picks(now)
             if self.cfg.screen_enabled and self._screen_due(now):
@@ -133,6 +134,7 @@ class Service:
             if (was_open or local.time() >= CLOSE) and "close" not in sent and cycled_today:
                 if was_open:
                     await self._run_cycle(now)     # final read after the bell
+                self._send_changes(now, force=True)
                 self.store.enqueue("digest", self.engine.digest_text("Closing summary", now))
                 sent.append("close")
         self.store.put(f"digests:{today}", sent)
@@ -177,10 +179,48 @@ class Service:
         if last.get("tag") == tag:
             return
         prev = last.get("volumes") if last.get("date") == str(local.date()) else None
-        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top)
+        pending = self.store.get("blocks") or {}
+        blocks = pending.get("items") if pending.get("date") == str(local.date()) else None
+        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top, blocks=blocks)
         if text:
             self.store.enqueue("unusual", text)
         self.store.put("unusual_report", {"tag": tag, "date": str(local.date()), "volumes": volumes})
+        self.store.put("blocks", {"date": str(local.date()), "items": []})
+
+    # ---- tier 2: batched changes every N minutes ----------------------------------------------
+
+    def _send_changes(self, now: datetime, force: bool = False) -> None:
+        """Send the changes collected since the last batch, aligned to 09:30 (09:45, 10:00, ...)."""
+        if self.cfg.alert_mode != "tiered":
+            return
+        local = now.astimezone(self.cfg.tz)
+        since_open = (local - datetime.combine(local.date(), OPEN, self.cfg.tz)).total_seconds()
+        if since_open < 0:
+            return
+        minutes = self.cfg.changes_every_minutes
+        slot = int(since_open // (minutes * 60))
+        last = self.store.get("changes_sent") or {}
+        same_day = last.get("date") == str(local.date())
+        if not force and (slot == 0 or (same_day and last.get("slot") == slot)):
+            return                                   # first batch at 09:45; once per slot
+        pending = self.store.get("changes") or {}
+        events = pending.get("events", []) if pending.get("date") == str(local.date()) else []
+        start = datetime.fromtimestamp(last["ts"], self.cfg.tz) if same_day and last.get("ts") else \
+            datetime.combine(local.date(), OPEN, self.cfg.tz)
+        ranks = self._sector_ranks()
+        prev_ranks = last.get("ranks", {}) if same_day else {}
+        from .formatting import changes_message
+        text = changes_message(events, start, local, _sector_line(ranks, prev_ranks)) if events else None
+        if text:
+            self.store.enqueue("changes", text)
+        self.store.put("changes", {"date": str(local.date()), "events": []})
+        self.store.put("changes_sent", {"date": str(local.date()), "slot": slot, "ts": local.timestamp(),
+                                        "ranks": ranks if text else prev_ranks})
+
+    def _sector_ranks(self) -> dict[str, list]:
+        from .sectors import read
+        reads = [x for x in read(self.engine.last_results, self.cfg.sectors) if x.swing is not None]
+        return {x.sector.name: [i, round(x.swing)] for i, x in enumerate(reads, 1)}
 
     # ---- daily spread picks ---------------------------------------------------------------------
 
@@ -289,6 +329,21 @@ class Service:
             "degraded": self.degraded, "bad_cycles": self.bad_cycles,
             "last_cycle": self.engine.last_cycle, "telegram_error": self.dispatcher.last_error,
         }
+
+
+def _sector_line(ranks: dict[str, list], prev: dict[str, list]) -> str | None:
+    """'Sectors: Energy #1 (+90) · Tech ▼ #3 (-18, was -10) · ...' with arrows for rank moves since last batch."""
+    if not ranks:
+        return None
+    parts = []
+    for name, (rank, score) in sorted(ranks.items(), key=lambda kv: kv[1][0]):
+        old = prev.get(name)
+        arrow = ""
+        if old and old[0] != rank:
+            arrow = "▲ " if rank < old[0] else "▼ "
+        was = f", was {old[1]:+d}" if old and abs(old[1] - score) >= 5 else ""
+        parts.append(f"{name} {arrow}#{rank} ({score:+d}{was})")
+    return "Sectors: " + " · ".join(parts)
 
 
 def _in_window(local: datetime) -> bool:

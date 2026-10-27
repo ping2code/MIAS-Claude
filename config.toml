@@ -21,6 +21,29 @@ symbols = [
 ]
 market_symbols = ["SPY", "QQQ", "IWM"]
 
+# Four sectors that tend to rotate (added 2026-10-24). Each has an ETF as its gauge. Members and ETFs are added
+# to the watchlist automatically, so a symbol can live here without being repeated above. The sector board
+# (ranked by the members' average swing score) heads every digest and the closing summary, and answers /sector.
+[sectors.tech]
+name = "Tech & Semis"
+etf = "SMH"
+symbols = ["NVDA", "MU", "AMD", "AVGO", "META", "MSFT", "AMZN", "GOOGL", "AAPL", "PLTR"]
+
+[sectors.financials]
+name = "Financials"
+etf = "XLF"
+symbols = ["GS", "JPM", "V", "HOOD", "COIN"]
+
+[sectors.energy]
+name = "Energy"
+etf = "XLE"
+symbols = ["XOM", "CVX", "OXY", "USO"]
+
+[sectors.defensive]
+name = "Defensive"
+etf = "XLV"
+symbols = ["LLY", "UNH", "COST", "WMT", "PG"]
+
 [schedule]
 interval_seconds = 150          # one cycle every 2.5 minutes while the market is open
 timezone = "America/New_York"
@@ -101,12 +124,12 @@ note = "trend from SPY bars · price from SPX option quotes"
 
 [reports]
 # A full /trend-style report sent every N minutes while the market is open, aligned to 09:30.
-every_minutes = { NDX = 10, META = 10, MSFT = 10 }
+every_minutes = { NDX = 60, META = 10, MSFT = 10 }
 # Optional last day (inclusive) for a report; after it the report stops by itself.
 until = { META = "2026-10-13", MSFT = "2026-10-13" }
 # Unusual options activity across the watchlist (volume > open interest, >= unusual_min_premium, no same-day
 # expiries) every N minutes, marking contracts that are new or growing since the previous report. 0 = off.
-unusual_every_minutes = 5
+unusual_every_minutes = 15
 unusual_top = 10
 
 [picks]
@@ -116,19 +139,76 @@ enabled = true
 time = "10:00"
 
 [alerts]
-# "strong_alignment": alert only when swing is STRONG UP, intraday is STRONG UP and options are BULLISH
-#   (or the bearish mirror), once confirmed; plus a message when that alignment ends.
-# "all": every rule (trend flips, options flips, blocks, IV spikes, wall breaks, market).
-mode = "strong_alignment"
+# "tiered" (since 2026-10-25): alerts by urgency.
+#   Tier 1, sent at once to the group: pullback-over entries and strong alignment, with market/sector context
+#     ("⚠️ against market" when SPY/QQQ/IWM or the symbol's sector trend the other way). At most one per
+#     symbol and direction per tier1_merge_minutes; extras wait for the next tier-2 batch.
+#   Tier 2, one "Changes" message every changes_every_minutes: swing trend and options changes (with
+#     hysteresis), call/put wall breaks, IV spikes, alignment ended, market trend, sector ranking.
+#   Tier 3: blocks >= report_block_premium go into the unusual-activity report instead of their own alerts.
+#   Positions (/buy): private alerts to the owner, see [positions].
+# "all": every rule as its own message (trend flips, options flips, blocks, IV spikes, wall breaks, market).
+# "strong_alignment": only strong alignment and alignment-ended alerts (used 2026-10-12..24).
+# Switching modes resets the alert state quietly, so a switch never sends a burst of stale alerts.
+mode = "tiered"
 alignment_end_alert = true
+changes_every_minutes = 15
+tier1_merge_minutes = 30
+# Hysteresis: a trend class is entered past change_enter (strong: trend.strong_threshold) and left only when
+# the score falls back inside change_exit (strong: strong_exit), so scores wobbling around a line stay quiet.
+change_enter = 30
+change_exit = 15
+strong_exit = 50
+# Options flips: tuned 2026-10-26 by replaying Oct 8-23 (40/20 with 2 cycles gave ~88 flips a day; this ~26).
+options_enter = 50
+options_exit = 25
+options_confirm_cycles = 3
+# Pullback-over entry: swing UP/STRONG UP, intraday dips to -pullback_dip or lower, then recovers to
+# +pullback_recover (confirmed), options not against it. Mirror for downtrends.
+pullback_dip = 15
+pullback_recover = 35            # was 25; 35 replayed better at 3 days (61% vs 56% in the right direction)
+pullback_cooldown_minutes = 120
+report_block_premium = 5_000_000
 # A new trend or bias must hold for this many consecutive cycles before it is alerted.
 confirm_cycles = 2
 cooldown_minutes = 30
 # Options bias needed before a stock/options disagreement is called a divergence.
 divergence_min_options_score = 40
-iv_spike_points = 3.0           # ATM IV rise in volatility points ...
+# IV spikes watch the ~30-day ATM IV: the front expiry (0-2 DTE) jumped 3+ points ~300 times a day.
+iv_spike_series = "month"       # or "front"
+iv_spike_points = 4.0           # ATM IV rise in volatility points ...
 iv_spike_window_minutes = 30    # ... within this many minutes
 block_cooldown_minutes = 60     # per contract
+
+[daytrade]
+# 5-minute EMA 9/21 cross-and-retest day trades (the SPY handout, added 2026-10-26). Untested: entries and their
+# management go to the group as PAPER trades, tracked on live option quotes, with a summary at the close.
+# Backtest: python -m mias ema-backtest --symbols SPY --start 2026-04-27 --end 2026-10-23
+enabled = true
+symbols = ["SPY", "QQQ", "NVDA", "TSLA", "META"]
+fast = 9
+slow = 21
+retest_bars = 6            # the pullback into the EMAs must come within 6 candles (30 min) of the cross
+confirm_bars = 3           # ... and the confirmation candle within 3 candles of the pullback
+start = "09:45"            # ET; times in the handout read as ET (3:10 PM Central would be after the close)
+last_entry = "15:00"
+close = "15:10"
+one_dte_after = "13:00"
+contracts = 5
+partial = 3
+stop = 0.20
+first_target = 0.30
+trail = [[0.75, 0.50], [1.00, 0.75]]
+max_losses_in_row = 2
+
+[positions]
+# Rules for positions tracked with /buy (alerts go privately to whoever added the position).
+take_profit = 0.55          # spreads: share of max profit
+single_take_profit = 0.50   # single options: gain on premium
+stop_loss = 0.50            # loss on premium
+near_strike_pct = 1.5
+time_stop_days = 10         # trading days after entry, unless /buy ... by MM/DD
+hard_exit_days = 7          # days before expiry
 
 [telegram]
 enabled = true

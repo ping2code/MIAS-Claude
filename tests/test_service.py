@@ -508,6 +508,7 @@ def test_strong_alignment_confirm_flicker_end_and_cooldown(cfg):
 
 
 def test_strong_mode_suppresses_other_alerts(cfg):
+    cfg = dataclasses.replace(cfg, alert_mode="strong_alignment")
     now = datetime.combine(TODAY, time(15, 0), ET)
     fake = FakeMassive(TODAY, now, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
     eng, store, client = _engine(cfg, fake)
@@ -725,7 +726,7 @@ def test_unusual_report_every_10_minutes(cfg):
     import mias.formatting as fm
     real = fm.unusual_report
 
-    def spy(results, now, prev, top, per_symbol=3):
+    def spy(results, now, prev, top, per_symbol=3, blocks=None):
         sent.append(now)
         return "🔥 report", {}
     fm.unusual_report = spy
@@ -826,3 +827,254 @@ def test_ids_come_from_environment(tmp_path, monkeypatch):
     monkeypatch.delenv("TELEGRAM_ALERT_CHATS"); monkeypatch.delenv("TELEGRAM_ALLOWED_USERS")
     c = config_mod.load(cfg_path)
     assert c.telegram_alert_chats == ["111"] and c.telegram_allowed_users == ["111"]   # single-user default
+
+
+# ---- sectors ------------------------------------------------------------------------------------
+
+def test_sectors_join_the_watchlist_and_rank_on_the_board(tmp_path, monkeypatch):
+    from mias import sectors
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    p = tmp_path / "config.toml"
+    p.write_text('[watchlist]\nsymbols = ["SPY", "AAA"]\n'
+                 '[sectors.tech]\nname = "Tech"\netf = "TTT"\nsymbols = ["AAA", "BBB"]\n'
+                 '[sectors.energy]\nname = "Energy"\netf = "EEE"\nsymbols = ["CCC", "DDD"]\n')
+    cfg = config_mod.load(p)
+    assert cfg.symbols == ["SPY", "AAA", "BBB", "TTT", "CCC", "DDD", "EEE"]   # no duplicates, order kept
+
+    def r(sym, swing, intra=0):
+        return dataclasses.replace(_aligned(swing, intra, 0), symbol=sym)
+    results = [r("AAA", -70), r("BBB", -30), r("TTT", -50), r("CCC", 90, 40), r("DDD", 70, 20), r("EEE", 80)]
+    reads = sectors.read(results, cfg.sectors)
+    assert [x.sector.key for x in reads] == ["energy", "tech"]
+    assert reads[0].swing == 80 and reads[0].up == 2 and reads[1].down == 2
+
+    lines = sectors.board_lines(results, cfg.sectors, cfg)
+    assert lines[0].startswith("🟢 <b>Energy</b>") and "EEE +80" in lines[0] and "lead CCC +90" in lines[0]
+    assert "lead AAA -70" in lines[1]                       # a falling sector's leader is its weakest member
+    assert lines[-1] == "Focus: <b>Energy</b> · weakest: Tech"
+    assert sectors.find(cfg.sectors, "ENERGY").key == "energy" and sectors.find(cfg.sectors, "fin") is None
+    now = datetime(2026, 10, 26, 9, 50, tzinfo=ZoneInfo("America/New_York"))
+    detail = sectors.detail(results, cfg.sectors[1], cfg, now)
+    assert detail.index("CCC") < detail.index("DDD") < detail.index("EEE")   # members by score, ETF last
+    assert "No sector data" in sectors.board([], cfg.sectors, cfg, now)
+
+
+def test_mode_switch_starts_alert_state_fresh():
+    from mias.engine import _for_mode
+    old = {"mode": "strong_alignment", "strong": {"cls": "bull"}, "last": {"strong_bull": 1.0}}
+    assert _for_mode(old, "strong_alignment") is old
+    assert _for_mode(old, "all") == {"mode": "all", "last": {"strong_bull": 1.0}}
+    stale = {"stock": {"cls": "bull"}, "options": {"cls": "bear"}}   # state written before modes were tracked
+    assert _for_mode(stale, "all") == {"mode": "all", "last": {}}
+
+
+# ---- tiered mode --------------------------------------------------------------------------------
+
+def test_hysteresis_ignores_wobble_and_moves_on_real_change():
+    from mias.signals import hysteresis
+    enter, exit_ = (60, 30), (50, 15)
+    cls = hysteresis(None, 10, enter, exit_)
+    assert cls == "neutral"
+    for score in (26, 29, 22, 28):                     # wobbling under +30: stays neutral
+        cls = hysteresis(cls, score, enter, exit_)
+    assert cls == "neutral"
+    cls = hysteresis(cls, 34, enter, exit_)
+    assert cls == "up"
+    for score in (24, 18, 16):                         # back under 30 but above 15: still up
+        cls = hysteresis(cls, score, enter, exit_)
+    assert cls == "up"
+    assert hysteresis(cls, 12, enter, exit_) == "neutral"
+    assert hysteresis("up", 65, enter, exit_) == "strong_up"
+    assert hysteresis("strong_up", 55, enter, exit_) == "strong_up"
+    assert hysteresis("strong_up", 45, enter, exit_) == "up"
+    assert hysteresis("up", -35, enter, exit_) == "down"   # straight through to the other side
+
+
+def test_pullback_entry_fires_once_after_dip_and_recovery(cfg):
+    from mias.signals import evaluate_tiered
+    state, t = {}, 1_000_000.0
+    seq = [(50, 10), (50, -20), (48, -25), (52, 5), (55, 30), (56, 32), (57, 35), (58, 36)]
+    fired = []
+    for i, (swing, intra) in enumerate(seq):
+        t1, _ = evaluate_tiered(_aligned(swing, intra, 0), state, cfg, t + 150 * i, [])
+        fired += [(i, x.rule, x.direction) for x in t1 if x.rule == "pullback_entry"]
+    assert fired == [(7, "pullback_entry", "bull")]          # 2nd reading at or above +35 confirms it
+    t1, _ = evaluate_tiered(_aligned(20, 30, 0), {}, cfg, t, [])  # swing not UP: no setup at all
+    assert not t1
+
+
+def test_pullback_needs_options_not_against(cfg):
+    from mias.signals import pullback
+    state = {}
+    for swing, intra, opt in [(50, -20, -40), (50, 30, -40), (50, 30, -40), (50, 30, -40)]:
+        assert pullback(_aligned(swing, intra, opt), state, cfg) is None
+
+
+def test_tiered_routes_changes_to_batch_and_strong_to_now(cfg):
+    from mias.signals import evaluate_tiered
+    state, t = {}, 1_000_000.0
+    t2_all = []
+    for i, (sw, intra, opt) in enumerate([(10, 0, 0), (40, 0, 0), (42, 0, 0), (70, 70, 50), (72, 72, 52), (73, 73, 55)]):
+        t1, t2 = evaluate_tiered(_aligned(sw, intra, opt), state, cfg, t + 150 * i, [])
+        t2_all += [(i, x.rule, x.text) for x in t2]
+        if i == 4:
+            assert [x.rule for x in t1] == ["strong_alignment"]
+    rules = [(i, r) for i, r, _ in t2_all]
+    assert (2, "trend_change") in rules                  # NEUTRAL -> UP confirmed on the 2nd reading
+    assert (5, "options_flip") in rules                  # options flips hold 3 readings
+    assert "NEUTRAL → UP (+42)" in [x for i, r, x in t2_all if r == "trend_change"][0]
+
+
+def test_changes_message_keeps_latest_per_symbol_and_groups():
+    from mias.formatting import changes_message
+    start = datetime(2026, 10, 26, 10, 45, tzinfo=ET)
+    ev = [{"symbol": "CVX", "rule": "trend_change", "dir": "bull", "text": "UP → STRONG UP (+78)"},
+          {"symbol": "JPM", "rule": "trend_change", "dir": "bull", "text": "NEUTRAL → UP (+31)"},
+          {"symbol": "JPM", "rule": "trend_change", "dir": "neutral", "text": "UP → NEUTRAL (+12)"},
+          {"symbol": "MU", "rule": "wall_break", "dir": "bear", "text": "Broke BELOW put wall 210 (now 208.70)"},
+          {"symbol": "MARKET", "rule": "market", "dir": "bear", "text": "SPY/QQQ/IWM UP → NEUTRAL (+10)"}]
+    text = changes_message(ev, start, start + timedelta(minutes=15), "Sectors: Energy #1 (+90)")
+    assert "Changes 10:45–11:00 ET" in text and "NEUTRAL → UP" not in text and "UP → NEUTRAL (+12)" in text
+    assert text.index("<b>Trend</b>") < text.index("MARKET") < text.index("CVX") < text.index("<b>Levels</b>")
+    assert text.endswith("Sectors: Energy #1 (+90)")
+    assert changes_message([], start, start, None) is None
+
+
+def test_block_lines_skip_pairs_and_mid():
+    from mias.formatting import block_lines
+    b = lambda sym, t, exp, k, kind, side, vol, prem: dict(symbol=sym, ticker=t, expiry=exp, strike=k, kind=kind,
+                                                            side=side, volume=vol, price=1, premium=prem, ts=0)
+    items = [b("NVDA", "n1", "2026-12-18", 190, "call", "buy", 3000, 7.2e6),
+             b("SPX", "s1", "2026-12-18", 7665, "call", "mid", 4800, 88e6),
+             b("SPX", "s2", "2026-12-18", 7665, "put", "mid", 4870, 87e6),
+             b("META", "m1", "2026-11-20", 700, "put", "buy", 900, 5.4e6),
+             b("TSLA", "t1", "2026-11-20", 400, "call", "sell", 2000, 6e6),
+             b("TSLA", "t2", "2026-11-20", 450, "call", "buy", 2100, 3e6),
+             b("AMD", "a1", "2026-11-20", 250, "call", "mid", 1000, 5e6)]
+    lines = block_lines(items)
+    text = "\n".join(lines)
+    assert "🟢 NVDA 12/18 190C" in text and "🔴 META 11/20 700P" in text
+    assert "SPX" not in text.split("Skipped")[0] and "TSLA 11/20" not in text
+    assert "paired (spread/roll/combo): SPX, TSLA" in text and "at mid (no side): AMD" in text
+
+
+def test_tiered_engine_batches_changes_every_15_minutes(cfg):
+    from mias.app import Service
+    cfg = dataclasses.replace(cfg, unusual_every_minutes=0, picks_enabled=False, digest_times=[], reports={})
+    start = datetime.combine(TODAY, time(9, 31), ET)
+    fake = FakeMassive(TODAY, start, {"AAA": 100.0, "BBB": 200.0, "CCC": 50.0})
+    svc = Service(cfg, transport=httpx.MockTransport(fake.handler))
+    svc.client._retries = 0
+
+    async def go():
+        for i in range(13):                              # 09:31 .. 10:01 every 2.5 minutes
+            now = start + timedelta(minutes=2.5 * i)
+            fake.now = now
+            svc.store.put("changes", {"date": TODAY.isoformat(), "events": (svc.store.get("changes") or {}).get(
+                "events", []) + [{"symbol": "AAA", "rule": "trend_change", "dir": "bull", "text": f"step {i}"}]})
+            svc._send_changes(now)
+        await svc.client.close()
+    run(go())
+    sent = [a for a in svc.store.recent_alerts() if a["rule"] == "changes"]
+    assert len(sent) == 2                                # 09:46 and 10:01 batches, nothing in the first slot
+    assert "Changes 09:46–10:01" in sent[0]["text"]       # recent_alerts is newest first
+    assert all("AAA" in a["text"] for a in sent)
+    svc.store.close()
+
+
+def test_market_and_sector_context_warns_when_against(cfg):
+    from mias.engine import context_lines
+    from mias.config import Sector
+    cfg = dataclasses.replace(cfg, sectors=[Sector("tech", "Tech", "TTT", ["AAA", "BBB"])],
+                              market_symbols=["AAA"], symbols=["AAA", "BBB"])
+    rs = [dataclasses.replace(_aligned(-50, 0, 0), symbol="AAA"), dataclasses.replace(_aligned(-40, 0, 0), symbol="BBB")]
+    lines = context_lines(rs[1], "bull", (-50, 0), rs, cfg)
+    assert lines[0].startswith("⚠️ against market AAA DOWN (-50) · Tech DOWN (-45)")
+    assert context_lines(rs[1], "bear", (-50, 0), rs, cfg) == ["Tech sector #1 of 1: DOWN (-45)"]
+
+
+# ---- positions ----------------------------------------------------------------------------------
+
+def test_parse_buy_and_tickers():
+    from mias.positions import PositionError, legs, parse_buy
+    p = parse_buy(["AMZN", "11/20", "260/280C", "6.63", "X1"], date(2026, 10, 19))
+    assert p["expiry"] == "2026-11-20" and p["long"] == 260 and p["short"] == 280 and p["kind"] == "call"
+    assert [l.ticker for l in legs(p)] == ["O:AMZN261120C00260000", "O:AMZN261120C00280000"]
+    p = parse_buy(["BAC", "12/18", "52.5/48P", "1.10", "X2", "BY", "11/30"], date(2026, 10, 19))
+    assert p["qty"] == 2 and p["exit_by"] == "2026-11-30" and legs(p)[0].ticker == "O:BAC261218P00052500"
+    assert parse_buy(["NVDA", "1/15", "190C", "9.85"], date(2026, 10, 19))["expiry"] == "2027-01-15"
+    for bad in (["AMZN", "11/20", "280/260C", "6.63"], ["AMZN", "11/20", "260/280C", "25"],
+                ["AMZN", "11/20", "260C"], ["AMZN", "13/45", "260C", "1"]):
+        with pytest.raises(PositionError):
+            parse_buy(bad, date(2026, 10, 19))
+
+
+def test_position_rules_fire_once_each(cfg):
+    from mias.positions import check_rules, parse_buy
+    rules = cfg.positions
+    p = parse_buy(["AMZN", "11/20", "260/280C", "6.63"], date(2026, 10, 19))
+    today = date(2026, 10, 20)
+    assert check_rules(p, 8.0, 262.0, today, rules) == []
+    out = check_rules(p, 13.40, 276.5, today, rules)       # target 6.63 + 0.55 x 13.37 = 13.98
+    assert [r for r, _ in out] == ["near_short"]
+    out = check_rules(p, 14.20, 279.0, today, rules)
+    assert [r for r, _ in out] == ["take_profit"] and "TAKE-PROFIT" in out[0][1]
+    assert check_rules(p, 14.50, 279.0, today, rules) == []          # each rule once
+    out = check_rules(p, 3.0, 255.0, date(2026, 11, 3), rules)       # 10 trading days later, down 55%
+    assert {r for r, _ in out} == {"stop_loss", "time_stop"}
+    assert [r for r, _ in check_rules(p, 3.0, 255.0, date(2026, 11, 13), rules)] == ["hard_exit"]
+    out = check_rules(p, 5.0, 258.0, today, rules, ("up", "neutral", 12.0))
+    assert [r for r, _ in out] == ["trend_against"] and "UP → NEUTRAL" in out[0][1]
+    q = parse_buy(["QQQ", "11/20", "710/670P", "10.33"], date(2026, 10, 19))
+    assert [r for r, _ in check_rules(q, 9.0, 690.0, today, rules, ("down", "neutral", 5.0))] == ["trend_against"]
+    assert check_rules(q, 9.0, 690.0, today, rules, ("neutral", "down", -30.0)) == []   # trend joined the hedge
+
+
+def test_positions_via_bot_private_only_and_alert_privately(cfg, monkeypatch):
+    import mias.positions as pos
+    svc, bot, out = _shared_bot(cfg, monkeypatch)
+    dm = lambda user, text: {"chat": {"id": int(user), "type": "private"}, "from": {"id": int(user)}, "text": text}
+    grp = lambda user, text: {"chat": {"id": -100, "type": "supergroup"}, "from": {"id": int(user)}, "text": text}
+
+    async def fake_quote(client, p):
+        return 14.20, 279.0
+    monkeypatch.setattr(pos, "quote", fake_quote)
+
+    async def go():
+        await bot._handle(grp("1", "/buy AMZN 11/20 260/280C 6.63"))        # group: refused
+        await bot._handle(dm("1", "/buy amzn 11/20 260/280c 6.63 x2"))
+        await bot._handle(dm("2", "/buy NVDA 12/18 190C 9.85"))             # a friend's own position
+        await bot._handle(dm("1", "/positions"))
+        n = await pos.check_all(svc.client, svc.store, svc.cfg, datetime.combine(TODAY, time(11, 0), ET), {})
+        await bot._handle(dm("1", "/sell AMZN 14.00"))
+        await bot._handle(dm("1", "/positions"))
+        await svc.client.close()
+        await bot.close()
+        return n
+    n = run(go())
+    assert "private chat" in out[0][1] and out[0][0] == "-100"
+    assert out[1][0] == "1" and "Tracking #1" in out[1][1] and "AMZN 11/20 260/280C ×2" in out[1][1]
+    assert "#2" in out[2][1] and out[2][0] == "2"
+    assert "AMZN" in out[3][1] and "NVDA" not in out[3][1] and "+$1,514" in out[3][1]   # (14.20-6.63)*200
+    assert n >= 1
+    alerts = [a for a in svc.store.recent_alerts() if a["rule"].startswith("position_")]
+    chats = {r[0] for r in svc.store.db.execute("SELECT chat FROM alerts WHERE rule LIKE 'position_%'")}
+    assert alerts and chats <= {"1", "2"}                  # never the group
+    assert "P&amp;L <b>+$1,474</b>" in out[4][1]                 # (14.00-6.63)*200
+    assert "No open positions" in out[5][1]
+    svc.store.close()
+
+
+def test_dispatcher_sends_private_alert_only_to_its_chat(tmp_path):
+    store = Store(tmp_path / "d.db")
+    sent = []
+
+    class TG:
+        async def send(self, text, chat=None):
+            sent.append(chat)
+    d = Dispatcher(store, TG(), ["-100"])
+    store.enqueue("position_take_profit", "x", "AMZN", chat="1")
+    store.enqueue("changes", "y")
+    run(d.flush())
+    assert sent == ["1", "-100"]
+    store.close()

@@ -29,6 +29,8 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(alerts)")}
         if "sent_to" not in cols:     # added for multi-chat delivery
             self.db.execute("ALTER TABLE alerts ADD COLUMN sent_to TEXT")
+        if "chat" not in cols:        # one specific chat (e.g. a private position alert) instead of the alert chats
+            self.db.execute("ALTER TABLE alerts ADD COLUMN chat TEXT")
 
     def close(self) -> None:
         self.db.close()
@@ -61,14 +63,14 @@ class Store:
         self.db.execute("DELETE FROM alerts WHERE ts<? AND delivered IS NOT NULL", (cutoff,))
 
     # alert outbox ----------------------------------------------------------------------------
-    def enqueue(self, rule: str, text: str, symbol: str | None = None) -> int:
-        cur = self.db.execute("INSERT INTO alerts(ts, symbol, rule, text) VALUES(?,?,?,?)",
-                              (time.time(), symbol, rule, text))
+    def enqueue(self, rule: str, text: str, symbol: str | None = None, chat: str | None = None) -> int:
+        cur = self.db.execute("INSERT INTO alerts(ts, symbol, rule, text, chat) VALUES(?,?,?,?,?)",
+                              (time.time(), symbol, rule, text, chat))
         return cur.lastrowid
 
-    def pending(self, max_age_s: float = 3600, max_attempts: int = 20) -> list[tuple[int, str, str]]:
+    def pending(self, max_age_s: float = 3600, max_attempts: int = 20) -> list[tuple]:
         return self.db.execute(
-            "SELECT id, rule, text, sent_to FROM alerts WHERE delivered IS NULL AND ts>=? AND attempts<? ORDER BY id",
+            "SELECT id, rule, text, sent_to, chat FROM alerts WHERE delivered IS NULL AND ts>=? AND attempts<? ORDER BY id",
             (time.time() - max_age_s, max_attempts)).fetchall()
 
     def mark_delivered(self, alert_id: int) -> None:

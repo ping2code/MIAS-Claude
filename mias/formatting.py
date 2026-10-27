@@ -90,18 +90,20 @@ def levels_line(r: SymbolResult) -> str | None:
     return f"Levels: call wall {num(o.call_wall, 'g')} · put wall {num(o.put_wall, 'g')} · {gamma}"
 
 
-def symbol_alert(r: SymbolResult, reasons: list[tuple[str, str]], now: datetime, cfg) -> str:
-    """reasons: list of (direction class, text)."""
+def symbol_alert(r: SymbolResult, reasons: list[tuple[str, str]], now: datetime, cfg,
+                 context: list[str] | None = None) -> str:
+    """reasons: list of (direction class, text). context: market/sector lines shown under the reasons."""
     from .verdict import verdict
     head_dir = reasons[0][0]
     lines = [f"{ICON.get(head_dir, '🔔')} <b>{escape(r.symbol)}</b>  {now:%H:%M} ET"]
     lines += [f"• {escape(text)}" for _, text in reasons]
+    lines += [escape(c) for c in context or []]
     lines += ["", price_line(r), *stock_lines(r, cfg.trend_profiles, cfg.trend_primary), options_line(r),
               escape(verdict(r, list(cfg.trend_profiles[cfg.trend_primary])).line())]
     lv = levels_line(r)
     if lv:
         lines.append(lv)
-    if head_dir in ("bull", "bear") and any(text.startswith("STRONG") for _, text in reasons):
+    if head_dir in ("bull", "bear") and any(text.startswith(("STRONG", "PULLBACK", "BOUNCE")) for _, text in reasons):
         for line in (idea_line(r, "swing", head_dir, cfg, "Swing"), idea_line(r, "day", head_dir, cfg, "Day trade")):
             if line:
                 lines.append(line)
@@ -190,12 +192,14 @@ def market_alert(old: str, new: str, stock: float, opts: float | None, symbols: 
 
 
 def digest(results: list[SymbolResult], market: tuple[str, float, float | None] | None, title: str,
-           now: datetime, stock_delay_minutes: int) -> str:
+           now: datetime, stock_delay_minutes: int, sector_lines: list[str] | None = None) -> str:
     lines = [f"📊 <b>{escape(title)}</b>  {now:%a %H:%M} ET"]
     if market:
         lbl, s, o = market
         lines.append(f"Market: {ICON[direction(lbl)]} <b>{label(lbl)}</b> (stock {num(s, '.0f', True)}, "
                      f"options {num(o, '.0f', True)})")
+    if sector_lines:
+        lines += ["<b>Sectors</b>", *sector_lines]
     bull = sum(1 for r in results if r.stock and direction(r.stock.label) == "bull")
     bear = sum(1 for r in results if r.stock and direction(r.stock.label) == "bear")
     lines.append(f"Breadth: {bull} up · {bear} down · {len(results) - bull - bear} neutral")
@@ -279,16 +283,20 @@ def _flow_side(p) -> str:
 
 
 def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, float] | None, top: int,
-                   per_symbol: int = 3) -> tuple[str | None, dict[str, float]]:
+                   per_symbol: int = 3, blocks: list[dict] | None = None) -> tuple[str | None, dict[str, float]]:
     """Unusual contracts across symbols, ranked by premium. Returns (text or None if empty, volumes for next time).
 
-    prev holds each contract's volume at the previous report; contracts not in it are marked new."""
+    prev holds each contract's volume at the previous report; contracts not in it are marked new.
+    blocks (tiered mode): large prints since the previous report, appended as their own section."""
     rows = [(r.symbol, p) for r in results if r.options for p in r.options.unusual[:per_symbol]]
     rows.sort(key=lambda sp: -sp[1].premium)
     rows = rows[:top]
     volumes = {p.ticker: p.volume for _, p in rows}
+    extra = block_lines(blocks) if blocks else []
     if not rows:
-        return None, volumes
+        if not extra:
+            return None, volumes
+        return "\n".join([f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET", *extra]), volumes
     lines = [f"🔥 <b>Unusual options activity</b>  {now:%H:%M} ET",
              "<i>volume &gt; open interest · ≥ $500K premium · ranked by premium today</i>"]
     new = grew = 0
@@ -313,4 +321,69 @@ def unusual_report(results: list[SymbolResult], now: datetime, prev: dict[str, f
     if prev is not None:
         summary += f" · {new} new, {grew} growing"
     lines += ["", escape(summary)]
+    if extra:
+        lines += ["", *extra]
     return "\n".join(lines), volumes
+
+
+CHANGE_GROUPS = (("Trend", ("trend_change", "market")), ("Options", ("options_flip",)),
+                 ("Levels", ("wall_break",)), ("IV", ("iv_spike",)), ("Alignment", ("alignment_ended",)))
+
+
+def changes_message(events: list[dict], start: datetime, end: datetime,
+                    sector_line: str | None = None) -> str | None:
+    """Tier 2: everything that changed in the window, grouped. Only the latest change per symbol and rule is
+    kept (a trend that went UP then back NEUTRAL inside the window shows its final state). None if empty."""
+    latest: dict[tuple[str, str], dict] = {}
+    for e in events:
+        latest[(e["symbol"], e["rule"])] = e
+    if not latest:
+        return None
+    lines = [f"🔄 <b>Changes {start:%H:%M}–{end:%H:%M} ET</b>"]
+    for title, rules in CHANGE_GROUPS:
+        rows = [e for e in latest.values() if e["rule"] in rules]
+        if not rows:
+            continue
+        lines.append(f"<b>{title}</b>")
+        rows.sort(key=lambda e: (e["rule"] != "market", e["symbol"]))
+        for e in rows:
+            icon = "⚡" if e["rule"] == "iv_spike" else ICON.get(e["dir"], "⚪")
+            lines.append(f"{icon} <b>{escape(e['symbol'])}</b> {escape(e['text'])}")
+    if sector_line:
+        lines.append(sector_line)
+    return "\n".join(lines)
+
+
+def block_lines(items: list[dict], top: int = 6) -> list[str]:
+    """Blocks since the last report: one-sided ones listed, matched pairs (spreads, combos, rolls) skipped."""
+    merged: dict[str, dict] = {}
+    for b in items:
+        m = merged.setdefault(b["ticker"], dict(b, premium=0.0, volume=0.0))
+        m["premium"] += b["premium"]
+        m["volume"] += b["volume"]
+        m["side"] = b["side"]
+    blocks = list(merged.values())
+    paired: set[str] = set()
+    for a in blocks:
+        for b in blocks:
+            if a is b or a["symbol"] != b["symbol"] or a["expiry"] != b["expiry"] and a["kind"] != b["kind"]:
+                continue
+            if max(a["volume"], b["volume"]) <= 1.25 * min(a["volume"], b["volume"]):
+                paired |= {a["ticker"], b["ticker"]}      # same size on two strikes/expiries or call + put
+    single = [b for b in blocks if b["ticker"] not in paired and b["side"] != "mid"]
+    single.sort(key=lambda b: -b["premium"])
+    lines = []
+    if single:
+        lines.append("<b>Blocks (one-sided) since last report</b>")
+        for b in single[:top]:
+            bullish = (b["side"] == "buy") == (b["kind"] == "call")
+            lines.append(escape(f"{'🟢' if bullish else '🔴'} {b['symbol']} {b['expiry'][5:].replace('-', '/')} "
+                                f"{b['strike']:g}{b['kind'][0].upper()} {b['volume']:,.0f}x · "
+                                f"{money(b['premium']).lstrip('+')} at {'ask' if b['side'] == 'buy' else 'bid'}"))
+    skipped = sorted({b["symbol"] for b in blocks if b["ticker"] in paired})
+    mid = sorted({b["symbol"] for b in blocks if b["ticker"] not in paired and b["side"] == "mid"})
+    notes = ([f"paired (spread/roll/combo): {', '.join(skipped)}"] if skipped else []) + \
+            ([f"at mid (no side): {', '.join(mid)}"] if mid else [])
+    if notes:
+        lines.append(f"<i>Skipped blocks: {escape(' · '.join(notes))}</i>")
+    return lines

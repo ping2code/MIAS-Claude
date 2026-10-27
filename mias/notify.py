@@ -105,15 +105,16 @@ class Dispatcher:
     async def flush(self) -> int:
         async with self._lock:
             sent = 0
-            for alert_id, rule, text, sent_to in self.store.pending():
+            for alert_id, rule, text, sent_to, only in self.store.pending():
                 done = [c for c in (sent_to or "").split(",") if c]
                 if not done:
                     log.info("ALERT [%s]\n%s", rule, strip_html(text))
-                if self.telegram is None or not self.chats:
+                chats = [only] if only else self.chats
+                if self.telegram is None or not chats:
                     self.store.mark_delivered(alert_id)
                     continue
                 failed = False
-                for chat in self.chats:
+                for chat in chats:
                     if chat in done:
                         continue
                     try:
