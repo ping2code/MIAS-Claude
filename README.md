@@ -450,6 +450,33 @@ report as "3:45 PM close fade". One SPX contract is about 10 SPY contracts in do
 **Watchlist:** your 15 focus symbols plus SPY. `/trend` works for any symbol. Use `rank` to compare candidates
 by options activity.
 
+## Strategy C: qualified EMA retest (experimental, test-only)
+
+`mias/qualify.py`, `[ema_qualified]`, on the local branch `experiment/ema-9-21-strategy-c` only. A third paper
+strategy beside **A** (cross + retest) and **B** (cross, no retest), which stay unchanged as controls. C uses A's
+retest detection, contract choice, bid/ask fills and trade management; the difference is that a confirmed retest is
+only a *candidate*. Every cross is logged with a disposition: **WATCH** (retest pending), **REJECT** (with reasons)
+or **TRADE**.
+
+Hard gates (each switchable): regime **trend**; calls above / puts below **VWAP**; EMA 9 and EMA 21 both **sloping**
+the trade's way (sign only); price on the trade's side of the 15-minute **opening-range midpoint** (no complete
+range = reject); entry-candle close within **09:35–11:00 or 13:30–14:30**, nothing filled after 14:45; option
+**spread ≤ 8%**; **whipsaw lock** (2 opposite flips within 30 minutes lock the symbol for 60). Logged only: EMA
+separation (vs price and ATR), SPY/QQQ alignment, volume vs the prior 20 candles, and an unweighted quality score.
+Rejection reasons: NO_VALID_RETEST, STALE_SIGNAL, INVALID_DATA, EMA_DIRECTION_MISALIGNED, REGIME_CHOP,
+VWAP_MISALIGNED, EMA_SLOPE_MISALIGNED, EMA_SEPARATION_WEAK, OPENING_RANGE_UNAVAILABLE, OPENING_RANGE_MISALIGNED,
+OUTSIDE_TRADING_WINDOW, WHIPSAW_COOLDOWN, MARKET_CONFLICT, IN_TRADE, DAILY_LOSS_LIMIT, DATA_HEALTH, NO_CONTRACT,
+OPTION_SPREAD_TOO_WIDE.
+
+All strategies' trade records also gain `first_5m/10m/15m_fav_pct` (best stock move the trade's way in its first
+minutes) and `time_to_mfe_min` / `time_to_mae_min`: evidence for a possible "must make progress" rule, not a rule.
+
+After the close the group gets the **A/B/C comparison**; any time: `python -m mias ema-compare [--date YYYY-MM-DD]`.
+It shows each strategy's trades, wins, gross, fees, net, average win/loss, PF and drawdown; C's funnel and
+rejection counts; A's and B's trades grouped by what C decided (what C avoided); C's trades by regime, VWAP, time,
+slope, separation, opening range, spread, SPY/QQQ, symbol, side, hour, whipsaw and score; MFE/MAE and early
+progress; whipsaw and spread cost. Off by default in code; on when `"qualified"` is in `[daytrade] strategies`.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

@@ -232,6 +232,7 @@ class Trade:
     under_lo: float | None = None
     info: dict = field(default_factory=dict)   # entry record: reason, timing, stop distances, spread, trend
     exit_spread_pct: float | None = None
+    early: dict = field(default_factory=dict)  # best stock move the trade's way (%) within the first 5/10/15 minutes
 
     @classmethod
     def open(cls, su: Setup, contract: str, strike: float, expiry: str, t: int, premium: float,
@@ -276,6 +277,11 @@ class Trade:
         if under:
             self.under_hi = max(self.under_hi or under, under)
             self.under_lo = min(self.under_lo or under, under)
+            if self.under:
+                fav = round(100 * (1 if self.side == "bull" else -1) * (under / self.under - 1), 3)
+                for n in ("5", "10", "15"):
+                    if t - self.opened_t <= int(n) * 60_000:
+                        self.early[n] = max(self.early.get(n, fav), fav)
 
     def exit(self, t: int, price: float, reason: str) -> list[tuple[str, str]]:
         if self.closed:
@@ -549,10 +555,14 @@ KEY = "ema_day"
 # Live paper strategies, run side by side on the same crosses with separate state and records:
 #   retest: the handout setup (cross, pullback into the EMAs, confirmation candle)
 #   cross:  the control group, entered at the close of the crossing candle (no retest)
+#   qualified: EXPERIMENTAL Strategy C, the retest setup only when it passes the trend/VWAP qualification
+#              (mias/qualify.py: its own entry step and candidate log; same management)
 STRATEGIES = {
     "retest": {"key": KEY, "retest": True, "title": "CROSS + RETEST", "short": "EMA retest", "rule": "ema_entry"},
     "cross": {"key": "ema_cross_day", "retest": False, "title": "CROSS (no retest)", "short": "EMA cross",
               "rule": "ema_cross_entry"},
+    "qualified": {"key": "ema_qual_day", "retest": True, "title": "CROSS + RETEST + QUALIFIED", "short": "EMA qualified",
+                  "rule": "ema_qual_entry", "qualify": True},
 }
 
 
@@ -688,6 +698,10 @@ def _close_record(tr: Trade, tz: ZoneInfo, out_t: int) -> dict:
         best, worst = (tr.under_hi, tr.under_lo) if sg > 0 else (tr.under_lo, tr.under_hi)
         rec["under_mfe_pct"] = round(100 * sg * (best / tr.under - 1), 2)
         rec["under_mae_pct"] = round(100 * sg * (worst / tr.under - 1), 2)
+    rec["time_to_mfe_min"] = round((tr.peak_t - tr.opened_t) / 60000, 1) if tr.peak_t else None
+    rec["time_to_mae_min"] = round((tr.low_t - tr.opened_t) / 60000, 1) if tr.low_t else None
+    for n in ("5", "10", "15"):
+        rec[f"first_{n}m_fav_pct"] = tr.early.get(n)
     rec.update(tr.info)
     return rec
 
@@ -769,13 +783,27 @@ async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], re
         for strategy in rules.strategies:
             st = _state(store, today, strategy)
             sent += _manage(await _snapshots(client, st), store, cfg, now, five, st, strategy)
-            sent += await _enter(client, store, cfg, now, five, results or {}, issues or {}, st, strategy)
+            if STRATEGIES[strategy].get("qualify"):
+                try:                                              # experimental: never let it break A/B
+                    from . import qualify
+                    sent += await qualify.enter(client, store, cfg, now, five, results or {}, issues or {}, st)
+                except Exception:
+                    log.exception("strategy C entry step failed")
+            else:
+                sent += await _enter(client, store, cfg, now, five, results or {}, issues or {}, st, strategy)
             if int(now.timestamp() * 1000) >= _at(today, rules.close, cfg.tz) and not st["open"] \
                     and not st["summary"]:
                 text = summary_text(st, rules, today, strategy)
                 if text:
                     store.enqueue("ema_summary", text)
                     sent += 1
+                if STRATEGIES[strategy].get("qualify"):
+                    try:
+                        from . import qualify
+                        store.enqueue("ema_summary", qualify.report(store, cfg, today))
+                        sent += 1
+                    except Exception:
+                        log.exception("strategy C report failed")
                 st["summary"] = True
             store.put(STRATEGIES[strategy]["key"], st)
     return sent

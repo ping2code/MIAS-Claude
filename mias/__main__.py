@@ -12,6 +12,7 @@
   python -m mias daytrade-backtest [--setups ema,orb,vwap_reclaim,vwap_reject,pdhl] [--minutes 2,3,5]
                                      intraday setups compared on real option prices, with slippage
   python -m mias ema-log [--csv data/ema_log.csv]
+  python -m mias ema-compare [--date YYYY-MM-DD]   # EMA A/B/C side by side, Strategy C funnel and rejections
                                      every closed EMA paper trade with MFE/MAE, stop distances, spread, fill delay
   python -m mias ema-backtest [--symbols SPY] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
                                      backtest the 5-minute EMA 9/21 cross-and-retest day trade on real option bars
@@ -57,6 +58,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("telegram-test")
     el = sub.add_parser("ema-log")
     el.add_argument("--csv", default="data/ema_log.csv")
+    cmp_ = sub.add_parser("ema-compare", help="EMA strategies A/B/C side by side for a day (Strategy C funnel)")
+    cmp_.add_argument("--date", help="YYYY-MM-DD (default today, ET)")
     sc = sub.add_parser("scorecard")
     sc.add_argument("--days", type=int, default=7)
     sc.add_argument("--backfill", action="store_true", help="replay recorded checks through the tiered rules")
@@ -131,6 +134,15 @@ def main(argv: list[str] | None = None) -> int:
         keys = sorted({k for r in rows for k in r})
         write_csv(Path(args.csv), [{k: r.get(k) for k in keys} for r in rows])
         print(f"\n{len(rows)} trades · CSV: {args.csv}")
+    elif args.cmd == "ema-compare":
+        from datetime import date as _date
+
+        from . import qualify
+        from .store import Store
+        store = Store(cfg.db_path)
+        day = _date.fromisoformat(args.date) if args.date else datetime.now(cfg.tz).date()
+        print(strip_html(qualify.report(store, cfg, day)))
+        store.close()
     elif args.cmd == "scorecard":
         from . import scorecard
         from .store import Store

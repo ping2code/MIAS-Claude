@@ -165,6 +165,7 @@ class Config:
     telegram_alert_chats: list[str] = field(repr=False, default_factory=list)
     telegram_allowed_users: list[str] = field(repr=False, default_factory=list)
     telegram_allowed_chats: list[str] = field(repr=False, default_factory=list)
+    ema_qualified: "QualRules | None" = None   # [ema_qualified]: Strategy C's gates (experimental; mias/qualify.py)
 
 
 def load_dotenv(path: Path) -> None:
@@ -207,6 +208,31 @@ def _daytrade(raw: dict):
             v = type(getattr(DayTradeRules, k))(v)
         kw[k] = v
     return DayTradeRules(**kw)
+
+
+def _qualified(raw: dict):
+    from .qualify import QualRules
+    kw = {}
+    for k, v in raw.items():
+        if not hasattr(QualRules, k):
+            raise ConfigError(f"ema_qualified.{k} is not a setting")
+        if k == "sessions":
+            try:
+                v = tuple((str(a), str(b)) for a, b in v)
+                for a, b in v:
+                    _hm_ok(a), _hm_ok(b)
+            except (TypeError, ValueError):
+                raise ConfigError('ema_qualified.sessions must be [["HH:MM", "HH:MM"], ...]')
+        else:
+            v = type(getattr(QualRules, k))(v)
+        kw[k] = v
+    return QualRules(**kw)
+
+
+def _hm_ok(text: str) -> None:
+    h, m = text.split(":")
+    if not (0 <= int(h) < 24 and 0 <= int(m) < 60):
+        raise ValueError(text)
 
 
 def _choice(value, allowed: tuple, name: str) -> str:
@@ -346,6 +372,7 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         iv_spike_series=al.get("iv_spike_series", "month"),
         options_confirm_cycles=max(1, int(al.get("options_confirm_cycles", al.get("confirm_cycles", 2)))),
         daytrade=_daytrade(raw.get("daytrade", {})),
+        ema_qualified=_qualified(raw.get("ema_qualified", {})),
         brief_enabled=bool(raw.get("brief", {}).get("enabled", True)),
         brief_time=raw.get("brief", {}).get("time", "09:45"),
         premarket_enabled=bool(raw.get("premarket", {}).get("enabled", True)),

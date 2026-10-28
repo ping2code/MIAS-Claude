@@ -212,11 +212,31 @@ manage_seconds = 30        # open paper trades are re-priced this often between 
 swing_filter = false       # true: skip entries against the swing trend (see the backtest's swing split first)
 # Two paper strategies on the same crosses, each with its own record, alerts and closing summary:
 # retest = cross, pullback into the EMAs, confirmation candle; cross = enter at the crossing candle's close.
-strategies = ["retest", "cross"]
+strategies = ["retest", "cross", "qualified"]   # "qualified" = EXPERIMENTAL Strategy C ([ema_qualified]); remove to stop it
 fee_per_contract = 0.65    # commission per contract per side, taken off in the weekly strategy report
 # Paper fills are realistic: bought at the ask, sold at the bid (never above the trigger price); the midpoint
 # result is shown alongside. Every closed trade is logged with MFE/MAE, stop distances, spread, fill delay and the
 # trend at entry: python -m mias ema-log
+
+[ema_qualified]
+# EXPERIMENTAL Strategy C (mias/qualify.py), test-only, paper: the retest setup (A) traded only when it qualifies.
+# Runs when "qualified" is in [daytrade] strategies; A and B are untouched controls. Every cross is logged as
+# WATCH / REJECT (with reasons) / TRADE. Report: python -m mias ema-compare (also posted after the close).
+# Values are first-test defaults, deliberately not tuned to the 23 trades seen so far.
+trend_only = true            # regime must be "trend" (ADX >= 25 and the day moved 40% of an average range)
+require_vwap = true          # calls above VWAP, puts below
+require_slope = true         # EMA 9 and EMA 21 both sloping the trade's way over slope_bars candles (sign only)
+require_or = true            # price on the trade's side of the 15-min opening-range midpoint; no range = reject
+require_market = false       # SPY/QQQ alignment: logged, not a gate
+min_separation_pct = 0.0     # |EMA9-EMA21| / price: logged, not a gate
+sessions = [["09:35", "11:00"], ["13:30", "14:30"]]   # entry-candle close, ET
+no_entries_after = "14:45"
+max_spread_pct = 8.0
+whipsaw_window_minutes = 30
+whipsaw_flips = 2            # 2 opposite flips (3 crosses) within the window lock the symbol
+cooldown_minutes = 60
+slope_bars = 3
+vwap_hold_bars = 3
 
 [closeplay]
 # 3:45 PM close play, paper-traded (python -m mias close-backtest): at 15:45 ET, when the day's move, the VWAP side

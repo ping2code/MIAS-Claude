@@ -129,7 +129,8 @@ def test_expiry_choice():
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("MASSIVE_API_KEY", "test-key")
     monkeypatch.setenv("MIAS_DB_PATH", str(tmp_path / "t.db"))
-    return config_mod.load(ROOT / "config.toml")
+    c = config_mod.load(ROOT / "config.toml")
+    return _only(c, "retest", "cross")          # the controls A and B (Strategy C: tests/test_strategy_c.py)
 
 
 class FakeClient:
