@@ -82,7 +82,7 @@ class Engine:
                 try:
                     sym = self.cfg.closeplay_symbol
                     r = by_sym.get(sym)
-                    spx = by_sym.get("SPX")
+                    spx = by_sym.get(self.cfg.closeplay_trade) or by_sym.get("SPX")
                     await closeplay.live(self.client, self.store, self.cfg, now, self.today5.get(sym),
                                          self.health_issues(r, now) if r else [], spx.price if spx else None)
                 except Exception:

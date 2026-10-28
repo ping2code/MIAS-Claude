@@ -15,8 +15,10 @@ the same move ~10x the size; the plan has no SPX index bars): bought at the firs
 sold at the 15:59 close, SLIP lost on each fill, commissions taken off.
 
 Live (live() each cycle, manage() from the 30 s watcher): the fade rule only, paper-traded. Every weekday at the
-first cycle from 15:45 the group gets CALL, PUT or NO TRADE with the reason and the SPX equivalent strike; a trade
-is bought at the ask and sold at the bid at 15:59, then logged (LOG_KEY) for the strategy report.
+first cycle from 15:45 the group gets CALL, PUT or NO TRADE with the reason. The read comes from the signal symbol's
+bars (SPY); the trade is in the trade symbol's 0DTE chain (SPX: SPXW), bought at the ask and sold at the bid at
+15:59, then logged (LOG_KEY) for the strategy report. The SPX index value on the chain is delayed, so the ATM
+strike is where the call and put are priced alike (put-call parity), and the index level is read the same way.
 """
 from __future__ import annotations
 
@@ -215,7 +217,8 @@ def _word(sign: int, up: str, down: str) -> str:
     return up if sign > 0 else down if sign < 0 else "flat"
 
 
-def signal_text(x: dict, side: int, local: datetime, symbol: str, spx: float | None) -> list[str]:
+def signal_text(x: dict, side: int, local: datetime, symbol: str, spx: float | None,
+                trade: str = "SPY") -> list[str]:
     agree = x["day"] if x["day"] == x["vwap_side"] == x["momentum"] else 0
     lines = [f"{symbol} {x['price']:.2f} · day {x['day_pct']:+.2f}% · {_word(x['vwap_side'], 'above', 'below')} "
              f"VWAP {x['vwap']:.2f} · last 45 min {x['mom_pct']:+.2f}%"]
@@ -223,7 +226,7 @@ def signal_text(x: dict, side: int, local: datetime, symbol: str, spx: float | N
         lines.append(f"All three {'up' if agree > 0 else 'down'}: fade it, the close tends to pull back")
     else:
         lines.append("Day, VWAP and the last 45 minutes don't all agree: no edge in the backtest")
-    if side and spx:
+    if side and spx and trade == symbol:
         k = 5 * round(spx / 5)
         lines.append(f"SPX equivalent: 0DTE {k}{'C' if side > 0 else 'P'} (SPX ~{spx:,.0f}, ~10× the dollars, "
                      f"wider spreads)")
@@ -275,40 +278,64 @@ async def _signal(client, store, cfg, now: datetime, today5: list[dict], issues:
         store.enqueue("closeplay", f"{head}: ⚠️ held by the health gate ({escape(issues[0])})")
         return 1
     kind = "call" if side > 0 else "put"
+    trade = cfg.closeplay_trade
+    inst = cfg.instruments.get(trade)
+    chain_sym = inst.options_symbol if inst else trade
+    center = x["price"] if trade == sym else spx
     try:
-        chain, _ = await client.option_chain(sym, spot=x["price"], today=local.date(), max_dte=0, strike_pct=0.01,
-                                             max_pages=3)
+        if not center:
+            center = await client.underlying_value(chain_sym)           # delayed, close enough to centre the fetch
+        chain, _ = await client.option_chain(chain_sym, spot=center, today=local.date(), max_dte=0,
+                                             strike_pct=0.01 if trade == sym else 0.005, max_pages=3)
     except Exception as exc:
         log.warning("close play chain failed: %s", exc)
         chain = []
-    rows = [c for c in chain if (c.get("details") or {}).get("contract_type") == kind
-            and c["details"].get("expiration_date") == local.date().isoformat() and _mid(c)]
+    today_rows = [c for c in chain if c.get("details") and c["details"].get("expiration_date") == local.date().isoformat()
+                  and _mid(c)]
+    rows = [c for c in today_rows if c["details"].get("contract_type") == kind]
     if not rows:
         st["status"] = "held"
-        store.enqueue("closeplay", f"{head}: {kind.upper()} signal, but no 0DTE {sym} quote to paper-trade")
+        store.enqueue("closeplay", f"{head}: {kind.upper()} signal, but no 0DTE {trade} quote to paper-trade")
         return 1
-    spot = (rows[0].get("underlying_asset") or {}).get("price") or x["price"]
+    spot = _parity_spot(today_rows) or (rows[0].get("underlying_asset") or {}).get("price") or center
     c = min(rows, key=lambda c: (abs(c["details"]["strike_price"] - spot), c["details"]["strike_price"]))
     bid, ask, mid = _quote(c)
     bad = health.spread_issue(bid, ask) or health.quote_issue(c, now)
     if bad:
         st["status"] = "held"
-        health.record(store, now, tz, sym, "close play", [bad])
+        health.record(store, now, tz, trade, "close play", [bad])
         store.enqueue("closeplay", f"{head}: {kind.upper()} signal held: {bad}")
         return 1
     strike = float(c["details"]["strike_price"])
     qty = cfg.closeplay_contracts
-    st.update(status="open", ticker=c["details"]["ticker"], strike=strike, kind=kind, qty=qty, entry=ask,
+    st.update(status="open", symbol=trade, ticker=c["details"]["ticker"], strike=strike, kind=kind, qty=qty, entry=ask,
               entry_mid=mid, entry_spread_pct=round(100 * (ask - bid) / mid, 1), opened=now.timestamp(),
-              under=spot)
+              under=spot, pair=_pair(today_rows, strike, kind))
     k = "C" if side > 0 else "P"
     store.enqueue("closeplay", "\n".join([
-        f"{head}: {'🟢' if side > 0 else '🔴'} <b>{kind.upper()}</b> · {sym} {strike:g}{k} 0DTE at {ask:.2f} ask "
-        f"(mid {mid:.2f}) × {qty}",
-        *signal_text(x, side, local, sym, spx),
+        f"{head}: {'🟢' if side > 0 else '🔴'} <b>{kind.upper()}</b> · {trade} {strike:g}{k} 0DTE at {ask:.2f} ask "
+        f"(mid {mid:.2f}) × {qty}" + (f" · {trade} ~{spot:,.2f}" if trade != sym else ""),
+        *signal_text(x, side, local, sym, spx, trade),
         f"Exit: sell at 15:59 · max loss the premium (${ask * 100 * qty:,.0f})",
         f"<i>{BACKTEST_NOTE}</i>"]))
     return 1
+
+
+def _parity_spot(rows: list[dict]) -> float | None:
+    """The underlying implied by the strike where call and put mids are closest: K + C - P."""
+    from .emacross import _mid
+    by: dict[float, dict[str, float]] = {}
+    for c in rows:
+        by.setdefault(float(c["details"]["strike_price"]), {})[c["details"]["contract_type"]] = _mid(c)
+    pairs = [(abs(v["call"] - v["put"]), k + v["call"] - v["put"]) for k, v in by.items() if "call" in v and "put" in v]
+    return min(pairs)[1] if pairs else None
+
+
+def _pair(rows: list[dict], strike: float, kind: str) -> str | None:
+    """The other side at the same strike, so the exit can read the underlying by parity too."""
+    other = "put" if kind == "call" else "call"
+    return next((c["details"]["ticker"] for c in rows if c["details"]["contract_type"] == other
+                 and float(c["details"]["strike_price"]) == strike), None)
 
 
 async def manage(client, store, cfg, now: datetime) -> int:
@@ -317,12 +344,13 @@ async def manage(client, store, cfg, now: datetime) -> int:
     st = store.get(KEY) or {}
     if st.get("status") != "open" or st.get("date") != local.date().isoformat() or local.time() < SELL:
         return 0
-    from .emacross import _quote
+    from .emacross import _mid, _quote
     try:
-        snap = (await client.snapshots([st["ticker"]])).get(st["ticker"]) or {}
+        snaps = await client.snapshots([t for t in (st["ticker"], st.get("pair")) if t])
     except Exception as exc:
         log.warning("close play quote failed: %s", exc)
         return 0
+    snap = snaps.get(st["ticker"]) or {}
     bid, ask, mid = _quote(snap)
     if mid is None and bid is None:
         return 0
@@ -330,10 +358,15 @@ async def manage(client, store, cfg, now: datetime) -> int:
     qty = st["qty"]
     pnl = round((exit_ - st["entry"]) * 100 * qty, 2)
     under = (snap.get("underlying_asset") or {}).get("price")
+    other = snaps.get(st.get("pair") or "") or {}
+    if mid and _mid(other):
+        call, put = (mid, _mid(other)) if st["kind"] == "call" else (_mid(other), mid)
+        under = round(st["strike"] + call - put, 2)
+    trade = st.get("symbol") or cfg.closeplay_symbol
     st.update(status="closed", exit=exit_, exit_mid=mid, pnl=pnl, closed=now.timestamp())
     store.put(KEY, st)
     k = "C" if st["kind"] == "call" else "P"
-    rec = {"date": st["date"], "strategy": "close_fade", "symbol": cfg.closeplay_symbol,
+    rec = {"date": st["date"], "strategy": "close_fade", "symbol": trade,
            "side": "bull" if st["kind"] == "call" else "bear", "contract": f"{st['strike']:g}{k}",
            "ticker": st["ticker"], "qty": qty, "entry": st["entry"], "entry_mid": st["entry_mid"], "exit": exit_,
            "pnl": pnl, "pnl_pct": round(100 * (exit_ / st["entry"] - 1), 1) if st["entry"] else 0.0,
@@ -341,9 +374,9 @@ async def manage(client, store, cfg, now: datetime) -> int:
            "under_in": st.get("under"), "under_out": under, "read": st.get("read")}
     store.put(LOG_KEY, (store.get(LOG_KEY) or [])[-999:] + [rec])
     sign = "+" if pnl >= 0 else "-"
-    store.enqueue("closeplay", f"{'🎯' if pnl > 0 else '🛑'} <b>3:45 close play: SOLD</b> {cfg.closeplay_symbol} "
+    store.enqueue("closeplay", f"{'🎯' if pnl > 0 else '🛑'} <b>3:45 close play: SOLD</b> {trade} "
                                f"{st['strike']:g}{k} at {exit_:.2f} bid (in {st['entry']:.2f}) · "
                                f"{sign}${abs(pnl):,.0f} ({rec['pnl_pct']:+}%)"
-                               + (f" · {cfg.closeplay_symbol} {st['under']:.2f} → {under:.2f}"
+                               + (f" · {trade} {st['under']:,.2f} → {under:,.2f}"
                                   if under and st.get("under") else ""))
     return 1

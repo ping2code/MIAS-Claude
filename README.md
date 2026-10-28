@@ -75,7 +75,7 @@ Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 | 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |
 | 2 Changes | One message every 15 min (09:45, 10:00, …) if anything changed: swing trend changes, options bias flips, call/put wall breaks, IV spikes, alignment ended, market trend, plus the sector ranking with ▲▼. Only the latest change per symbol shows | Group |
 | 3 Context | **Unusual activity** every 5 min: only contracts that traded since the last report, ranked by that new premium, each classified **trade by trade** (buy / sell / mid / multi-leg, sweeps). The first report of the day checks **yesterday's flow against today's open interest**. Blocks ≥ $5M since the last report, judged by their trades. See [Options flow](#options-flow) | Group |
-| 1 Close play (paper) | **3:45 PM close fade**: CALL, PUT or NO TRADE at ~15:45 with the SPX strike, the paper trade's exit at 15:59. See [3:45 PM close play](#345-pm-close-play-paper) | Group |
+| 1 Close play (paper) | **3:45 PM close fade**: CALL, PUT or NO TRADE at ~15:45, an SPX 0DTE paper trade, its exit at 15:59. See [3:45 PM close play](#345-pm-close-play-paper) | Group |
 | 3 Context | **Day-trade brief** at 09:45 ([Morning brief](#morning-brief)); **scorecard** and **strategy report** every Friday at the close ([Scorecard](#alert-scorecard), [Strategy report](#strategy-report)); signals held by the [health gate](#health-gate) at the close | Group |
 
 **Hysteresis** keeps tier 2 quiet when a score wobbles: a trend counts as UP after passing +30 and stays UP until it
@@ -440,10 +440,12 @@ first half is checked on the second. Results in `data/close_backtest/`.
 days that moved 0.7%+ (+$11). Thin: +$2.4 with 3 cents of slippage. Following the trend loses (−$13 a contract).
 
 **Live paper trade** (`[closeplay]`, the fade rule only): every weekday, at the first cycle from 15:45 ET (when the
-15:40 candle is in, up to 15:52), the group gets **CALL**, **PUT** or **NO TRADE** with the three readings and the SPX
-equivalent 0DTE strike. A trade buys `contracts` SPY 0DTE ATM at the ask (health gate and a 10% spread limit
-apply) and sells at the bid at 15:59 (the 30-second watcher), with an alert at each step. Results go to the
-strategy report as "3:45 PM close fade".
+15:40 candle is in, up to 15:52), the group gets **CALL**, **PUT** or **NO TRADE** with the three readings (from
+SPY's bars, `symbol`). A trade buys `contracts` of the `trade` symbol's 0DTE ATM option at the ask: **SPX** (SPXW)
+by default, `trade = "SPY"` for SPY. The SPX index value on the chain is delayed, so the ATM strike and the SPX level
+are read by put-call parity (the strike where call and put are priced alike). The health gate and a 10% spread limit
+apply; it sells at the bid at 15:59 (the 30-second watcher), with an alert at each step. Results go to the strategy
+report as "3:45 PM close fade". One SPX contract is about 10 SPY contracts in dollars, and the backtest was SPY.
 
 **Watchlist:** your 15 focus symbols plus SPY. `/trend` works for any symbol. Use `rank` to compare candidates
 by options activity.

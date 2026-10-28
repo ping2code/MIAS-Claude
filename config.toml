@@ -221,11 +221,13 @@ fee_per_contract = 0.65    # commission per contract per side, taken off in the 
 [closeplay]
 # 3:45 PM close play, paper-traded (python -m mias close-backtest): at 15:45 ET, when the day's move, the VWAP side
 # and the last 45 minutes all point the same way, buy the 0DTE ATM option AGAINST them (the closing pullback) and
-# sell at 15:59. Otherwise NO TRADE. Posted to the group every day at ~15:45 with the SPX equivalent strike.
+# sell at 15:59. Otherwise NO TRADE. Posted to the group every day at ~15:45. The read comes from SPY's bars (the
+# plan has no SPX index bars); the trade is the SPX 0DTE (SPXW) ATM option, ~10x a SPY contract.
 # Backtest, SPY 2024-10 to 2026-10: right 59% of the time, +$6.4 per contract after costs, PF 1.34, both years
 # positive; thin (+$2.4 with 3 cents of slippage).
 enabled = true
-symbol = "SPY"
+symbol = "SPY"             # the 15:45 read
+trade = "SPX"              # the option traded (SPY to trade SPY 0DTE instead)
 contracts = 1
 
 [premarket]

@@ -342,10 +342,14 @@ class _CloseClient:
         self.day, self.bid, self.ask = day, 0.50, 0.52
 
     async def option_chain(self, symbol, *, spot, today, **kw):
+        self.chain_symbol = symbol
+        def q(k, s):                                  # priced by parity around spot, so the ATM strike is spot's
+            v = max(0.0, (spot - s) if k == "call" else (s - spot))
+            return {"bid": self.bid + v, "ask": self.ask + v}
         return [{"details": {"contract_type": k, "expiration_date": today.isoformat(), "strike_price": s,
-                             "ticker": f"O:SPY{today:%y%m%d}{k[0].upper()}{int(s * 1000):08d}"},
-                 "last_quote": {"bid": self.bid, "ask": self.ask}, "underlying_asset": {"price": spot}}
-                for k in ("call", "put") for s in (round(spot) - 1, round(spot), round(spot) + 1)], False
+                             "ticker": f"O:{symbol[-3:]}{today:%y%m%d}{k[0].upper()}{int(s * 1000):08d}"},
+                 "last_quote": q(k, s), "underlying_asset": {"value": spot}}
+                for k in ("call", "put") for s in (round(spot) - 5, round(spot), round(spot) + 5)], False
 
     async def snapshots(self, tickers):
         return {t: {"last_quote": {"bid": self.bid, "ask": self.ask}, "underlying_asset": {"price": 104.0}}
@@ -375,16 +379,24 @@ def test_close_play_live_fade_trade(tmp_path, monkeypatch):
     assert asyncio.run(closeplay.live(client, store, cfg, at(15, 45), early)) == 0     # 15:40 candle not in yet
     assert asyncio.run(closeplay.live(client, store, cfg, at(15, 46), raw, [], 6880.0)) == 1
     text = store.pending()[-1][2]
-    assert "PUT" in text and "fade it" in text and "SPX equivalent: 0DTE 6880P" in text and "0.52 ask" in text
+    assert "PUT" in text and "fade it" in text and "SPX 6880P 0DTE at 0.52 ask" in text and "SPX ~6,880" in text
+    assert client.chain_symbol == "I:SPX" and store.get(closeplay.KEY)["pair"].startswith("O:SPX261028C")
     assert asyncio.run(closeplay.live(client, store, cfg, at(15, 48), raw)) == 0       # once a day
     assert asyncio.run(closeplay.manage(client, store, cfg, at(15, 58))) == 0           # not before 15:59
     client.bid, client.ask = 0.90, 0.92
     assert asyncio.run(closeplay.manage(client, store, cfg, at(15, 59))) == 1
     assert "SOLD" in store.pending()[-1][2] and "+$38" in store.pending()[-1][2]
+    assert "SPX 6,880.00 → 6,880.00" in store.pending()[-1][2]
     log = store.get(closeplay.LOG_KEY)
     assert log[0]["pnl"] == 38.0 and log[0]["side"] == "bear" and log[0]["qty"] == 1
     text = strategies.report(store, cfg, at(16, 30))
     assert "3:45 PM close fade" in text and "expectancy +$37/trade" in text           # 38 - 2 x 0.65
+    import dataclasses                                                                 # trade = "SPY": SPY 0DTE
+    spy = dataclasses.replace(cfg, closeplay_trade="SPY")
+    store3, client3 = Store(tmp_path / "spy.db"), _CloseClient(day)
+    asyncio.run(closeplay.live(client3, store3, spy, at(15, 46), raw, [], 6880.0))
+    text = store3.pending()[-1][2]
+    assert client3.chain_symbol == "SPY" and " SPY " in text and "SPX equivalent: 0DTE 6880P" in text
 
 
 def test_close_play_no_trade_and_health_hold(tmp_path, monkeypatch):

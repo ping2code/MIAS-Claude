@@ -147,7 +147,8 @@ class Config:
     premarket_enabled: bool              # [premarket]: 07:00 heads-up and 09:15 update
     premarket_times: list[str]
     closeplay_enabled: bool              # [closeplay]: the 3:45 PM 0DTE fade, paper-traded
-    closeplay_symbol: str
+    closeplay_symbol: str                # read from this symbol's bars (SPY)
+    closeplay_trade: str                 # traded in this symbol's 0DTE chain (SPX; an [instruments] name maps its chain)
     closeplay_contracts: int
     telegram_enabled: bool
     telegram_commands: bool
@@ -351,6 +352,8 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         premarket_times=[str(t) for t in raw.get("premarket", {}).get("times", ["07:00", "09:15"])],
         closeplay_enabled=bool(raw.get("closeplay", {}).get("enabled", True)),
         closeplay_symbol=str(raw.get("closeplay", {}).get("symbol", "SPY")).upper(),
+        closeplay_trade=str(raw.get("closeplay", {}).get("trade", raw.get("closeplay", {}).get("symbol", "SPY"))
+                            ).upper(),
         closeplay_contracts=max(1, int(raw.get("closeplay", {}).get("contracts", 1))),
         telegram_enabled=bool(tg.get("enabled", True)),
         telegram_commands=bool(tg.get("commands", True)),
