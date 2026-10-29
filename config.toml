@@ -212,7 +212,10 @@ manage_seconds = 30        # open paper trades are re-priced this often between 
 swing_filter = false       # true: skip entries against the swing trend (see the backtest's swing split first)
 # Two paper strategies on the same crosses, each with its own record, alerts and closing summary:
 # retest = cross, pullback into the EMAs, confirmation candle; cross = enter at the crossing candle's close.
-strategies = ["retest", "cross", "qualified"]   # "qualified" = EXPERIMENTAL Strategy C ([ema_qualified]); remove to stop it
+strategies = ["retest", "cross", "qualified", "ema_9_21_d"]
+# "qualified" = EXPERIMENTAL Strategy C ([ema_qualified]); "ema_9_21_d" = EXPERIMENTAL Strategy D: the backtested
+# "A + trend + time windows" rule with a +50% first target and the -20% stop, fixed in code (mias/qualify.py D_GATES).
+# Live-paper session only: remove either name to stop it. Neither runs unless listed here.
 fee_per_contract = 0.65    # commission per contract per side, taken off in the weekly strategy report
 # Paper fills are realistic: bought at the ask, sold at the bid (never above the trigger price); the midpoint
 # result is shown alongside. Every closed trade is logged with MFE/MAE, stop distances, spread, fill delay and the

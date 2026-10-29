@@ -477,6 +477,23 @@ rejection counts; A's and B's trades grouped by what C decided (what C avoided);
 slope, separation, opening range, spread, SPY/QQQ, symbol, side, hour, whipsaw and score; MFE/MAE and early
 progress; whipsaw and spread cost. Off by default in code; on when `"qualified"` is in `[daytrade] strategies`.
 
+## Strategy D: trend + time windows, +50/−20 (experimental, live paper)
+
+`ema_9_21_d` in `[daytrade] strategies` (off unless listed), on the local experiment branch only. It is the backtested
+**"A + trend + time windows"** rule, fixed in code (`mias/qualify.py` `D_GATES`) so it can't drift from what was
+validated: A's cross + retest, kept only when the regime is **trend** and the entry candle closes in **09:35–11:00 or
+13:30–14:30** ET. No VWAP, slope, opening-range, whipsaw or score gate (they are logged as diagnostics only). Exits
+are `[daytrade]` with one change, `first_target = 0.50`: −20% premium stop; at +50% sell 3 of 5, runners to
+breakeven, trail +75%→+50% and +100%→+75%; a 5-minute close through the retest extreme exits (invalidation); all
+out at 15:10; 0DTE, 1DTE from 13:00. Fills as A: bought at the ask, sold at the bid; the option must pass A's health
+checks (spread ≤ 10%, fresh real-time quote). Own state (`ema_d_day`), loss counter, records (`ema_log` rows tagged
+`ema_9_21_d`) and candidate log (`ema_d_candidates`, `ema_d_log`).
+
+Backtest (6 symbols, real option minute bars, 1% slippage, fees): prior year Oct 2024–Oct 2025 (out of sample) 53
+trades, +$142/trade, PF 1.78; Oct 2025–Oct 2026 55 trades, +$61/trade, PF 1.37. About one trade a week; promising,
+not proven. The after-close comparison report (`python -m mias ema-compare`) adds D's signals, trades, exits by
+reason, and each trade's entry, contract, target, stop, exit and net P&L.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

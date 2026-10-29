@@ -557,13 +557,26 @@ KEY = "ema_day"
 #   cross:  the control group, entered at the close of the crossing candle (no retest)
 #   qualified: EXPERIMENTAL Strategy C, the retest setup only when it passes the trend/VWAP qualification
 #              (mias/qualify.py: its own entry step and candidate log; same management)
+#   ema_9_21_d: EXPERIMENTAL Strategy D, the backtested "A + trend + time windows" rule with a +50% first target
+#              (mias/qualify.py D_GATES; "rules" overrides DayTradeRules for this strategy only)
 STRATEGIES = {
     "retest": {"key": KEY, "retest": True, "title": "CROSS + RETEST", "short": "EMA retest", "rule": "ema_entry"},
     "cross": {"key": "ema_cross_day", "retest": False, "title": "CROSS (no retest)", "short": "EMA cross",
               "rule": "ema_cross_entry"},
     "qualified": {"key": "ema_qual_day", "retest": True, "title": "CROSS + RETEST + QUALIFIED", "short": "EMA qualified",
                   "rule": "ema_qual_entry", "qualify": True},
+    "ema_9_21_d": {"key": "ema_d_day", "retest": True, "title": "D · TREND + TIME + 50/20", "short": "EMA D",
+                   "rule": "ema_d_entry", "qualify": True, "rules": {"first_target": 0.50}},
 }
+
+
+def rules_for(cfg, strategy: str) -> DayTradeRules:
+    """The day-trade rules a strategy trades with: [daytrade] plus its own fixed overrides (none for A/B/C)."""
+    over = STRATEGIES[strategy].get("rules")
+    if not over:
+        return cfg.daytrade
+    from dataclasses import replace
+    return replace(cfg.daytrade, **over)
 
 
 def _state(store, today: date, strategy: str = "retest") -> dict:
@@ -730,7 +743,7 @@ async def _snapshots(client, st: dict) -> dict:
 
 def _manage(snaps: dict, store, cfg, now: datetime, five: dict[str, list[Bar]], st: dict,
             strategy: str = "retest") -> int:
-    rules: DayTradeRules = cfg.daytrade
+    rules: DayTradeRules = rules_for(cfg, strategy)
     tz = cfg.tz
     now_ms = int(now.timestamp() * 1000)
     close_ms = _at(now.astimezone(tz).date(), rules.close, tz)
@@ -779,6 +792,7 @@ async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], re
     rules: DayTradeRules = cfg.daytrade
     today = now.astimezone(cfg.tz).date()
     sent = 0
+    done: list[bool] = []
     async with LOCK:
         for strategy in rules.strategies:
             st = _state(store, today, strategy)
@@ -786,9 +800,10 @@ async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], re
             if STRATEGIES[strategy].get("qualify"):
                 try:                                              # experimental: never let it break A/B
                     from . import qualify
-                    sent += await qualify.enter(client, store, cfg, now, five, results or {}, issues or {}, st)
+                    sent += await qualify.enter(client, store, cfg, now, five, results or {}, issues or {}, st,
+                                                strategy)
                 except Exception:
-                    log.exception("strategy C entry step failed")
+                    log.exception("experimental strategy %s entry step failed", strategy)
             else:
                 sent += await _enter(client, store, cfg, now, five, results or {}, issues or {}, st, strategy)
             if int(now.timestamp() * 1000) >= _at(today, rules.close, cfg.tz) and not st["open"] \
@@ -797,16 +812,26 @@ async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], re
                 if text:
                     store.enqueue("ema_summary", text)
                     sent += 1
-                if STRATEGIES[strategy].get("qualify"):
-                    try:
-                        from . import qualify
-                        store.enqueue("ema_summary", qualify.report(store, cfg, today))
-                        sent += 1
-                    except Exception:
-                        log.exception("strategy C report failed")
                 st["summary"] = True
             store.put(STRATEGIES[strategy]["key"], st)
+            done.append(st["summary"])
+        sent += _compare(store, cfg, today, done)
     return sent
+
+
+def _compare(store, cfg, today: date, done: list[bool]) -> int:
+    """Once a day, after every strategy's closing summary: the A/B/C/D comparison (only when C or D runs)."""
+    key = f"ema_compare:{today}"
+    if not all(done) or not any(STRATEGIES[s].get("qualify") for s in cfg.daytrade.strategies) or store.get(key):
+        return 0
+    store.put(key, True)
+    try:
+        from . import qualify
+        store.enqueue("ema_summary", qualify.report(store, cfg, today))
+        return 1
+    except Exception:
+        log.exception("strategy comparison report failed")
+        return 0
 
 
 def _skip(st: dict, why: str) -> None:

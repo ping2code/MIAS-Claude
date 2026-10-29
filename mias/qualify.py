@@ -60,6 +60,20 @@ def rules_of(cfg) -> QualRules:
     return getattr(cfg, "ema_qualified", None) or QualRules()
 
 
+# Strategy D (EXPERIMENTAL): the backtested "A + trend + time windows" rule, fixed in code so it can't drift from what
+# was validated (Oct 2024-Oct 2026, both years positive): the trend gate and the entry windows only; VWAP, slope,
+# opening range and whipsaw are logged as diagnostics, never gates. Exits: DayTradeRules with first_target 0.50
+# (emacross.STRATEGIES["ema_9_21_d"]["rules"]); option checks are A's (health spread <= 10%, fresh quote).
+D = "ema_9_21_d"
+D_GATES = QualRules(require_vwap=False, require_slope=False, require_or=False, whipsaw_flips=999)
+
+# Per experimental strategy: candidate keys, gates, and which option-spread check applies.
+PROFILES = {
+    NAME: {"candidates": CANDIDATES, "log": CAND_LOG, "gates": rules_of, "spread": "max_spread_pct"},
+    D: {"candidates": "ema_d_candidates", "log": "ema_d_log", "gates": lambda cfg: D_GATES, "spread": "health"},
+}
+
+
 def _hm(text: str) -> time:
     h, m = text.split(":")
     return time(int(h), int(m))
@@ -220,8 +234,8 @@ def score(components: dict) -> tuple[int, int, list[str]]:
 
 # ---- live ----------------------------------------------------------------------------------------
 
-def _book(store, today: date) -> dict:
-    b = store.get(CANDIDATES) or {}
+def _book(store, today: date, key: str = CANDIDATES) -> dict:
+    b = store.get(key) or {}
     return b if b.get("date") == today.isoformat() else {"date": today.isoformat(), "items": {}}
 
 
@@ -260,6 +274,16 @@ async def _option(client, sym: str, su: Setup, today: date, now: datetime, tz, r
     return c, expiry, f, ("INVALID_DATA" if bad else None)
 
 
+def _d_line(d: dict, tr: Trade, rules: DayTradeRules) -> str:
+    ok = lambda v: "✅" if v else "·"
+    c = d.get("components") or {}
+    return (f"D rule: trend ✅ · window ✅ ({d.get('eval_at')}) · target +{100 * rules.first_target:.0f}% "
+            f"{tr.entry * (1 + rules.first_target):.2f} · stop -{100 * rules.stop:.0f}% {tr.stop:.2f}\n"
+            f"<i>Diagnostics only: VWAP {d.get('vwap_dist_pct'):+.2f}% {ok(c.get('vwap'))} · EMA slopes "
+            f"{ok(c.get('ema_slope'))} · OR {d.get('or_position')} {ok(c.get('opening_range'))} · SPY/QQQ "
+            f"{ {True: '✅', False: '⚠️', None: '?'}[d.get('market_aligned')]} · spread {d.get('opt_spread_pct')}%</i>")
+
+
 def _qual_line(d: dict) -> str:
     ok = lambda v: "✅" if v else "⚠️"
     c = d.get("components") or {}
@@ -271,14 +295,16 @@ def _qual_line(d: dict) -> str:
 
 
 async def enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], results: dict,
-                issues: dict[str, list[str]], st: dict) -> int:
-    """Strategy C's entry step (A/B use emacross._enter): every cross becomes a candidate with a disposition."""
+                issues: dict[str, list[str]], st: dict, strategy: str = NAME) -> int:
+    """Strategy C's / D's entry step (A/B use emacross._enter): every cross becomes a candidate with a disposition."""
     from . import health
-    rules: DayTradeRules = cfg.daytrade
-    q, tz = rules_of(cfg), cfg.tz
+    from .emacross import rules_for
+    prof = PROFILES[strategy]
+    rules: DayTradeRules = rules_for(cfg, strategy)
+    q, tz = prof["gates"](cfg), cfg.tz
     today = now.astimezone(tz).date()
     now_ms = int(now.timestamp() * 1000)
-    book = _book(store, today)
+    book = _book(store, today, prof["candidates"])
     final: list[dict] = []
     sent = 0
     for sym in rules.symbols:
@@ -315,12 +341,17 @@ async def enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], r
                     reasons.append("DAILY_LOSS_LIMIT")
                 if issues.get(sym):
                     reasons.append("DATA_HEALTH")
-                    health.record(store, now, tz, sym, f"{NAME} entry", issues[sym])
+                    health.record(store, now, tz, sym, f"{strategy} entry", issues[sym])
                 elif "STALE_SIGNAL" not in reasons:
                     c, expiry, opt, why = await _option(client, sym, su, today, now, tz, rules)
                     rec.update(opt)
                     if why:
                         reasons.append(why)
+                    elif prof["spread"] == "health":                     # A's check: spread <= 10% of the mid
+                        bad = health.spread_issue(opt.get("opt_bid"), opt.get("opt_ask"))
+                        if bad:
+                            reasons.append("DATA_HEALTH")
+                            health.record(store, now, tz, sym, f"{strategy} entry", [f"{opt.get('option')}: {bad}"])
                     elif rec.get("opt_spread_pct") is None or rec["opt_spread_pct"] > q.max_spread_pct:
                         reasons.append("OPTION_SPREAD_TOO_WIDE")
             if rec.get("components"):
@@ -331,22 +362,24 @@ async def enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], r
             rec["disposition"] = "TRADE" if trade else "REJECT"
             rec["reasons"] = reasons
             if trade:
-                sent += _open(store, cfg, now, su, c, expiry, rec, results, st)
+                sent += _open(store, cfg, now, su, c, expiry, rec, results, st, strategy)
             else:
                 _skip(st, reasons[0] if reasons else "rejected")
             book["items"][su.key] = rec
             final.append(dict(rec, date=today.isoformat()))
-            log.info("strategy C %s %s %s: %s %s", sym, su.side, rec["cross_close"], rec["disposition"],
-                     ",".join(reasons))
-    store.put(CANDIDATES, book)
+            log.info("strategy %s %s %s %s: %s %s", strategy, sym, su.side, rec["cross_close"],
+                     rec["disposition"], ",".join(reasons))
+    store.put(prof["candidates"], book)
     if final:
-        store.put(CAND_LOG, (store.get(CAND_LOG) or [])[-(CAND_MAX - len(final)):] + final)
+        store.put(prof["log"], (store.get(prof["log"]) or [])[-(CAND_MAX - len(final)):] + final)
     return sent
 
 
-def _open(store, cfg, now: datetime, su: Setup, c: dict, expiry: str, rec: dict, results: dict, st: dict) -> int:
-    """Open the paper trade exactly as A does (ask fill, same size and management)."""
-    rules: DayTradeRules = cfg.daytrade
+def _open(store, cfg, now: datetime, su: Setup, c: dict, expiry: str, rec: dict, results: dict, st: dict,
+          strategy: str = NAME) -> int:
+    """Open the paper trade exactly as A does (ask fill, same size and management; D: its own first target)."""
+    from .emacross import rules_for
+    rules: DayTradeRules = rules_for(cfg, strategy)
     now_ms = int(now.timestamp() * 1000)
     sym = su.symbol
     bid, ask, mid = _quote(c)
@@ -360,27 +393,35 @@ def _open(store, cfg, now: datetime, su: Setup, c: dict, expiry: str, rec: dict,
     delta = abs(((c.get("greeks") or {}).get("delta")) or 0) or None
     tr.info = entry_info(su, tr, rules, now_ms, spot, delta, swing, intra, cfg)
     tr.info.update({f"q_{k}": v for k, v in rec.items() if k not in ("key", "symbol", "side", "status", "price")})
+    if strategy == D:                                   # D's report shows each trade's levels
+        tr.info.update(underlying_entry=su.price, target_price=round(tr.entry * (1 + rules.first_target), 2),
+                       stop_price=tr.stop, first_target_pct=round(100 * rules.first_target))
     st["open"][sym] = asdict(tr)
-    store.enqueue("ema_entry", entry_text(su, tr, rules, cfg.tz, st["losses"].get(sym, 0), NAME) + "\n"
-                  + _qual_line(rec), sym)
+    line = _d_line(rec, tr, rules) if strategy == D else _qual_line(rec)
+    store.enqueue("ema_entry", entry_text(su, tr, rules, cfg.tz, st["losses"].get(sym, 0), strategy) + "\n" + line,
+                  sym)
     try:
         from . import scorecard
-        scorecard.record(store, now.timestamp(), sym, STRATEGIES[NAME]["rule"], su.side, su.price, tr.contract,
+        scorecard.record(store, now.timestamp(), sym, STRATEGIES[strategy]["rule"], su.side, su.price, tr.contract,
                          tr.entry)
     except Exception:
-        log.exception("strategy C scorecard record failed")
+        log.exception("strategy %s scorecard record failed", strategy)
     return 1
 
 
 # ---- report --------------------------------------------------------------------------------------
 
-LABELS = {"retest": "A · Cross + retest", "cross": "B · Cross, no retest", NAME: "C · Cross + retest + qualified"}
+LABELS = {"retest": "A · Cross + retest", "cross": "B · Cross, no retest", NAME: "C · Cross + retest + qualified",
+          D: "D · Trend + time + 50/20"}
+D_EXITS = {"stop": "STOP_-20", "trailed": "TRAILING_EXIT", "breakeven": "BREAKEVEN (runners after +50%)",
+           "target": "TARGET (all sold)", "invalidated": "INVALIDATION", "time": "FORCE_CLOSE"}
 
 
-def _row_stats(rows: list[dict], fee: float, contracts: int) -> str:
+def _row_stats(rows: list[dict], fee: float, contracts: int, signals: int | None = None) -> str:
     from .strategies import stats
+    sig = f" · {signals} signal{'s' if signals != 1 else ''}" if signals is not None else ""
     if not rows:
-        return "no trades"
+        return "no trades" + sig
     g, s = stats(rows, 0, contracts), stats(rows, fee, contracts)
     fees = sum(2 * fee * (t.get("qty") or contracts) for t in rows)
     w = sum(t["pnl"] > 0 for t in rows)
@@ -389,7 +430,12 @@ def _row_stats(rows: list[dict], fee: float, contracts: int) -> str:
     loss = _money(s["avg_loss"]) if s["n"] - w else "–"
     return (f"{s['n']} trade{'s' if s['n'] != 1 else ''} · {w}W/{s['n'] - w}L ({s['win']:.0f}%) · gross "
             f"{_money(g['total'])} · fees ${fees:,.0f} · <b>net {_money(s['total'])}</b> · avg win {win} / loss "
-            f"{loss} · PF {pf} · max DD {_money(s['max_dd'])}")
+            f"{loss} · PF {pf} · max DD {_money(s['max_dd'])} · avg/trade {_money(s['expectancy'])} · calls "
+            f"{_money(_net(rows, 'bull', fee, contracts))} / puts {_money(_net(rows, 'bear', fee, contracts))}{sig}")
+
+
+def _net(rows: list[dict], side: str, fee: float, contracts: int) -> float:
+    return sum(t["pnl"] - 2 * fee * (t.get("qty") or contracts) for t in rows if t["side"] == side)
 
 
 def _bucket(rows: list[dict], key, fee: float, contracts: int) -> list[str]:
@@ -430,12 +476,16 @@ def report(store, cfg, day: date) -> str:
     fee, n5 = rules.fee_per_contract, rules.contracts
     ds = day.isoformat()
     log_ = [t for t in store.get(LOG_KEY) or [] if t.get("date") == ds]
-    by = {k: [t for t in log_ if t.get("strategy", "retest") == k] for k in ("retest", "cross", NAME)}
-    lines = [f"🧪 <b>EMA {rules.fast}/{rules.slow} A/B/C comparison</b> (paper) {day:%a %b %d}",
+    by = {k: [t for t in log_ if t.get("strategy", "retest") == k] for k in LABELS}
+    show = [k for k in LABELS if k != D or D in rules.strategies or by[D]]
+    names = "/".join(LABELS[k][0] for k in show)
+    lines = [f"🧪 <b>EMA {rules.fast}/{rules.slow} {names} comparison</b> (paper) {day:%a %b %d}",
              f"<i>Same bars, contracts, bid/ask fills and management; ${fee:.2f}/contract each way. "
-             f"A and B are the controls; C is the experiment.</i>"]
-    for k, label in LABELS.items():
-        lines.append(f"<b>{label}</b>: {_row_stats(by[k], fee, n5)}")
+             f"A and B are the controls; C and D are experiments.</i>"]
+    for k in show:
+        st = store.get(STRATEGIES[k]["key"]) or {}
+        signals = len(st.get("seen") or []) if st.get("date") == ds else None
+        lines.append(f"<b>{LABELS[k]}</b>: {_row_stats(by[k], fee, n5, signals)}")
 
     cands = [c for c in store.get(CAND_LOG) or [] if c.get("date") == ds]
     book = store.get(CANDIDATES) or {}
@@ -520,6 +570,8 @@ def report(store, cfg, day: date) -> str:
     lines.append("<b>Spread cost</b> (mid P&L − bid/ask P&L): " + " · ".join(
         f"{LABELS[k].split(' · ')[0]} ${sum((t.get('pnl_mid') or t['pnl']) - t['pnl'] for t in by[k]):,.0f} "
         f"(avg entry spread {_avg([t.get('entry_spread_pct') for t in by[k]], False)}%)" for k in LABELS if by[k]))
+    if D in show:
+        lines += _d_section(store, cfg, day, by[D])
     lines.append("<i>One day of evidence: decide KEEP / MODIFY / DISCARD / PROMOTE only after review.</i>")
     return "\n".join(lines)
 
@@ -529,3 +581,44 @@ def _count(xs) -> dict[str, int]:
     for x in xs:
         out[x] = out.get(x, 0) + 1
     return out
+
+
+def _d_section(store, cfg, day: date, rows: list[dict]) -> list[str]:
+    """Strategy D: funnel and rejections, exit-reason counts, and every trade with its levels and diagnostics."""
+    from .emacross import rules_for
+    rules = rules_for(cfg, D)
+    fee, n5, ds = rules.fee_per_contract, rules.contracts, day.isoformat()
+    cands = [c for c in store.get(PROFILES[D]["log"]) or [] if c.get("date") == ds]
+    rej = [c for c in cands if c["disposition"] == "REJECT"]
+    lines = ["", f"<b>Strategy D</b> (EMA 9/21 D — Trend + Time + 50/20): {len(cands)} EMA crosses · "
+                 f"{sum(c['disposition'] == 'TRADE' for c in cands)} traded · {len(rej)} rejected"]
+    if rej:
+        lines.append("D rejections (first reason): " + " · ".join(
+            f"{k} {v}" for k, v in sorted(_count(c["reasons"][0] for c in rej).items(), key=lambda x: -x[1])))
+    if not rows:
+        lines.append("<i>No D trade today: a valid outcome (about one a week in the backtest).</i>")
+        return lines
+    ex = _count(D_EXITS.get(t["exit_reason"], "OTHER") for t in rows)
+    hit = sum((t.get("mfe_pct") or 0) >= (t.get("first_target_pct") or 100 * rules.first_target) for t in rows)
+    lines.append(f"D exits: first target +{100 * rules.first_target:.0f}% reached {hit} · " + " · ".join(
+        f"{k} {ex.get(k, 0)}" for k in ("STOP_-20", "TRAILING_EXIT", "BREAKEVEN (runners after +50%)",
+                                        "TARGET (all sold)", "INVALIDATION", "FORCE_CLOSE", "OTHER")))
+    for t in rows:
+        qty = t.get("qty") or n5
+        fees = 2 * fee * qty
+        exit_avg = t["entry"] + t["pnl"] / (100 * qty)
+        under = t.get("underlying_entry")
+        lines.append(
+            f"{'🟢 CALL' if t['side'] == 'bull' else '🔴 PUT'} {t['symbol']} in {t['in']} (stock {under:.2f}) · "
+            f"{t.get('ticker') or t['contract']} at {t['entry']:.2f} · target {t.get('target_price') or 0:.2f} · "
+            f"stop {t.get('stop_price') or 0:.2f} → out {t['out']} avg exit {exit_avg:.2f} · {t['exit_reason']} · "
+            f"gross {_money(t['pnl'])} · fees ${fees:.2f} · net {_money(t['pnl'] - fees)}"
+            if under is not None else f"{t['symbol']} {t['in']} {t['contract']} {t['exit_reason']} {_money(t['pnl'])}")
+        c = t.get("q_components") or {}
+        lines.append(
+            f"   regime {t.get('q_regime')} · window {_hour_bucket(t.get('q_entry_close'))} · EMA9 {t.get('q_ema9')} / "
+            f"EMA21 {t.get('q_ema21')} · retest {t.get('q_retest_at')} · option MFE {t.get('mfe_pct', 0):+.0f}% / "
+            f"MAE {t.get('mae_pct', 0):+.0f}% · <i>diagnostics: VWAP {'with' if c.get('vwap') else 'against'}, "
+            f"OR {t.get('q_or_position')}, slopes {'aligned' if c.get('ema_slope') else 'not'}, SPY/QQQ "
+            f"{ {True: 'aligned', False: 'conflict', None: 'unknown'}[t.get('q_market_aligned')]}</i>")
+    return lines

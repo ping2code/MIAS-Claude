@@ -34,7 +34,7 @@ DEDUPE_S = 30 * 60
 OPTION_FRESH_S = 30 * 60      # an option value is only taken this close to the horizon (it can't be looked up later)
 NAMES = {"pullback_entry": "Pullback entry", "strong_alignment": "Strong alignment", "trend_change": "Trend change",
          "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA day trade (retest)",
-         "ema_cross_entry": "EMA day trade (cross)", "ema_qual_entry": "EMA day trade (qualified, experimental)",
+         "ema_cross_entry": "EMA day trade (cross)", "ema_qual_entry": "EMA day trade (qualified, experimental)", "ema_d_entry": "EMA day trade (D, experimental)",
          "flow": "One-sided flow", "flow_confirmed": "Flow, price confirms",
          "flow_unconfirmed": "Flow, price disagrees", "flow_opened": "Flow confirmed by OI"}
 
