@@ -158,7 +158,7 @@ class Service:
                     self.store.enqueue("system", held)
                 if local.weekday() == 4:
                     from . import scorecard, strategies
-                    self.store.enqueue("scorecard", scorecard.report(self.store, now, 7))
+                    self.store.enqueue("scorecard", scorecard.report(self.store, now, 7, tz=self.cfg.tz))
                     self.store.enqueue("strategies", strategies.report(self.store, self.cfg, now, 7))
                 sent.append("close")
         self.store.put(f"digests:{today}", sent)

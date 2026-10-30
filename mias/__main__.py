@@ -5,7 +5,7 @@
   python -m mias rank [--top 20]     rank candidate symbols by options activity
   python -m mias screen [--top 30]   best underlyings for options trading (liquidity, spreads, movement, IV)
   python -m mias telegram-test       send a test message
-  python -m mias scorecard [--days 7] [--backfill] [--replay]
+  python -m mias scorecard [--days 7] [--backfill] [--replay | --live] [--full]
                                      how the alerts did; --backfill replays the recorded checks into the card
   python -m mias pullback-backtest [--symbols NVDA,AMD] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
                                      swing entries (pullback vs strong vs trend) on real option prices
@@ -63,7 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     sc = sub.add_parser("scorecard")
     sc.add_argument("--days", type=int, default=7)
     sc.add_argument("--backfill", action="store_true", help="replay recorded checks through the tiered rules")
-    sc.add_argument("--replay", action="store_true", help="show the replayed history instead of live alerts")
+    sc.add_argument("--replay", action="store_true", help="show only the replayed history (default: live and replayed)")
+    sc.add_argument("--live", action="store_true", help="show only live alerts")
+    sc.add_argument("--full", action="store_true", help="every horizon, intervals and 1h SPY-day splits")
     pb = sub.add_parser("pullback-backtest")
     pb.add_argument("--symbols", help="comma-separated (default: the watchlist without index instruments)")
     pb.add_argument("--start", help="first day (default: two years back)")
@@ -149,8 +151,9 @@ def main(argv: list[str] | None = None) -> int:
         store = Store(cfg.db_path)
         if args.backfill:
             print(f"replayed {scorecard.backfill(store, cfg)} alerts")
-        print(strip_html(scorecard.report(store, datetime.now(timezone.utc), 3650 if args.replay else args.days,
-                                          source="replay" if args.replay else "live")))
+        source = "replay" if args.replay else "live" if args.live else "both"
+        print(strip_html(scorecard.report(store, datetime.now(timezone.utc), args.days, source=source,
+                                          full=args.full, tz=cfg.tz)))
         store.close()
     elif args.cmd == "pullback-backtest":
         return asyncio.run(_pullback_backtest(cfg, args))

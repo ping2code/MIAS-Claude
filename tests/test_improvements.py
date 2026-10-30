@@ -49,8 +49,8 @@ def test_scorecard_records_and_scores_from_history(tmp_path):
     asyncio.run(scorecard.update(Client(), store, ET, now))
     st = scorecard.stats(store, t0 - 1)["pullback_entry"]
     assert st["n"] == 1 and st["1h"] == [1.0] and st["1d"] == [-1.0] and st["5d"] == [4.0]
-    text = scorecard.report(store, now, 30)
-    assert "Pullback entry" in text and "1h 100% right" in text and "1d 0% right" in text
+    text = scorecard.report(store, now, 30, full=True)
+    assert "Pullback entry" in text and "1h bull: 100% right" in text and "1d bull: 0% right" in text
 
 
 def test_scorecard_due_times_cap_the_hour_at_the_close():
@@ -227,8 +227,8 @@ def test_scorecard_short_horizons_need_a_nearby_check(tmp_path):
     asyncio.run(scorecard.update(None, store, ET, datetime.fromtimestamp(t0 + 7200, timezone.utc)))
     st = scorecard.stats(store, t0 - 1)["flow_confirmed"]
     assert st["15m"] == [-0.5] and st["30m"] == [1.0] and st["1h"] == []      # no check within 20 min of 12:00
-    text = scorecard.report(store, datetime.fromtimestamp(t0 + 7200, timezone.utc), 7)
-    assert "Flow, price confirms" in text and "15m 0% right" in text and "30m 100% right" in text
+    text = scorecard.report(store, datetime.fromtimestamp(t0 + 7200, timezone.utc), 7, full=True)
+    assert "Flow, price confirms" in text and "15m bear: 0% right" in text and "30m bear: 100% right" in text
 
 
 # ---- pre-market ----------------------------------------------------------------------------------

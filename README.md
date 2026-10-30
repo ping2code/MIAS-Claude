@@ -20,7 +20,7 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | `/buy AMZN 11/20 260/280C 6.63 x1` | Track a position (private chat only; first strike = the one you bought; add `by 10/30` for your own exit date). Single options too: `/buy NVDA 12/18 190C 9.85` |
 | `/positions`, `/sell AMZN 13.40` | Your positions with live value and P&L; close one (by symbol or `#`, no price = current mid) |
 | `/brief` | The day-trade brief (also sent at 09:45): opening read, trend or chop day, candidates, key levels |
-| `/scorecard`, `/scorecard 30`, `/scorecard replay` | How the alerts did: share that went the right way 1 hour, 1 day and 5 days later, and the option's return |
+| `/scorecard`, `/scorecard 30`, `/scorecard replay`, `/scorecard full` | How the alerts did: right %, raw and SPY-relative moves, bull / bear, live vs replayed, trading-day coverage and evidence, option returns |
 | `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META, MSFT): where the EMAs are, the last cross and what became of it, today's paper trades for both strategies |
 | `/strategies`, `/strategies 30` | Each paper strategy's own record: trades, win rate, average win and loss, expectancy after costs, drawdown; signals held by the health gate |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
@@ -191,7 +191,24 @@ EMA entries, one-sided flow split by whether price confirmed it, flow confirmed 
 minutes, 30 minutes and 1 hour later (capped at the close), 1 trading day and 5 trading days later: did the stock move the alert's way, and what did the named contract return.
 `/scorecard` (7 days), `/scorecard 30`, every Friday at the close, and `python -m mias scorecard`.
 `python -m mias scorecard --backfill` replays the recorded checks through today's rules; `/scorecard replay`
-shows that history.
+shows only that history. `/scorecard full` (`--full`) adds every horizon, intervals and 1h SPY-day splits.
+
+The report measures; it never feeds an alert, a threshold or a strategy. For each rule, live alerts (last N days)
+and replayed alerts (all replayed history, stock moves only) are shown side by side, never merged, since they cover
+overlapping days. Each is split into bullish, bearish and all, per horizon:
+
+- **Raw** = `sign × (P1/P0 − 1)`, the direction-adjusted stock move (sign +1 bullish, −1 bearish). Right = raw > 0.
+- **vs SPY** = `sign × ((P1/P0 − 1) − (SPY1/SPY0 − 1))`, the direction-adjusted excess over SPY in the same window
+  (a bearish alert scores when the stock lags SPY). SPY prices are the first recorded check at or after each time,
+  the same lookup as the stock. Alerts on SPY show "N/A — benchmark is SPY".
+- **Days, evidence**: alerts and distinct trading days. Evidence (from alerts with a 1-day result): under 5 days
+  VERY LIMITED, 5–9 LIMITED, 10–19 EARLY, 20+ DEVELOPING; under 10 alerts drops one step. No result is "validated".
+- **Concentration**: median and maximum alerts per day, share from the top day and the top 3 days.
+- **SPY day**: UP / DOWN when SPY's close-to-close change (last check by 16:00) is beyond ±0.25%, else FLAT (fixed,
+  not tuned); the alert's own day is used.
+- **Intervals**: 95% for right % and mean excess, mean ± t(days−1) × standard error clustered by trading day;
+  "insufficient sample" under 10 alerts or 5 days.
+- **Option** returns of the named contract stay on their own line, never blended into the stock score.
 
 ## Pre-market heads-up
 

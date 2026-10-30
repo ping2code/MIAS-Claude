@@ -68,7 +68,7 @@ Shortcut: just send <code>NVDA</code> or <code>nvda mu</code>
 /sector: which sector is strongest (also in every digest); /sector energy for its members
 /picks: today's call and put spread picks (also sent automatically at 10:00 ET)
 /premarket: the 07:00 pre-market heads-up now (sectors, gappers, earnings) · /brief: the 09:45 day-trade brief again (candidates, key levels) · /scorecard: how the alerts did
-(/scorecard 30 for 30 days, /scorecard replay for the replayed history)
+(/scorecard 30 for 30 days, /scorecard replay for the replayed history only, /scorecard full for every horizon)
 /strategies: each paper strategy's own record (win rate, expectancy after costs, drawdown); /strategies 30 for 30 days
 /ema: 5-minute EMA 9/21 cross-and-retest watch (SPY, QQQ, NVDA, TSLA, META, MSFT) and today's paper trades (entries also alert the group)
 /list: watched symbols · /status: health · /whoami: your IDs
@@ -202,11 +202,11 @@ class CommandBot:
         elif cmd == "scorecard":
             from . import scorecard
             now = datetime.now(timezone.utc)
-            if args and args[0].lower() == "replay":
-                await self.reply(scorecard.report(self.svc.store, now, 3650, source="replay"))
-            else:
-                days = int(args[0]) if args and args[0].isdigit() else 7
-                await self.reply(scorecard.report(self.svc.store, now, max(1, min(days, 365))))
+            words = [a.lower() for a in args]
+            days = next((int(a) for a in words if a.isdigit()), 7)
+            await self.reply(scorecard.report(self.svc.store, now, max(1, min(days, 365)),
+                                              source="replay" if "replay" in words else "both",
+                                              full="full" in words, tz=self.svc.cfg.tz))
         elif cmd == "strategies":
             from . import strategies
             days = int(args[0]) if args and args[0].isdigit() else 7
