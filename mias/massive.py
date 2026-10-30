@@ -130,15 +130,17 @@ class MassiveClient:
         return None
 
     async def option_chain(self, symbol: str, *, spot: float, today: date, max_dte: int, strike_pct: float,
-                           max_pages: int) -> tuple[list[dict], bool]:
+                           max_pages: int, min_dte: int = 0, contract_type: str | None = None) -> tuple[list[dict], bool]:
         from datetime import timedelta
         params = {
             "limit": 250,
-            "expiration_date.gte": today.isoformat(),
+            "expiration_date.gte": (today + timedelta(days=min_dte)).isoformat(),
             "expiration_date.lte": (today + timedelta(days=max_dte)).isoformat(),
             "strike_price.gte": f"{spot * (1 - strike_pct):.2f}",
             "strike_price.lte": f"{spot * (1 + strike_pct):.2f}",
         }
+        if contract_type:
+            params["contract_type"] = contract_type
         return await self.paginate(f"/v3/snapshot/options/{symbol}", params, max_pages)
 
 

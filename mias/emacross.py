@@ -308,8 +308,11 @@ class Trade:
             n = min(rules.partial, self.open_qty)
             self._sell(n, target)
             self.partial_done, self.stop = True, self.entry
-            events.append(("partial", f"sold {n} at {target:.2f} (+{100 * rules.first_target:.0f}%), "
-                                      f"runner stop to breakeven {self.entry:.2f}"))
+            if self.open_qty == 0:                          # all-out strategies (E7/E21): nothing left to run
+                events.append(("target", f"sold all {n} at {target:.2f} (+{100 * rules.first_target:.0f}%)"))
+            else:
+                events.append(("partial", f"sold {n} at {target:.2f} (+{100 * rules.first_target:.0f}%), "
+                                          f"runner stop to breakeven {self.entry:.2f}"))
         self.peak = max(self.peak, h)
         for reach, lock in rules.trail:
             if self.partial_done and self.peak >= self.entry * (1 + reach):
@@ -559,6 +562,8 @@ KEY = "ema_day"
 #              (mias/qualify.py: its own entry step and candidate log; same management)
 #   ema_9_21_d: EXPERIMENTAL Strategy D, the backtested "A + trend + time windows" rule with a +50% first target
 #              (mias/qualify.py D_GATES; "rules" overrides DayTradeRules for this strategy only)
+#   ema_9_21_e7 / ema_9_21_e21: EXPERIMENTAL, D's entry with a 7DTE / 21DTE ~0.50-delta contract and one all-out
+#              exit at +25% / +30% (mias/dte.py; "all_out": every contract sold at the target, no trail)
 STRATEGIES = {
     "retest": {"key": KEY, "retest": True, "title": "CROSS + RETEST", "short": "EMA retest", "rule": "ema_entry"},
     "cross": {"key": "ema_cross_day", "retest": False, "title": "CROSS (no retest)", "short": "EMA cross",
@@ -567,6 +572,10 @@ STRATEGIES = {
                   "rule": "ema_qual_entry", "qualify": True},
     "ema_9_21_d": {"key": "ema_d_day", "retest": True, "title": "D · TREND + TIME + 50/20", "short": "EMA D",
                    "rule": "ema_d_entry", "qualify": True, "rules": {"first_target": 0.50}},
+    "ema_9_21_e7": {"key": "ema_e7_day", "retest": True, "title": "E7 · 7DTE 25/20 ALL-OUT", "short": "E7 PAPER",
+                    "rule": "ema_e7_entry", "qualify": True, "rules": {"first_target": 0.25}, "all_out": True},
+    "ema_9_21_e21": {"key": "ema_e21_day", "retest": True, "title": "E21 · 21DTE 30/20 ALL-OUT", "short": "E21 PAPER",
+                     "rule": "ema_e21_entry", "qualify": True, "rules": {"first_target": 0.30}, "all_out": True},
 }
 
 
@@ -576,7 +585,10 @@ def rules_for(cfg, strategy: str) -> DayTradeRules:
     if not over:
         return cfg.daytrade
     from dataclasses import replace
-    return replace(cfg.daytrade, **over)
+    rules = replace(cfg.daytrade, **over)
+    if STRATEGIES[strategy].get("all_out"):
+        rules = replace(rules, partial=rules.contracts, trail=())
+    return rules
 
 
 def _state(store, today: date, strategy: str = "retest") -> dict:
@@ -816,7 +828,26 @@ async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]], re
             store.put(STRATEGIES[strategy]["key"], st)
             done.append(st["summary"])
         sent += _compare(store, cfg, today, done)
+        sent += _e_report(store, cfg, now, today, five, done)
     return sent
+
+
+def _e_report(store, cfg, now: datetime, today: date, five: dict[str, list[Bar]], done: list[bool]) -> int:
+    """E7/E21 only: resolve the 10-minute confirmation diagnostics, and once a day after every closing summary,
+    their own report (the A/B/C/D comparison is not touched)."""
+    from . import dte
+    if not any(s in dte.PLANS for s in cfg.daytrade.strategies):
+        return 0
+    try:
+        dte.track(store, cfg, now, five)
+        key = f"ema_e_report:{today}"
+        if all(done) and not store.get(key):
+            store.put(key, True)
+            store.enqueue("ema_summary", dte.report(store, cfg, today))
+            return 1
+    except Exception:
+        log.exception("E7/E21 diagnostics or report failed")
+    return 0
 
 
 def _compare(store, cfg, today: date, done: list[bool]) -> int:

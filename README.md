@@ -494,6 +494,38 @@ trades, +$142/trade, PF 1.78; Oct 2025–Oct 2026 55 trades, +$61/trade, PF 1.37
 not proven. The after-close comparison report (`python -m mias ema-compare`) adds D's signals, trades, exits by
 reason, and each trade's entry, contract, target, stop, exit and net P&L.
 
+## Strategies E7 / E21: D's entry, fixed-DTE ~0.50 delta, all-out (experimental, live paper)
+
+`ema_9_21_e7` and `ema_9_21_e21` in `[daytrade] strategies` (off unless listed), on the local experiment branch only
+(`mias/dte.py`). Both take **the same Strategy D signal** (D's gates exactly, entered at once: no delay, no extra
+filter) and are separate paper strategies with their own state (`ema_e7_day`, `ema_e21_day`), loss counters,
+records (`ema_log` rows tagged with their name), alerts and candidate logs (`ema_e7_candidates`/`ema_e7_log`,
+`ema_e21_candidates`/`ema_e21_log`). D, A, B and C are untouched.
+
+| | Expiry | Contract | Target | Stop | Exit |
+|---|---|---|---|---|---|
+| **E7** | listed expiry closest to 7 calendar days (±3) | \|delta\| closest to 0.50 in 0.45–0.55 | +25% | −20% | sell all |
+| **E21** | listed expiry closest to 21 calendar days (±3) | same | +30% | −20% | sell all |
+
+Contract: of the 8 strikes nearest the stock, the snapshot delta closest to 0.50 (Black-Scholes from the mid when the
+snapshot has none); ties go to the tighter spread, then the lower strike; nothing in range is rejected as
+`NO_DELTA_MATCH`, never substituted. Health checks as D (two-sided, fresh, spread ≤ 10%); the premium is not a gate,
+and the alert shows capital and the −20% risk per contract. Exits, checked in this order on every re-price: 15:10
+force close, a 5-minute close through the invalidation level, the stop (midpoint at or below entry −20%), the target
+(midpoint at or above +25% / +30%). Bought at the ask; every exit sold at the bid (a target never above its price).
+No partials, runners, breakeven or trailing. One trade at a time per symbol; two losses in a row end that symbol's
+day, per strategy.
+
+**10-minute close confirmation, diagnostic only.** After the two 5-minute candles that follow the entry candle,
+PASS when the second closed ≥ 0.10% the trade's way from the signal price, otherwise FAIL (NOT_AVAILABLE when the
+candle never comes). Stored per signal (`ema_e_diag`), with whether each strategy had already exited. No entry,
+exit, stop, target or size reads it.
+
+After the close, an **E7 / E21 report** of its own: unique D signals and what each strategy did with them (valid,
+no contract, no delta match), both / only-E7 / only-E21, each strategy's results with per-contract economics, every
+trade, the same-signal pairs and the PASS/FAIL split. One D signal traded by both is **one signal and two
+correlated observations**, never two independent trades.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

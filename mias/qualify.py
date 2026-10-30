@@ -23,6 +23,7 @@ from datetime import date, datetime, time
 
 from .emacross import (FIVE, LOG_KEY, MAX_SPREAD_PCT, STRATEGIES, DayTradeRules, Setup, Trade, _at, _chain, _et, _mid,
                        _money, _quote, _skip, _spread_pct, entry_info, entry_text, pick_expiry, regime, scan)
+from .dte import E7, E21
 from .indicators import Bar, atr, ema, session_vwap
 
 log = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ MARKET = ("SPY", "QQQ")
 REASONS = ("NO_VALID_RETEST", "STALE_SIGNAL", "INVALID_DATA", "EMA_DIRECTION_MISALIGNED", "REGIME_CHOP",
            "VWAP_MISALIGNED", "EMA_SLOPE_MISALIGNED", "EMA_SEPARATION_WEAK", "OPENING_RANGE_UNAVAILABLE",
            "OPENING_RANGE_MISALIGNED", "OUTSIDE_TRADING_WINDOW", "WHIPSAW_COOLDOWN", "MARKET_CONFLICT", "IN_TRADE",
-           "DAILY_LOSS_LIMIT", "DATA_HEALTH", "NO_CONTRACT", "OPTION_SPREAD_TOO_WIDE")
+           "DAILY_LOSS_LIMIT", "DATA_HEALTH", "NO_CONTRACT", "OPTION_SPREAD_TOO_WIDE", "NO_DELTA_MATCH")
 
 
 @dataclass(frozen=True)
@@ -71,6 +72,11 @@ D_GATES = QualRules(require_vwap=False, require_slope=False, require_or=False, w
 PROFILES = {
     NAME: {"candidates": CANDIDATES, "log": CAND_LOG, "gates": rules_of, "spread": "max_spread_pct"},
     D: {"candidates": "ema_d_candidates", "log": "ema_d_log", "gates": lambda cfg: D_GATES, "spread": "health"},
+    # E7 / E21 (mias/dte.py): D's gates exactly, their own fixed-DTE ~0.50-delta contract choice ("plan")
+    E7: {"candidates": "ema_e7_candidates", "log": "ema_e7_log", "gates": lambda cfg: D_GATES, "spread": "health",
+         "plan": True},
+    E21: {"candidates": "ema_e21_candidates", "log": "ema_e21_log", "gates": lambda cfg: D_GATES, "spread": "health",
+          "plan": True},
 }
 
 
@@ -342,6 +348,17 @@ async def enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], r
                 if issues.get(sym):
                     reasons.append("DATA_HEALTH")
                     health.record(store, now, tz, sym, f"{strategy} entry", issues[sym])
+                elif "STALE_SIGNAL" not in reasons and prof.get("plan"):
+                    from . import dte
+                    c, expiry, opt, why = await dte.option(client, sym, su, today, now, tz, strategy)
+                    rec.update(opt)
+                    if why:
+                        reasons.append(why)
+                    else:
+                        bad = health.spread_issue(opt.get("opt_bid"), opt.get("opt_ask"))
+                        if bad:
+                            reasons.append("DATA_HEALTH")
+                            health.record(store, now, tz, sym, f"{strategy} entry", [f"{opt.get('option')}: {bad}"])
                 elif "STALE_SIGNAL" not in reasons:
                     c, expiry, opt, why = await _option(client, sym, su, today, now, tz, rules)
                     rec.update(opt)
@@ -396,6 +413,14 @@ def _open(store, cfg, now: datetime, su: Setup, c: dict, expiry: str, rec: dict,
     if strategy == D:                                   # D's report shows each trade's levels
         tr.info.update(underlying_entry=su.price, target_price=round(tr.entry * (1 + rules.first_target), 2),
                        stop_price=tr.stop, first_target_pct=round(100 * rules.first_target))
+    if PROFILES[strategy].get("plan"):                  # E7 / E21: own levels, alert and diagnostic; no scorecard
+        from . import dte
+        tr.info.update(dte.levels(su, tr, rules, rec, strategy, cfg.tz))
+        st["open"][sym] = asdict(tr)
+        dte.register(store, su, cfg.tz)
+        store.enqueue("ema_entry", dte.entry_text(su, tr, rules, rec, cfg.tz, st["losses"].get(sym, 0), strategy,
+                                                  now_ms), sym)
+        return 1
     st["open"][sym] = asdict(tr)
     line = _d_line(rec, tr, rules) if strategy == D else _qual_line(rec)
     store.enqueue("ema_entry", entry_text(su, tr, rules, cfg.tz, st["losses"].get(sym, 0), strategy) + "\n" + line,
