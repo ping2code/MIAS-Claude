@@ -481,6 +481,12 @@ class Service:
             return 0
         from . import closeplay
         sent = await closeplay.manage(self.client, self.store, self.cfg, now)     # the 15:59 exit
+        if self.cfg.ema_simple_enabled:
+            try:
+                from . import simple
+                sent += await simple.manage(self.client, self.store, self.cfg, now)    # target / stop / 15:10
+            except Exception:
+                log.exception("EMA simple watch failed")
         if sent:
             await self.dispatcher.flush()
         day = str(now.astimezone(self.cfg.tz).date())

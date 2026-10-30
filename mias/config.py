@@ -166,6 +166,7 @@ class Config:
     telegram_allowed_users: list[str] = field(repr=False, default_factory=list)
     telegram_allowed_chats: list[str] = field(repr=False, default_factory=list)
     ema_qualified: "QualRules | None" = None   # [ema_qualified]: Strategy C's gates (experimental; mias/qualify.py)
+    ema_simple_enabled: bool = False     # [ema_simple]: EMA 9/21 Simple on SPY/QQQ/IWM (experimental paper; mias/simple.py)
 
 
 def load_dotenv(path: Path) -> None:
@@ -373,6 +374,7 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         options_confirm_cycles=max(1, int(al.get("options_confirm_cycles", al.get("confirm_cycles", 2)))),
         daytrade=_daytrade(raw.get("daytrade", {})),
         ema_qualified=_qualified(raw.get("ema_qualified", {})),
+        ema_simple_enabled=bool(raw.get("ema_simple", {}).get("enabled", False)),
         brief_enabled=bool(raw.get("brief", {}).get("enabled", True)),
         brief_time=raw.get("brief", {}).get("time", "09:45"),
         premarket_enabled=bool(raw.get("premarket", {}).get("enabled", True)),

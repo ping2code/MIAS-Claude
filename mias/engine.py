@@ -78,6 +78,12 @@ class Engine:
                     await emacross.live(self.client, self.store, self.cfg, now, self.five, by_sym, issues)
                 except Exception:
                     log.exception("EMA day-trade check failed")
+            if self.cfg.ema_simple_enabled:
+                try:                                      # experimental paper strategy, isolated from A-E21
+                    from . import simple
+                    await simple.live(self.client, self.store, self.cfg, now, self.five)
+                except Exception:
+                    log.exception("EMA simple check failed")
             if self.cfg.closeplay_enabled:
                 try:
                     sym = self.cfg.closeplay_symbol
@@ -253,7 +259,7 @@ class Engine:
         five = hist[1] + today5
         days = list(daily[1])
         today_bar = _session_bar(today5, cfg.tz, available_until)
-        if sym in cfg.daytrade.symbols:
+        if sym in cfg.daytrade.symbols or (cfg.ema_simple_enabled and sym in ("SPY", "QQQ", "IWM")):
             from .trend import complete_bars, regular_session, to_bars
             self.five[sym] = complete_bars(regular_session(to_bars(five), cfg.tz), 5, available_until)
         if today_bar:

@@ -223,6 +223,14 @@ fee_per_contract = 0.65    # commission per contract per side, taken off in the 
 # result is shown alongside. Every closed trade is logged with MFE/MAE, stop distances, spread, fill delay and the
 # trend at entry: python -m mias ema-log
 
+[ema_simple]
+# EXPERIMENTAL "EMA 9/21 Simple — SPY / QQQ / IWM" (mias/simple.py), paper only, a frozen benchmark: a completed
+# 5-minute candle whose EMA 9/21 state changed (no retest, trend, VWAP or any other gate), the first two such signals
+# per symbol per day (each symbol counted separately), ATM call / put on the 0DTE (next expiry from 13:00), 5 contracts
+# bought at the ask, all sold at the bid at +25% or -20% (judged on the mid) or at 15:10. Its own state, log and
+# alerts; A-E21 are untouched. Trades only SPY, QQQ, IWM (their 5-minute bars are fetched whenever this is on).
+enabled = true
+
 [ema_qualified]
 # EXPERIMENTAL Strategy C (mias/qualify.py), test-only, paper: the retest setup (A) traded only when it qualifies.
 # Runs when "qualified" is in [daytrade] strategies; A and B are untouched controls. Every cross is logged as

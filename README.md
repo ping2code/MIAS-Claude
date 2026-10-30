@@ -526,6 +526,25 @@ no contract, no delta match), both / only-E7 / only-E21, each strategy's results
 trade, the same-signal pairs and the PASS/FAIL split. One D signal traded by both is **one signal and two
 correlated observations**, never two independent trades.
 
+## EMA 9/21 Simple — SPY / QQQ / IWM (experimental, live paper)
+
+`[ema_simple] enabled = true` (off by default), on the local experiment branch only (`mias/simple.py`,
+`ema_9_21_simple_index`). A frozen benchmark for one question: does the plain EMA 9/21 cross have an options edge on
+the index ETFs? It is **not** one of the `[daytrade] strategies`: its own module, state (`ema_simple_day`), trade log
+(`ema_simple_log`), alerts (`EMA SIMPLE — PAPER`) and closing summary; A–E21 never see it.
+
+- **Signal:** a completed regular-session 5-minute candle whose EMA 9 / EMA 21 state changed from the previous
+  completed candle (bullish: prev EMA9 ≤ EMA21, now EMA9 > EMA21; bearish: prev ≥, now <). EMAs are
+  `mias.indicators.ema` on the candle closes, earlier days included. Intrabar crosses never count. No retest, trend,
+  VWAP, opening range, slope, whipsaw, market alignment, confirmation or any other gate.
+- **Daily limit, per symbol:** the first two signals that close by 15:00 are traded, each as its own position (trade
+  #2 may open while #1 is still open); the third and later are ignored. SPY, QQQ and IWM count separately; the count
+  resets each day.
+- **Contract:** ATM call (bullish) / put (bearish), the strike nearest the signal close (the lower on a tie), on the
+  0DTE expiry, the next expiry from 13:00 (as D). Bought at the ask, 5 contracts; a two-sided, fresh quote is needed.
+- **Exit:** sell all at the bid when the mid reaches +25% (never above the target price) or −20%, or at 15:10. No
+  partials, runners, breakeven, trail, chart invalidation or loss limit.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market
