@@ -7,6 +7,8 @@
   python -m mias telegram-test       send a test message
   python -m mias scorecard [--days 7] [--backfill] [--replay | --live] [--full]
                                      how the alerts did; --backfill replays the recorded checks into the card
+  python -m mias paper-scorecard [--full]
+                                     every paper strategy's forward record vs its backtest (report only)
   python -m mias pullback-backtest [--symbols NVDA,AMD] [--start YYYY-MM-DD] [--end YYYY-MM-DD]
                                      swing entries (pullback vs strong vs trend) on real option prices
   python -m mias daytrade-backtest [--setups ema,orb,vwap_reclaim,vwap_reject,pdhl] [--minutes 2,3,5]
@@ -60,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     el.add_argument("--csv", default="data/ema_log.csv")
     cmp_ = sub.add_parser("ema-compare", help="EMA strategies A/B/C side by side for a day (Strategy C funnel)")
     cmp_.add_argument("--date", help="YYYY-MM-DD (default today, ET)")
+    ps = sub.add_parser("paper-scorecard", help="paper strategies' forward record (report only)")
+    ps.add_argument("--full", action="store_true", help="daily / weekly, symbols, outliers, exits, diagnostics")
     sc = sub.add_parser("scorecard")
     sc.add_argument("--days", type=int, default=7)
     sc.add_argument("--backfill", action="store_true", help="replay recorded checks through the tiered rules")
@@ -154,6 +158,12 @@ def main(argv: list[str] | None = None) -> int:
         source = "replay" if args.replay else "live" if args.live else "both"
         print(strip_html(scorecard.report(store, datetime.now(timezone.utc), args.days, source=source,
                                           full=args.full, tz=cfg.tz)))
+        store.close()
+    elif args.cmd == "paper-scorecard":
+        from . import paperscore
+        from .store import Store
+        store = Store(cfg.db_path)
+        print(strip_html(paperscore.report(store, cfg, full=args.full)))
         store.close()
     elif args.cmd == "pullback-backtest":
         return asyncio.run(_pullback_backtest(cfg, args))

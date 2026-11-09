@@ -212,7 +212,11 @@ manage_seconds = 30        # open paper trades are re-priced this often between 
 swing_filter = false       # true: skip entries against the swing trend (see the backtest's swing split first)
 # Two paper strategies on the same crosses, each with its own record, alerts and closing summary:
 # retest = cross, pullback into the EMAs, confirmation candle; cross = enter at the crossing candle's close.
-strategies = ["retest", "cross", "qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21"]
+# 2026-11-09: "retest" (Strategy A) RETIRED from active paper trading by removing it from this list. It failed the
+# 4-year backtest (8,932 trades, -$365,800) and forward paper (73 trades, -$9,428 net). Its code (emacross
+# STRATEGIES["retest"], scan(retest=True)) and its logged trades are kept, so its results stay reproducible and
+# reportable (python -m mias paper-scorecard, /strategies). Re-adding "retest" here would run it again.
+strategies = ["cross", "qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21"]
 # "qualified" = EXPERIMENTAL Strategy C ([ema_qualified]); "ema_9_21_d" = EXPERIMENTAL Strategy D: the backtested
 # "A + trend + time windows" rule with a +50% first target and the -20% stop, fixed in code (mias/qualify.py D_GATES).
 # "ema_9_21_e7" / "ema_9_21_e21" = EXPERIMENTAL E7 / E21: D's signal with a 7DTE / 21DTE ~0.50-delta contract,

@@ -319,7 +319,9 @@ def test_strategy_report_separates_strategies(tmp_path, monkeypatch):
     store.put(emacross.LOG_KEY, log)
     store.put("health:2026-10-27", {"BAC": {"stock": 2}})
     text = strategies.report(store, cfg, _dt(2026, 10, 27, 21, 0, tzinfo=_tz.utc))
-    retest, cross = text.split("cross + retest")[1].split("cross (no retest)")
+    blocks = {b.split("</b>")[0]: b for b in text.split("<b>EMA 9/21 ")[1:]}        # order follows the config
+    retest = blocks["cross + retest"]
+    cross = blocks["cross (no retest)"]
     assert "2 trades" in retest and "win 50%" in retest and "expectancy +$44/trade" in retest  # (193.5-106.5)/2
     assert "1 trade ·" in cross and "-$56" in cross
     assert "Health gate held 2 signals" in text

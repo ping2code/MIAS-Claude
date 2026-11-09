@@ -23,6 +23,7 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | `/scorecard`, `/scorecard 30`, `/scorecard replay`, `/scorecard full` | How the alerts did: right %, raw and SPY-relative moves, bull / bear, live vs replayed, trading-day coverage and evidence, option returns |
 | `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META, MSFT): where the EMAs are, the last cross and what became of it, today's paper trades for both strategies |
 | `/strategies`, `/strategies 30` | Each paper strategy's own record: trades, win rate, average win and loss, expectancy after costs, drawdown; signals held by the health gate |
+| `/paperscore`, `/paperscore full` | Paper Strategy Scorecard: every paper strategy's forward record next to its backtest, evidence by trading days, daily / weekly P/L, symbol and outlier dependence, exits, SPY-day splits, correlated setups |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
 
 Example reply (real data, 2026-10-07 close):
@@ -432,6 +433,26 @@ Secrets come from the environment or a `.env` file next to `config.toml` (mode 0
 
 The service has a dashboard at `http://localhost:8080/` (auto-refreshes; no login, so keep it private).
 `/status` returns JSON and `/healthz` is the health check.
+
+## Paper Strategy Scorecard
+
+`mias/paperscore.py`, `/paperscore` (`/paperscore full`) and `python -m mias paper-scorecard [--full]`. Report only;
+separate from the Alert Scorecard. For A, B, C, D, E7, E21, Simple and the 3:45 close fade: trades, distinct trading
+days, wins / losses, gross P/L, commissions ($0.65 per contract each way), net, net per trade (= expectancy),
+average winner / loser, profit factor, max drawdown, largest winner / loser, median hold, calls and puts. Each
+strategy's FORWARD PAPER record is shown next to its HISTORICAL backtest, never merged. Evidence comes from distinct
+trading days (<5 VERY LIMITED, 5–9 LIMITED, 10–19 EARLY, 20–39 DEVELOPING, 40+ MORE MATURE; under 30 trades one step
+lower), with "INSUFFICIENT FOR PERFORMANCE JUDGMENT" at the first two; nothing is labelled validated. `full` adds
+daily / weekly P/L, best / worst day, per-symbol tables with the best symbol's and top 3's share of positive P/L,
+net without the largest winner / top 3 winners / largest loser, exit-reason buckets (descriptive only: losses under
+STOP don't show the stop caused them), SPY-day UP / DOWN / FLAT splits (±0.25%, as the Alert Scorecard), B and
+Simple diagnostics, the close fade's market context, and correlated trades (same symbol and direction within 10
+minutes = one setup). Portfolio totals are shown including retired A's history and for the current active set.
+
+**Strategy A (EMA retest) retired from active paper trading on 2026-11-09:** `"retest"` was removed from
+`[daytrade] strategies`. Its code and logged trades are kept, so its results stay reportable; adding the name back
+runs it again. The close fade logs report-only market context with each trade (SPY / SPX day change, direction, day
+range, moves beyond 1 / 2 / 3%); it never affects whether or how it trades.
 
 ## Strategy report
 

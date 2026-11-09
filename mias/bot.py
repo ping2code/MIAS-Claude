@@ -35,7 +35,7 @@ _reply_chat: contextvars.ContextVar[str | None] = contextvars.ContextVar("reply_
 GROUP_TYPES = ("group", "supergroup")
 KNOWN = {"trend", "t", "market", "sector", "sectors", "picks", "list", "status", "help", "start", "whoami",
          "buy", "sell", "positions", "pos", "ema", "scorecard", "brief", "premarket",
-         "strategies"}
+         "strategies", "paperscore"}
 PRIVATE_ONLY = {"buy", "sell", "positions", "pos"}
 # The user and chat type of the message being answered (position commands are per user, private chats only).
 _user: contextvars.ContextVar[str] = contextvars.ContextVar("user", default="")
@@ -53,6 +53,7 @@ COMMANDS = [
     ("premarket", "Pre-market heads-up: sectors, gappers, earnings"),
     ("scorecard", "How the alerts did: /scorecard 30 for 30 days"),
     ("strategies", "Paper strategies' records: expectancy after costs (/strategies 30)"),
+    ("paperscore", "Paper Strategy Scorecard: forward vs backtest, evidence (/paperscore full)"),
     ("positions", "Your open positions (private chat)"),
     ("buy", "Track a position: /buy AMZN 11/20 260/280C 6.63 x1"),
     ("sell", "Close a tracked position: /sell AMZN 13.40"),
@@ -212,6 +213,10 @@ class CommandBot:
             days = int(args[0]) if args and args[0].isdigit() else 7
             await self.reply(strategies.report(self.svc.store, self.svc.cfg, datetime.now(timezone.utc),
                                                max(1, min(days, 365))))
+        elif cmd == "paperscore":
+            from . import paperscore
+            await self.reply(paperscore.report(self.svc.store, self.svc.cfg,
+                                               full=bool(args) and args[0].lower() == "full"))
         elif cmd == "brief":
             await self.reply(self.svc.brief_text(datetime.now(timezone.utc)))
         elif cmd == "premarket":

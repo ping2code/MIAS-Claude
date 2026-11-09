@@ -23,6 +23,7 @@ strike is where the call and put are priced alike (put-call parity), and the ind
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from datetime import date, datetime, time, timedelta
 from html import escape
@@ -266,7 +267,8 @@ async def _signal(client, store, cfg, now: datetime, today5: list[dict], issues:
         return 0                                   # the 15:40 candle isn't in yet: next cycle
     side = decide(x, RULE)
     head = f"🕞 <b>3:45 close play (paper)</b> {local:%a %H:%M} ET"
-    st.update(read={k: round(v, 4) if isinstance(v, float) else v for k, v in x.items()}, side=side)
+    st.update(read={k: round(v, 4) if isinstance(v, float) else v for k, v in x.items()}, side=side,
+              context=market_context(store, now, bars, x))
     if not side:
         st["status"] = "no_trade"
         store.enqueue("closeplay", "\n".join([f"{head}: <b>NO TRADE</b>", *signal_text(x, 0, local, sym, spx),
@@ -321,6 +323,30 @@ async def _signal(client, store, cfg, now: datetime, today5: list[dict], issues:
     return 1
 
 
+def market_context(store, now: datetime, bars: list, x: dict) -> dict | None:
+    """REPORT ONLY, never read by decide() or the entry: the market at the 15:45 read, for later study of whether
+    big trend days are hostile to the fade. SPY / SPX day returns are vs the prior close (latest recorded check);
+    UP / DOWN / FLAT uses the scorecard's ±0.25% convention; range = (high - low) / open of today's SPY bars."""
+    try:
+        from .scorecard import REGIME_FLAT_PCT
+
+        def day_change(symbol):
+            row = store.db.execute("SELECT data FROM metrics WHERE symbol=? AND ts<=? ORDER BY ts DESC LIMIT 1",
+                                   (symbol, now.timestamp())).fetchone()
+            v = json.loads(row[0]).get("day_change_pct") if row else None
+            return round(v, 3) if v is not None else None
+        spy, spx = day_change("SPY"), day_change("SPX")
+        move = spy if spy is not None else x["day_pct"]
+        hi, lo = max(b.h for b in bars), min(b.l for b in bars)
+        return {"spy_day_pct": spy, "spx_day_pct": spx, "spy_from_open_pct": round(x["day_pct"], 3),
+                "direction": "UP" if move > REGIME_FLAT_PCT else "DOWN" if move < -REGIME_FLAT_PCT else "FLAT",
+                "day_high": hi, "day_low": lo, "day_range_pct": round(100 * (hi - lo) / x["open"], 3),
+                "beyond_1pct": abs(move) >= 1, "beyond_2pct": abs(move) >= 2, "beyond_3pct": abs(move) >= 3}
+    except Exception:
+        log.exception("close play market context failed (report only)")
+        return None
+
+
 def _parity_spot(rows: list[dict]) -> float | None:
     """The underlying implied by the strike where call and put mids are closest: K + C - P."""
     from .emacross import _mid
@@ -371,7 +397,7 @@ async def manage(client, store, cfg, now: datetime) -> int:
            "ticker": st["ticker"], "qty": qty, "entry": st["entry"], "entry_mid": st["entry_mid"], "exit": exit_,
            "pnl": pnl, "pnl_pct": round(100 * (exit_ / st["entry"] - 1), 1) if st["entry"] else 0.0,
            "pnl_mid": round(((mid or exit_) - (st["entry_mid"] or st["entry"])) * 100 * qty, 2),
-           "under_in": st.get("under"), "under_out": under, "read": st.get("read")}
+           "under_in": st.get("under"), "under_out": under, "read": st.get("read"), "context": st.get("context")}
     store.put(LOG_KEY, (store.get(LOG_KEY) or [])[-999:] + [rec])
     sign = "+" if pnl >= 0 else "-"
     store.enqueue("closeplay", f"{'🎯' if pnl > 0 else '🛑'} <b>3:45 close play: SOLD</b> {trade} "
