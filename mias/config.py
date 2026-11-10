@@ -1,10 +1,11 @@
 """Configuration: config.toml for behaviour, environment for secrets."""
 from __future__ import annotations
 
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -167,6 +168,9 @@ class Config:
     telegram_allowed_chats: list[str] = field(repr=False, default_factory=list)
     ema_qualified: "QualRules | None" = None   # [ema_qualified]: Strategy C's gates (experimental; mias/qualify.py)
     ema_simple_enabled: bool = False     # [ema_simple]: EMA 9/21 Simple on SPY/QQQ/IWM (experimental paper; mias/simple.py)
+    alert_symbols: tuple[str, ...] = ()  # [alerts] symbols: per-symbol alerts only for these (empty = every watched)
+    tier1_trend: str = "strong"          # [alerts] tier1_trend: "strong" full alignment, "swing" swing turns UP/DOWN
+    rollcall_time: str = ""              # [alerts] rollcall_time: one card per alert symbol trending UP/DOWN ("" = off)
 
 
 def load_dotenv(path: Path) -> None:
@@ -307,6 +311,18 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
     if interval < 30:
         raise ConfigError("schedule.interval_seconds must be >= 30")
 
+    listed = [s.upper() for s in al.get("symbols", [])]
+    alert_symbols = tuple(s for s in listed if s in symbols)
+    if len(alert_symbols) < len(listed):            # e.g. a MIAS_SYMBOLS override; none watched = every symbol
+        logging.getLogger(__name__).warning("alerts.symbols not watched, ignored: %s",
+                                            ", ".join(s for s in listed if s not in symbols))
+    rollcall = str(al.get("rollcall_time", ""))
+    if rollcall:
+        try:
+            time.fromisoformat(rollcall)
+        except ValueError:
+            raise ConfigError("alerts.rollcall_time must be HH:MM or empty") from None
+
     db_path = Path(os.environ.get("MIAS_DB_PATH", st.get("path", "data/mias.db")))
     if not db_path.is_absolute():
         db_path = path.parent / db_path
@@ -375,6 +391,9 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         daytrade=_daytrade(raw.get("daytrade", {})),
         ema_qualified=_qualified(raw.get("ema_qualified", {})),
         ema_simple_enabled=bool(raw.get("ema_simple", {}).get("enabled", False)),
+        alert_symbols=alert_symbols,
+        tier1_trend=_choice(al.get("tier1_trend", "strong"), ("strong", "swing"), "alerts.tier1_trend"),
+        rollcall_time=rollcall,
         brief_enabled=bool(raw.get("brief", {}).get("enabled", True)),
         brief_time=raw.get("brief", {}).get("time", "09:45"),
         premarket_enabled=bool(raw.get("premarket", {}).get("enabled", True)),

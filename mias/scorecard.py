@@ -32,7 +32,8 @@ INTRADAY = {"15m": 900, "30m": 1800, "1h": 3600}
 INTRADAY_GAP_S = 20 * 60
 DEDUPE_S = 30 * 60
 OPTION_FRESH_S = 30 * 60      # an option value is only taken this close to the horizon (it can't be looked up later)
-NAMES = {"pullback_entry": "Pullback entry", "strong_alignment": "Strong alignment", "trend_change": "Trend change",
+NAMES = {"pullback_entry": "Pullback entry", "strong_alignment": "Strong alignment", "swing_trend": "Swing trend turn",
+         "trend_change": "Trend change",
          "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA day trade (retest)",
          "ema_cross_entry": "EMA day trade (cross)", "ema_qual_entry": "EMA day trade (qualified, experimental)", "ema_d_entry": "EMA day trade (D, experimental)",
          "flow": "One-sided flow", "flow_confirmed": "Flow, price confirms",
@@ -181,7 +182,8 @@ EVIDENCE_MIN_ALERTS = 10      # fewer alerts than this drops the day-based label
 CI_MIN_DAYS, CI_MIN_ALERTS = 5, 10
 _T95 = {4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 12: 2.179, 15: 2.131, 20: 2.086,
         25: 2.060, 30: 2.042}
-SHORT = {"pullback_entry": "Pullback", "strong_alignment": "Strong align", "trend_change": "Trend change",
+SHORT = {"pullback_entry": "Pullback", "strong_alignment": "Strong align", "swing_trend": "Swing turn",
+         "trend_change": "Trend change",
          "options_flip": "Options flip", "wall_break": "Wall break", "ema_entry": "EMA retest",
          "ema_cross_entry": "EMA cross", "ema_qual_entry": "EMA qual (C)", "ema_d_entry": "EMA D",
          "flow": "Flow", "flow_confirmed": "Flow px agrees", "flow_unconfirmed": "Flow px disagrees",

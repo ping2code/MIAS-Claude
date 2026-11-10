@@ -19,7 +19,7 @@ from .trend import direction, label_for, stock_trend
 log = logging.getLogger(__name__)
 
 # Directional alerts logged on the scorecard (tier 1 and the directional tier-2 changes).
-SCORED = ("pullback_entry", "strong_alignment", "trend_change", "options_flip", "wall_break")
+SCORED = ("pullback_entry", "strong_alignment", "swing_trend", "trend_change", "options_flip", "wall_break")
 # A volume baseline older than this is discarded rather than turned into one oversized flow window.
 MAX_BASELINE_AGE_S = 15 * 60
 
@@ -367,6 +367,11 @@ class Engine:
                 if cfg.alert_mode == "tiered":
                     old_swing = (state.get("swing") or {}).get("cls")
                     reasons, later = signals.evaluate_tiered(r, state, cfg, ts, iv_hist)
+                    for x in later:
+                        if x.rule == "trend_change":                 # position alerts: every symbol
+                            self.swing_changes[r.symbol] = (old_swing, state["swing"]["cls"], r.stock.score)
+                    if not self.alerts_for(r.symbol):
+                        reasons, later = [], []          # evaluated so the state stays current; not posted
                     if reasons and not signals._cooled(state, f"tier1_{reasons[0].direction}", ts,
                                                        cfg.tier1_merge_minutes):
                         later, reasons = reasons + later, []     # just alerted this symbol: batch it instead
@@ -374,10 +379,8 @@ class Engine:
                                for x in later]
                     for x in [x for x in reasons + later if x.rule in SCORED]:
                         self._score(r, x.rule, x.direction, ts)
-                    for x in later:
-                        if x.rule == "trend_change":
-                            self.swing_changes[r.symbol] = (old_swing, state["swing"]["cls"], r.stock.score)
-                    self._collect_blocks(r, ts)
+                    if self.alerts_for(r.symbol):
+                        self._collect_blocks(r, ts)
                 elif cfg.alert_mode == "strong_alignment":
                     reasons = signals.evaluate_strong(r, state, cfg, ts)
                 else:
@@ -386,6 +389,8 @@ class Engine:
                 log.exception("%s: alert evaluation failed", r.symbol)
                 continue
             self.store.put(key, state)
+            if not self.alerts_for(r.symbol):
+                reasons = []
             if reasons:
                 ctx = context_lines(r, reasons[0].direction, mc, results, cfg) if cfg.alert_mode == "tiered" else []
                 text = formatting.symbol_alert(r, [(x.direction, x.text) for x in reasons], local, cfg, ctx)
@@ -418,6 +423,10 @@ class Engine:
                 self.store.enqueue("market", formatting.market_alert(
                     old_label, new, stock, opts, [s for s in cfg.market_symbols if s in cfg.symbols], local))
             self.store.put("state:__market__", mstate)
+
+    def alerts_for(self, symbol: str) -> bool:
+        """Per-symbol alerts are posted only for [alerts] symbols (all watched symbols when that list is empty)."""
+        return not self.cfg.alert_symbols or symbol in self.cfg.alert_symbols
 
     def _score(self, r: SymbolResult, rule: str, direction_: str, ts: float) -> None:
         """Log a directional alert on the scorecard, with the swing contract it would suggest."""

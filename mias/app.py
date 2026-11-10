@@ -131,6 +131,7 @@ class Service:
             await self._send_unusual(now)
             await self._send_picks(now)
             self._send_brief(now)
+            self._send_rollcall(now)
             if self.cfg.screen_enabled and self._screen_due(now):
                 self.start_screen()
             for t in self.cfg.digest_times:
@@ -212,7 +213,8 @@ class Service:
         blocks = pending.get("items") if pending.get("date") == today else None
 
         # Trade-by-trade tapes for the contracts that traded unusually in this window, and for the blocks.
-        rows = [(r.symbol, p) for r in self.engine.last_results if r.options for p in r.options.unusual[:3]]
+        results = [r for r in self.engine.last_results if self.engine.alerts_for(r.symbol)]   # [alerts] symbols
+        rows = [(r.symbol, p) for r in results if r.options for p in r.options.unusual[:3]]
         moved = [(s, p) for s, p in rows if p.volume - (prev or {}).get(p.ticker, 0.0) > 0]
         moved.sort(key=lambda sp: -(sp[1].volume - (prev or {}).get(sp[1].ticker, 0.0)) * (sp[1].price or 0))
         want = {p.ticker: p.kind for _, p in moved[:TAPE_CONTRACTS]}
@@ -245,7 +247,7 @@ class Service:
         market = self.cfg.market_symbols
         reads = confirm.reads(self.engine, self.cfg, {s for s, _ in rows} | set(market), local.date())
         info: dict = {}
-        text, volumes = unusual_report(self.engine.last_results, local, prev, self.cfg.unusual_top, blocks=blocks,
+        text, volumes = unusual_report(results, local, prev, self.cfg.unusual_top, blocks=blocks,
                                        tapes=tapes, since=since if same_day else None, oi_lines=oi_lines(checks),
                                        material=self.cfg.unusual_material, row_min=self.cfg.unusual_row_min,
                                        quiet=self.cfg.unusual_quiet, structures=structs, confirm=reads,
@@ -354,6 +356,33 @@ class Service:
             self.store.enqueue("brief", self.brief_text(now))
         except Exception:
             log.exception("morning brief failed")
+
+    def _send_rollcall(self, now: datetime) -> None:
+        """Once a day from [alerts] rollcall_time: one card per alert symbol whose swing trend is UP / STRONG UP or
+        DOWN / STRONG DOWN, in the [alerts] symbols order (intraday and options are on the card)."""
+        cfg = self.cfg
+        if not cfg.rollcall_time or cfg.alert_mode != "tiered" or self.engine.last_cycle.get("at") != now.isoformat():
+            return
+        local = now.astimezone(cfg.tz)
+        due = datetime.combine(local.date(), dtime.fromisoformat(cfg.rollcall_time), cfg.tz)
+        key = f"rollcall:{local.date()}"
+        if not (due <= local < due + timedelta(minutes=30)) or self.store.get(key):
+            return
+        self.store.put(key, True)
+        from . import formatting, signals
+        from .engine import context_lines
+        results = self.engine.last_results
+        mc = signals.market_composite(results, cfg.market_symbols)
+        order = {s: i for i, s in enumerate(cfg.alert_symbols or cfg.symbols)}
+        for r in sorted(results, key=lambda r: order.get(r.symbol, len(order))):
+            if not r.ok or not r.stock or not self.engine.alerts_for(r.symbol) or self.engine.health_issues(r, now):
+                continue
+            confirmed = ((self.store.get(f"state:{r.symbol}") or {}).get("swing") or {}).get("cls")
+            x = signals.rollcall_reason(r, confirmed)
+            if x:
+                ctx = context_lines(r, x.direction, mc, results, cfg)
+                self.store.enqueue("rollcall", formatting.symbol_alert(r, [(x.direction, x.text)], local, cfg, ctx),
+                                   r.symbol)
 
     async def _send_premarket(self, now: datetime) -> None:
         """07:00 heads-up, 09:15 update ([premarket] times), each once in the 30 minutes after its time."""

@@ -67,10 +67,13 @@ the confidence verdict, and their options flip alerts are suppressed.
 
 Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 
+**Alert symbols** (`[alerts] symbols`, since 2026-11-09): per-symbol alerts (pullback, swing trend, roll-call, trend / options changes, wall breaks, IV spikes, blocks, unusual-activity listings) are posted only for SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN, AMD, COST, PG and WMT. Every watched symbol is still evaluated (sector board, market line, position alerts, `/trend`).
+
 | Tier | Message | Where, when |
 |---|---|---|
 | 1 Act now | **Pullback over / bounce over**: swing UP or STRONG UP, intraday dipped to −15 or lower and recovered to +35 (2 checks), options not against it; mirror for downtrends. With swing and day-trade contracts | Group, instantly (max one per symbol per direction per 2 h) |
-| 1 Act now | **Strong alignment**, as below | Group, instantly |
+| 1 Act now | **Swing trend** (`[alerts] tier1_trend = "swing"`, since 2026-11-09): the swing trend turns UP / STRONG UP or DOWN / STRONG DOWN (confirmed, with hysteresis), intraday and options shown on the card, "✅ full strong alignment" noted when all three agree. With `"strong"`: **strong alignment** only, as below | Group, instantly |
+| 1 Roll-call | **Morning roll-call** at `[alerts] rollcall_time` (09:45): one card per alert symbol whose swing trend is UP or DOWN | Group, once a day |
 | 1 Act now | Both carry the symbol's sector rank, and **⚠️ against market/sector** when SPY/QQQ/IWM or the sector trend the other way | |
 | 1 Day trade (paper) | **EMA 9/21** entries for two strategies, cross + retest and cross (no retest) (SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN, AMD), and their management (first target, trail, stop, invalidated, end of day), then a summary per strategy at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
 | 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |

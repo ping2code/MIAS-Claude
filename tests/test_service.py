@@ -1040,6 +1040,7 @@ def test_pullback_needs_options_not_against(cfg):
 
 def test_tiered_routes_changes_to_batch_and_strong_to_now(cfg):
     from mias.signals import evaluate_tiered
+    cfg = dataclasses.replace(cfg, tier1_trend="strong")       # the full-alignment tier 1 (swing mode: test_swing_alerts)
     state, t = {}, 1_000_000.0
     t2_all = []
     for i, (sw, intra, opt) in enumerate([(10, 0, 0), (40, 0, 0), (42, 0, 0), (70, 70, 50), (72, 72, 52), (73, 73, 55)]):

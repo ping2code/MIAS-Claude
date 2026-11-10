@@ -1,7 +1,7 @@
 """Alert rules. Edge-triggered with confirmation and cooldowns, state persisted across restarts.
 
 Mode "tiered" (default) splits alerts by urgency, see `evaluate_tiered`:
-  tier 1  sent at once:     pullback_entry, strong_alignment
+  tier 1  sent at once:     pullback_entry, strong_alignment (or swing_trend: [alerts] tier1_trend = "swing")
   tier 2  batched (15 min): trend and options changes with hysteresis, wall breaks, IV spikes, alignment ended
   tier 3  blocks are folded into the unusual-activity report instead of being sent one by one
 Mode "strong_alignment" alerts only on full agreement, see `evaluate_strong`.
@@ -197,6 +197,25 @@ def evaluate_strong(r: SymbolResult, state: dict, cfg: Config, now: float) -> li
     return []
 
 
+def swing_reason(r: SymbolResult, side: str, how: str, rule: str = "swing_trend") -> Reason:
+    """Tier-1 swing trend alert ([alerts] tier1_trend = "swing"): the swing trend alone decides; intraday and
+    options are shown on the card for the reader to judge. Full strong alignment is noted when it also holds."""
+    tf = "UP" if side == "bull" else "DOWN"
+    full = " · ✅ full strong alignment" if strong_side(r) == side else ""
+    return Reason(rule, side, f"SWING TREND {tf}: {how} ({r.stock.score:+.0f}){full}")
+
+
+def rollcall_reason(r: SymbolResult, confirmed: str | None) -> Reason | None:
+    """Morning roll-call card for a symbol whose swing trend is UP / STRONG UP or DOWN / STRONG DOWN (the confirmed
+    class when known, else the current label); None when it is neutral."""
+    label = confirmed or r.stock.label
+    side = direction(label)
+    if side == "neutral":
+        return None
+    full = " · ✅ full strong alignment" if strong_side(r) == side else ""
+    return Reason("rollcall", side, f"MORNING ROLL-CALL · SWING {WORD[label]} ({r.stock.score:+.0f}){full}")
+
+
 # ---- tiered mode -----------------------------------------------------------------------------
 
 LEVEL = {"strong_down": -2, "down": -1, "neutral": 0, "up": 1, "strong_up": 2}
@@ -285,10 +304,11 @@ def evaluate_tiered(r: SymbolResult, state: dict, cfg: Config, now: float,
         t1.append(Reason("pullback_entry", side, f"{head}: swing {WORD[r.stock.label]} ({r.stock.score:+.0f}) · "
                                                  f"intraday {dipped}back to {intra:+.0f}"))
 
-    t1 += evaluate_strong(r, state, cfg, now)
-    for x in [x for x in t1 if x.rule == "alignment_ended"]:
-        t1.remove(x)
-        t2.append(x)
+    if cfg.tier1_trend == "strong":
+        t1 += evaluate_strong(r, state, cfg, now)
+        for x in [x for x in t1 if x.rule == "alignment_ended"]:
+            t1.remove(x)
+            t2.append(x)
 
     if r.stock and r.stock.timeframes:
         slot = state.get("swing", {})
@@ -298,6 +318,9 @@ def evaluate_tiered(r: SymbolResult, state: dict, cfg: Config, now: float,
         if ch:
             t2.append(Reason("trend_change", direction(ch[1]),
                              f"{WORD[ch[0]]} → {WORD[ch[1]]} ({r.stock.score:+.0f})"))
+            side = direction(ch[1])
+            if cfg.tier1_trend == "swing" and side != "neutral" and side != direction(ch[0]):
+                t1.append(swing_reason(r, side, f"{WORD[ch[0]]} → {WORD[ch[1]]}"))
 
     if r.bias and r.bias.components and not (r.options and r.options.thin):
         slot = state.get("opts", {})

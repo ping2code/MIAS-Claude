@@ -159,6 +159,16 @@ time = "10:00"
 # "strong_alignment": only strong alignment and alignment-ended alerts (used 2026-10-12..24).
 # Switching modes resets the alert state quietly, so a switch never sends a burst of stale alerts.
 mode = "tiered"
+# 2026-11-09 (user): per-symbol alerts (pullback, swing trend, trend / options changes, wall breaks, IV spikes,
+# blocks and the unusual-activity listings) are posted only for these symbols. Every watched symbol is still
+# evaluated (sector board, market line, scorecard reads, position alerts, /trend). Empty list = every watched symbol.
+symbols = ["SPY", "QQQ", "IWM", "NVDA", "TSLA", "META", "MSFT", "AAPL", "AMZN", "AMD", "COST", "PG", "WMT"]
+# Tier-1 trend alert: "swing" = instantly when a symbol's swing trend turns UP / STRONG UP or DOWN / STRONG DOWN
+# (the same confirmed, hysteresis-filtered change as the tier-2 trend change), with intraday and options on the card
+# and "full strong alignment" noted when all three agree. "strong" = only full strong alignment (until 2026-11-09).
+tier1_trend = "swing"
+# Morning roll-call: once a day from this time, one card per alert symbol whose swing trend is UP or DOWN. "" = off.
+rollcall_time = "09:45"
 alignment_end_alert = true
 changes_every_minutes = 15
 tier1_merge_minutes = 30
