@@ -6,7 +6,9 @@ sold at the bid) minus commissions of fee_per_contract per contract each way. Fo
 backtests are shown side by side, never merged. Evidence comes from distinct trading days first (trade count can
 only lower it); nothing is ever labelled validated. Market context (SPY day UP / DOWN / FLAT at ±0.25%, the Alert
 Scorecard convention, and SPY's day change at entry) is diagnostic only. Several strategies can act on one setup:
-trades with the same symbol and direction entered within 10 minutes on the same day count as one setup.
+trades with the same symbol and direction entered within 10 minutes on the same day count as one setup
+(setup_id = date_SYMBOL_SIDE_HHMMSS of its first entry). The setup-level view sums every expression's premium and
+P/L per setup and shows several stated ways to count a setup once; it applies no risk cap.
 python -m mias paper-scorecard [--full] · /paperscore [full]
 """
 from __future__ import annotations
@@ -65,11 +67,15 @@ def trades(store, cfg) -> list[dict]:
     tz, fee, lots = cfg.tz, cfg.daytrade.fee_per_contract, cfg.daytrade.contracts
     out = []
 
-    def add(code, t, qty, exit_reason, entry_time):
+    def add(code, t, qty, exit_reason, entry_time, exit_time=None):
+        ts = _ts(t["date"], entry_time, tz)
+        hold = t.get("minutes")
+        exit_ts = ts + 60 * float(hold) if ts is not None and hold is not None else _ts(t["date"], exit_time, tz)
         out.append({"code": code, "date": date.fromisoformat(t["date"]), "symbol": t.get("symbol"),
                     "side": t.get("side"), "qty": qty, "gross": float(t["pnl"]), "fee": 2 * fee * qty,
                     "net": float(t["pnl"]) - 2 * fee * qty, "exit": EXITS.get(exit_reason or "", "other"),
-                    "hold": t.get("minutes"), "ts": _ts(t["date"], entry_time, tz), "entry_time": entry_time,
+                    "hold": hold, "ts": ts, "entry_time": entry_time, "exit_ts": exit_ts,
+                    "premium": float(t.get("entry") or 0) * 100 * qty, "ticker": t.get("ticker"),
                     "n": t.get("n"), "ema_regime": t.get("regime"), "context": t.get("context")})
     for t in store.get(emacross.LOG_KEY) or []:
         add(CODES.get(t.get("strategy", "retest"), t.get("strategy")), t, t.get("contracts") or lots,
@@ -77,7 +83,7 @@ def trades(store, cfg) -> list[dict]:
     for t in store.get(simple.LOG_KEY) or []:
         add("Simple", t, lots, t.get("exit_reason"), t.get("fill_at") or t.get("in"))
     for t in store.get(closeplay.LOG_KEY) or []:
-        add("Close fade", t, t.get("qty") or 1, "time", "15:45")       # scheduled sale at 15:59 = a time exit
+        add("Close fade", t, t.get("qty") or 1, "time", "15:45", "15:59")   # scheduled sale at 15:59 = a time exit
     out.sort(key=lambda r: (r["date"], r["ts"] or 0))
     return out
 
@@ -197,10 +203,89 @@ def setups(rows: list[dict]) -> list[list[dict]]:
     return groups
 
 
+def setup_id(group: list[dict], tz) -> str:
+    """Deterministic id of one setup from its own facts only (never a strategy name): trading date, symbol, direction
+    and the earliest member's entry time, e.g. 2026-11-03_MSFT_BULL_101001. Members are chained by setups(): each
+    within OVERLAP_S of the previous one, so the anchor is the setup's first entry."""
+    first = group[0]
+    when = datetime.fromtimestamp(first["ts"], tz).strftime("%H%M%S") if first.get("ts") is not None else "NA"
+    return f"{first['date'].isoformat()}_{first['symbol']}_{(first['side'] or '').upper()}_{when}"
+
+
+def with_setups(rows: list[dict], tz) -> list[dict]:
+    """Adds setup_id and setup_size (strategy observations sharing it) to every row, grouping ALL rows given."""
+    for g in setups(rows):
+        sid = setup_id(g, tz)
+        for r in g:
+            r["setup_id"], r["setup_size"] = sid, len(g)
+    return rows
+
+
+def family(code: str) -> str:
+    return "D-family" if code in CORRELATED else code
+
+
+def max_concurrent(rows: list[dict]) -> tuple[float, float | None]:
+    """Largest sum of premium held at one moment ([entry, exit) intervals) and when it happened (epoch s)."""
+    ev = []
+    for r in rows:
+        if r.get("ts") is not None and r.get("exit_ts") is not None:
+            ev += [(r["ts"], 1, r["premium"]), (max(r["exit_ts"], r["ts"]), 0, -r["premium"])]
+    best, at, cur = 0.0, None, 0.0
+    for t, _, x in sorted(ev):                           # exits sort before entries at the same second
+        cur += x
+        if cur > best + 1e-9:
+            best, at = cur, t
+    return best, at
+
+
+def setup_stats(rows: list[dict]) -> dict:
+    """Setup-level measures (REPORT ONLY). Setup P/L 'as traded' = the sum of every expression of it (what MIAS
+    actually made or lost from one idea); exposure = the sum of the premium paid by every expression."""
+    groups = setups(rows)
+    if not groups:
+        return {"obs": 0, "setups": 0}
+    nets = sorted(((sum(r["net"] for r in g), g) for g in groups), key=lambda x: x[0])
+    exposure = [sum(r["premium"] for r in g) for g in groups]
+    total = sum(n for n, _ in nets)
+    ranked = sorted((n for n, _ in nets), reverse=True)
+    positive = sum(n for n in ranked if n > 0)
+    sizes: dict[int, int] = {}
+    for g in groups:
+        sizes[len(g)] = sizes.get(len(g), 0) + 1
+    big = max(range(len(groups)), key=lambda i: exposure[i])
+    return {"obs": len(rows), "setups": len(groups), "multi": sum(len(g) > 1 for g in groups),
+            "sizes": dict(sorted(sizes.items())), "premium": sum(r["premium"] for r in rows),
+            "setup_avg_exposure": sum(exposure) / len(groups), "largest": (exposure[big], groups[big]),
+            "concurrent": max_concurrent(rows), "net": total, "best": nets[-1], "worst": nets[0],
+            "top1_share": 100 * ranked[0] / positive if positive and ranked[0] > 0 else None,
+            "top3_share": 100 * sum(n for n in ranked[:3] if n > 0) / positive if positive else None,
+            "no_top1": total - ranked[0], "no_top3": total - sum(ranked[:3])}
+
+
+def count_once(rows: list[dict]) -> dict:
+    """Ways to count each underlying setup once. None is canonical; each is a stated methodology:
+    mean = the equal-weight average of the setup's expressions (one 'unit' of the idea);
+    first = the expression that entered first (ties broken by strategy order C, D, E7, E21: a convention only);
+    ret = setup net / setup premium, the return on the money the setup tied up, averaged over setups."""
+    groups = setups(rows)
+    if not groups:
+        return {}
+    first = [min(g, key=lambda r: (r["ts"] or 0, ORDER.index(r["code"]) if r["code"] in ORDER else 99)) for g in groups]
+    rets = [sum(r["net"] for r in g) / sum(r["premium"] for r in g) for g in groups if sum(r["premium"] for r in g)]
+    return {"setups": len(groups), "all": sum(r["net"] for r in rows),
+            "mean": sum(sum(r["net"] for r in g) / len(g) for g in groups),
+            "first": sum(r["net"] for r in first), "ret": 100 * sum(rets) / len(rets) if rets else None}
+
+
 # ---- text --------------------------------------------------------------------------------------------
 
 def _m(x: float | None) -> str:
     return "–" if x is None else f"{'+' if x >= 0 else '-'}${abs(x):,.0f}"
+
+
+def _usd(x: float | None) -> str:
+    return "–" if x is None else f"${x:,.0f}"
 
 
 def _pf(s: dict) -> str:
@@ -349,18 +434,52 @@ def _close_extra(rows: list[dict]) -> list[str]:
     return lines
 
 
-def _overlap(rows: list[dict]) -> list[str]:
+def _setup_lines(title: str, rows: list[dict], tz) -> list[str]:
+    st = setup_stats(rows)
+    if not st["obs"]:
+        return [f"  {title}: no trades"]
+    conc, at = st["concurrent"]
+    big_exp, big = st["largest"]
+    when = datetime.fromtimestamp(at, tz).strftime("%m-%d %H:%M") if at else "–"
+    pct = lambda x: "–" if x is None else f"{x:.0f}%"
+    return [f"  <b>{title}</b>: {st['obs']} strategy observations · {st['setups']} unique setups · "
+            f"{st['multi']} taken by 2+ strategies · observations per setup "
+            + ", ".join(f"{k}×{v}" for k, v in st["sizes"].items()),
+            f"    premium paid, all observations {_usd(st['premium'])} · per setup avg {_usd(st['setup_avg_exposure'])} · "
+            f"largest setup {_usd(big_exp)} ({setup_id(big, tz)}: {'+'.join(r['code'] for r in big)}) · "
+            f"max held at once {_usd(conc)} ({when})",
+            f"    setup P/L as traded (sum of expressions): best {_m(st['best'][0])} ({setup_id(st['best'][1], tz)}) · "
+            f"worst {_m(st['worst'][0])} ({setup_id(st['worst'][1], tz)}) · top 1 setup {pct(st['top1_share'])} and "
+            f"top 3 {pct(st['top3_share'])} of positive setup P/L · net {_m(st['net'])}, without top 1 "
+            f"{_m(st['no_top1'])}, without top 3 {_m(st['no_top3'])}"]
+
+
+def _setups(rows: list[dict], cfg) -> list[str]:
+    tz = cfg.tz
+    active = [r for r in rows if r["code"] not in RETIRED]
     corr = [r for r in rows if r["code"] in CORRELATED]
-    g = setups(corr)
-    multi = [x for x in g if len({r["code"] for r in x}) > 1]
-    every = setups(rows)
-    lines = ["\n<b>Correlated trades</b> (same symbol and direction within 10 minutes = one setup)",
-             f"  C/D/E7/E21: {len(corr)} strategy observations from {len(g)} unique underlying setups "
-             f"({len(multi)} setups traded by 2+ of them)",
-             f"  all strategies: {len(rows)} trades from {len(every)} unique setups"]
-    for x in multi:
-        lines.append(f"    {x[0]['date']:%m-%d} {x[0]['symbol']} {x[0]['side']}: "
-                     + ", ".join(f"{r['code']} {_m(r['net'])}" for r in x))
+    lines = ["\n<b>Setup-level view</b> (REPORT ONLY; same day, symbol and direction, each entry within 10 minutes "
+             "of the previous = one setup; exposure = premium paid, the most a long option can lose; no risk cap is "
+             "applied)"]
+    lines += _setup_lines("All strategies incl. retired A", rows, tz)
+    lines += _setup_lines("Active set (excluding A)", active, tz)
+    lines += _setup_lines("D-family (C / D / E7 / E21)", corr, tz)
+    c = count_once(corr)
+    if c:
+        lines.append(f"    D-family P/L: every observation {_m(c['all'])} · each setup once, equal-weight mean of its "
+                     f"expressions {_m(c['mean'])} · each setup once, first expression to enter {_m(c['first'])} · "
+                     f"avg setup return on premium " + ("–" if c["ret"] is None else f"{c['ret']:+.1f}%"))
+        lines.append("    <i>No count-once figure is canonical: the mean treats each idea as one unit, the first-entry "
+                     "figure is one arbitrary expression, the return ignores size.</i>")
+    fam = {}
+    for g in setups(active):
+        fam.setdefault("+".join(sorted({family(r["code"]) for r in g})), []).append(g)
+    lines.append("    active setups by family mix: " + " · ".join(
+        f"{k} {len(v)} ({_m(sum(r['net'] for g in v for r in g))})" for k, v in sorted(fam.items(), key=lambda kv: -len(kv[1]))))
+    multi = [g for g in setups(corr) if len({r["code"] for r in g}) > 1]
+    for g in multi:
+        lines.append(f"    {setup_id(g, tz)}: " + ", ".join(f"{r['code']} {_m(r['net'])}" for r in g)
+                     + f" · together {_m(sum(r['net'] for r in g))} on {_usd(sum(r['premium'] for r in g))} premium")
     return lines
 
 
@@ -387,8 +506,8 @@ def report(store, cfg, full: bool = False) -> str:
         lines += _b_extra(groups.get("B", []))
         lines += _simple_extra(groups.get("Simple", []))
         lines += _close_extra(groups.get("Close fade", []))
-        lines += _overlap(rows)
+        lines += _setups(rows, cfg)
     else:
         lines.append("\n<i>/paperscore full: daily / weekly, symbols, outliers, exits, SPY-day splits, B and Simple "
-                     "diagnostics, close-fade context, correlated setups.</i>")
+                     "diagnostics, close-fade context, setup-level view.</i>")
     return "\n".join(lines)

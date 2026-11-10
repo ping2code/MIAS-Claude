@@ -98,7 +98,7 @@ def _t(code, d, sym, side, pnl, exit_="stop", qty=5, hhmm="10:00", **kw):
     return {"code": code, "date": date.fromisoformat(d), "symbol": sym, "side": side, "qty": qty, "gross": pnl,
             "fee": 2 * 0.65 * qty, "net": pnl - 2 * 0.65 * qty, "exit": exit_, "hold": 10, "ts": ts,
             "entry_time": hhmm, "n": kw.get("n"), "ema_regime": kw.get("regime"), "context": None,
-            "regime": kw.get("spy")}
+            "regime": kw.get("spy"), "premium": kw.get("premium", 200.0 * qty), "exit_ts": ts + 60 * kw.get("hold", 10)}
 
 
 def test_commissions_net_and_core_stats():
@@ -204,5 +204,5 @@ def test_correlated_strategies_count_as_one_setup():
             _t("C", "2026-11-03", "MSFT", "bear", 100, hhmm="10:01"), _t("D", "2026-11-04", "AMD", "bull", -100)]
     g = P.setups(rows)
     assert sorted(len(x) for x in g) == [1, 1, 1, 3]                    # E21 30 min later is a separate setup
-    text = "\n".join(P._overlap(rows))
-    assert "6 strategy observations from 4 unique underlying setups" in text
+    text = "\n".join(P._setup_lines("x", rows, ET))
+    assert "6 strategy observations · 4 unique setups · 1 taken by 2+ strategies" in text

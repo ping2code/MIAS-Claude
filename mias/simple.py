@@ -168,6 +168,8 @@ def _manage(snaps: dict, store, cfg, now: datetime, st: dict) -> int:
         tr.bid, tr.ask = bid, ask
         events = tr.exit(now_ms, value, "time") if now_ms >= close_ms else \
             tr.on_price(now_ms, value, value, value, value, rules)
+        if tr.closed and bid and ask and value:          # logged only, as emacross._manage: fills are unchanged
+            tr.exit_spread_pct = round(100 * (ask - bid) / value, 1)
         for kind, detail in events:
             store.enqueue("ema_simple", event_text(tr, n, kind, detail, value), tr.symbol)
             sent += 1
