@@ -193,7 +193,7 @@ block_cooldown_minutes = 60     # per contract
 # management go to the group as PAPER trades, tracked on live option quotes, with a summary at the close.
 # Backtest: python -m mias ema-backtest --symbols SPY --start 2026-04-27 --end 2026-10-23
 enabled = true
-symbols = ["SPY", "QQQ", "NVDA", "TSLA", "META", "MSFT"]
+symbols = ["SPY", "QQQ", "IWM", "NVDA", "TSLA", "META", "MSFT", "AAPL", "AMZN", "AMD"]
 fast = 9
 slow = 21
 retest_bars = 6            # the pullback into the EMAs must come within 6 candles (30 min) of the cross

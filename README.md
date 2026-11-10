@@ -21,7 +21,7 @@ Send these to your Telegram bot. It answers only your configured chat and ignore
 | `/positions`, `/sell AMZN 13.40` | Your positions with live value and P&L; close one (by symbol or `#`, no price = current mid) |
 | `/brief` | The day-trade brief (also sent at 09:45): opening read, trend or chop day, candidates, key levels |
 | `/scorecard`, `/scorecard 30`, `/scorecard replay`, `/scorecard full` | How the alerts did: right %, raw and SPY-relative moves, bull / bear, live vs replayed, trading-day coverage and evidence, option returns |
-| `/ema` | 5-minute EMA 9/21 (SPY, QQQ, NVDA, TSLA, META, MSFT): where the EMAs are, the last cross and what became of it, today's paper trades for both strategies |
+| `/ema` | 5-minute EMA 9/21 (SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN, AMD): where the EMAs are, the last cross and what became of it, today's paper trades for both strategies |
 | `/strategies`, `/strategies 30` | Each paper strategy's own record: trades, win rate, average win and loss, expectancy after costs, drawdown; signals held by the health gate |
 | `/paperscore`, `/paperscore full` | Paper Strategy Scorecard: every paper strategy's forward record next to its backtest, evidence by trading days, daily / weekly P/L, symbol and outlier dependence, exits, SPY-day splits, correlated setups |
 | `/list`, `/status`, `/help` | Watchlist, service health, how to read the answers |
@@ -72,7 +72,7 @@ Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 | 1 Act now | **Pullback over / bounce over**: swing UP or STRONG UP, intraday dipped to −15 or lower and recovered to +35 (2 checks), options not against it; mirror for downtrends. With swing and day-trade contracts | Group, instantly (max one per symbol per direction per 2 h) |
 | 1 Act now | **Strong alignment**, as below | Group, instantly |
 | 1 Act now | Both carry the symbol's sector rank, and **⚠️ against market/sector** when SPY/QQQ/IWM or the sector trend the other way | |
-| 1 Day trade (paper) | **EMA 9/21** entries for two strategies, cross + retest and cross (no retest) (SPY, QQQ, NVDA, TSLA, META, MSFT), and their management (first target, trail, stop, invalidated, end of day), then a summary per strategy at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
+| 1 Day trade (paper) | **EMA 9/21** entries for two strategies, cross + retest and cross (no retest) (SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN, AMD), and their management (first target, trail, stop, invalidated, end of day), then a summary per strategy at 15:10. See [EMA day trade](#ema-921-day-trade-paper) | Group, instantly |
 | 1 Positions | Take-profit (55% of max on spreads, +50% on single options), stop (−50%), underlying within 1.5% of the short strike, time stop (10 trading days or your `by` date), 7 days to expiry, swing trend turned against you. Each once per position | **Private chat of whoever added it** |
 | 2 Changes | One message every 15 min (09:45, 10:00, …) if anything changed: swing trend changes, options bias flips, call/put wall breaks, IV spikes, alignment ended, market trend, plus the sector ranking with ▲▼. Only the latest change per symbol shows | Group |
 | 3 Context | **Unusual activity** every 5 min: only contracts that traded since the last report, ranked by that new premium, each classified **trade by trade** (buy / sell / mid / multi-leg, sweeps). The first report of the day checks **yesterday's flow against today's open interest**. Blocks ≥ $5M since the last report, judged by their trades. See [Options flow](#options-flow) | Group |
@@ -289,7 +289,7 @@ alerts; the EMA paper trades continue as a live test. Per-symbol tables in `data
 
 ## EMA 9/21 day trade (paper)
 
-The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, NVDA, TSLA, META and MSFT (`[daytrade]`, `mias/emacross.py`):
+The 5-minute EMA 9/21 cross-and-retest from the SPY handout, run on SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN and AMD (`[daytrade]`, `mias/emacross.py`):
 
 1. EMA 9 crosses EMA 21 on a completed 5-minute candle.
 2. Within 6 candles price pulls back into the EMAs (bull: low touches EMA 9) and holds (closes stay above EMA 21).
