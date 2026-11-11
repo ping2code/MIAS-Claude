@@ -416,3 +416,30 @@ def test_close_play_no_trade_and_health_hold(tmp_path, monkeypatch):
     store2 = Store(tmp_path / "h.db")
     asyncio.run(closeplay.live(_CloseClient(day), store2, cfg, at, _close_day_raw(day, cfg.tz), ["stock: timeout"]))
     assert "health gate" in store2.pending()[-1][2] and store2.get(closeplay.KEY)["status"] == "held"
+
+
+def test_close_play_cycle_and_watcher_together_sell_once(tmp_path, monkeypatch):
+    """The cycle and the 30 s watcher both call closeplay.manage at 15:59: one sale, one alert, one log row."""
+    import asyncio
+    from datetime import date as _date, datetime as _dt, time as _time
+    from mias import closeplay
+    from mias.store import Store
+    cfg = _close_cfg(tmp_path, monkeypatch)
+    day = _date(2026, 10, 28)
+    raw = _close_day_raw(day, cfg.tz)
+    at = lambda h, m: _dt.combine(day, _time(h, m), cfg.tz)
+
+    class Slow(_CloseClient):
+        async def snapshots(self, tickers):
+            await asyncio.sleep(0.02)
+            return await super().snapshots(tickers)
+
+    store, client = Store(tmp_path / "c.db"), Slow(day)
+    assert asyncio.run(closeplay.live(client, store, cfg, at(15, 46), raw, [], 6880.0)) == 1
+
+    async def both():
+        return await asyncio.gather(closeplay.manage(client, store, cfg, at(15, 59)),
+                                    closeplay.manage(client, store, cfg, at(15, 59)))
+
+    assert sorted(asyncio.run(both())) == [0, 1]
+    assert len(store.get(closeplay.LOG_KEY)) == 1

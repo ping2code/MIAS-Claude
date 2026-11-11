@@ -368,3 +368,27 @@ def test_no_order_path(cfg, tmp_path):
     store, client = Store(tmp_path / "x.db"), Chain()
     _drive(cfg, store, client, {"SPY": _wave(), "QQQ": _rise(level=200.0)})
     assert {c[0] if isinstance(c, tuple) else c for c in client.calls} <= {"option_chain", "snapshots"}
+
+
+class SlowChain(Chain):
+    """Quotes that take a moment, so the cycle and the 30 s watcher overlap while both wait for them."""
+
+    async def snapshots(self, tickers):
+        await asyncio.sleep(0.02)
+        return await super().snapshots(tickers)
+
+
+def test_cycle_and_watcher_together_close_a_trade_once(cfg, tmp_path):
+    """2026-11-10: the cycle and the watcher both closed QQQ 673P at 09:40 (two alerts, two log rows)."""
+    store, _ = _one_open(cfg, tmp_path)
+    client = SlowChain(mid=1.60)                         # at the stop
+    now = datetime.combine(DAY, time(11, 30), ET)
+    five = {"SPY": [b for b in _rise() if b.t + E.FIVE <= now.timestamp() * 1000]}
+
+    async def both():
+        return await asyncio.gather(S.manage(client, store, cfg, now), S.live(client, store, cfg, now, five))
+
+    asyncio.run(both())
+    assert len(store.get(S.KEY)["closed"]) == 1 and not store.get(S.KEY)["open"]
+    assert len(store.get(S.LOG_KEY)) == 1
+    assert len([m for m in store.pending() if "STOPPED" in str(m)]) == 1

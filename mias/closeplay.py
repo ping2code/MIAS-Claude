@@ -22,6 +22,7 @@ strike is where the call and put are priced alike (put-call parity), and the ind
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import json
 import logging
@@ -364,8 +365,16 @@ def _pair(rows: list[dict], strike: float, kind: str) -> str | None:
                  and float(c["details"]["strike_price"]) == strike), None)
 
 
+LOCK = asyncio.Lock()      # the cycle and the 30 s watcher both call manage at 15:59: one closes, the other sees it
+
+
 async def manage(client, store, cfg, now: datetime) -> int:
     """Sell the open close-play trade at the bid from 15:59 (called by the cycle and the 30 s watcher)."""
+    async with LOCK:
+        return await _manage(client, store, cfg, now)
+
+
+async def _manage(client, store, cfg, now: datetime) -> int:
     local = now.astimezone(cfg.tz)
     st = store.get(KEY) or {}
     if st.get("status") != "open" or st.get("date") != local.date().isoformat() or local.time() < SELL:

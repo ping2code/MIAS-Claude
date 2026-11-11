@@ -16,6 +16,7 @@ The plainest version of the EMA 9/21 idea, to see whether the cross itself has a
     chart invalidation, loss limit or any qualification gate.
 Its own state, trade log and alerts: Strategies A/B/C/D/E7/E21 never see it and it never sees them. No order path.
 """
+import asyncio
 import logging
 from dataclasses import asdict, replace
 from datetime import date, datetime
@@ -33,6 +34,8 @@ TARGET, STOP = 0.25, 0.20
 KEY = "ema_simple_day"
 LOG_KEY = "ema_simple_log"
 LOG_MAX = 3000
+LOCK = asyncio.Lock()               # the cycle (live) and the 30 s watcher (manage) both update the day's state;
+                                    # without it both can close the same trade (2026-11-10 QQQ 673P, logged twice)
 FRESH_MS = 2 * FIVE                 # a signal found later than this after its candle closed is not traded (missed)
 
 
@@ -197,12 +200,13 @@ async def _snapshots(client, st: dict) -> dict:
 
 async def manage(client, store, cfg, now: datetime) -> int:
     """The 30 s watcher: re-price open paper trades (target, stop, 15:10)."""
-    st = _state(store, now.astimezone(cfg.tz).date())
-    if not st["open"]:
-        return 0
-    sent = _manage(await _snapshots(client, st), store, cfg, now, st)
-    store.put(KEY, st)
-    return sent
+    async with LOCK:
+        st = _state(store, now.astimezone(cfg.tz).date())
+        if not st["open"]:
+            return 0
+        sent = _manage(await _snapshots(client, st), store, cfg, now, st)
+        store.put(KEY, st)
+        return sent
 
 
 async def _enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], st: dict) -> int:
@@ -264,14 +268,16 @@ async def _enter(client, store, cfg, now: datetime, five: dict[str, list[Bar]], 
 async def live(client, store, cfg, now: datetime, five: dict[str, list[Bar]]) -> int:
     """Once per cycle: manage open trades, open new ones, and the closing summary."""
     today = now.astimezone(cfg.tz).date()
-    st = _state(store, today)
-    sent = _manage(await _snapshots(client, st), store, cfg, now, st)
-    sent += await _enter(client, store, cfg, now, five, st)
-    if int(now.timestamp() * 1000) >= _at(today, cfg.daytrade.close, cfg.tz) and not st["open"] and not st["summary"]:
-        text = summary_text(st, today)
-        if text:
-            store.enqueue("ema_summary", text)
-            sent += 1
-        st["summary"] = True
-    store.put(KEY, st)
-    return sent
+    async with LOCK:
+        st = _state(store, today)
+        sent = _manage(await _snapshots(client, st), store, cfg, now, st)
+        sent += await _enter(client, store, cfg, now, five, st)
+        if int(now.timestamp() * 1000) >= _at(today, cfg.daytrade.close, cfg.tz) and not st["open"] \
+                and not st["summary"]:
+            text = summary_text(st, today)
+            if text:
+                store.enqueue("ema_summary", text)
+                sent += 1
+            st["summary"] = True
+        store.put(KEY, st)
+        return sent
