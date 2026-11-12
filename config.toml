@@ -319,3 +319,22 @@ port = 8080
 [storage]
 path = "data/mias.db"
 retention_days = 30
+
+[observer]
+# Live Observer + Early Watch, SHADOW MODE (added 2026-11-11). A separate process and service:
+#   python -m mias.observer run        (deploy/systemd/mias-observer.service)
+# It streams Massive WebSocket per-minute bars (AM) for these symbols, keeps its own chart state and logs EARLY WATCH
+# events to its own database. It never trades, never sends Telegram (no sender exists; telegram stays false), never
+# writes data/mias.db and never calls the strategy engines; it only reads MIAS data to link watches to the confirmed
+# events that followed. The rules are frozen in mias/observer/rules.py and docs/observer/PREREGISTRATION.md.
+enabled = true
+symbols = ["SPY", "QQQ", "IWM", "NVDA", "TSLA", "META", "MSFT", "AAPL", "AMZN", "AMD", "PG"]   # = [daytrade] symbols
+ws_url = "wss://socket.massive.com/stocks"
+db_path = "data/observer/observer.db"
+cache_dir = "data/observer/cache"
+minute_grace_seconds = 5      # a minute is evaluated when every symbol reported it, or 5 s after it ended
+watchdog_seconds = 150        # no AM message for this long during the session forces a reconnect
+connect_from = "04:00"        # ET, weekdays: extended-hours bars are recorded (validation), only 09:30-16:00 evaluated
+connect_until = "20:05"
+confirm_poll_seconds = 20     # read-only poll of MIAS confirmed events (paper entries, swing / strong alerts)
+telegram = false

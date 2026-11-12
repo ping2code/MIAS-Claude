@@ -1,0 +1,19 @@
+# MIAS Live Observer + Early Watch, SHADOW MODE. Independent of mias-claude: own process, own database
+# (data/observer/), no Telegram, read-only access to data/mias.db. Stopping or restarting it never affects mias-claude.
+#   cp deploy/systemd/mias-observer.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mias-observer
+[Unit]
+Description=MIAS Live Observer + Early Watch (shadow mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/MyRepos/MIAS-Claude
+ExecStart=%h/MyRepos/MIAS-Claude/.venv/bin/python -m mias.observer run
+Restart=always
+RestartSec=20
+Nice=10
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target
