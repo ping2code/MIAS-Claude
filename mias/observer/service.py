@@ -14,6 +14,10 @@ Telegram pilot ([observer] telegram = true): after a new main-lane watch is stor
 else) is queued for a separate send worker if the watch is fresh (created within telegram_max_age_seconds, so a
 restart backfill never re-sends or sends stale watches). The send outcome is written to the watch row; a failed or
 slow send never blocks or changes observer state.
+
+Early Watch v2 research ([observer] v2 = true): a separate V2Observer (own state instances, own database
+data/observer/v2.db) receives the same bars right after v1 has finished with them; any v2 error is logged and never
+reaches v1. v2 Telegram ([observer] v2_telegram) has its own policy (mias.observer.v2.V2Telegram) and queue.
 """
 from __future__ import annotations
 
@@ -35,7 +39,7 @@ log = logging.getLogger("mias.observer")
 
 
 class LiveRunner:
-    def __init__(self, cfg, settings, client, db: ObserverDB, source, clock=time.time, sender=None):
+    def __init__(self, cfg, settings, client, db: ObserverDB, source, clock=time.time, sender=None, v2db=None):
         self.cfg, self.s, self.client, self.db, self.source = cfg, settings, client, db, source
         self.tz = cfg.tz
         self.clock = clock
@@ -54,6 +58,13 @@ class LiveRunner:
         self.sender = sender
         self.outbox: asyncio.Queue = asyncio.Queue()
         self.counts.update({"tg_queued": 0, "tg_sent": 0, "tg_failed": 0, "tg_skipped_stale": 0})
+        from .v2 import V2Telegram
+        self.v2db = v2db
+        self.v2 = None
+        self.v2tg = V2Telegram(max_age_s=settings.telegram_max_age_s)
+        self.v2_outbox: asyncio.Queue = asyncio.Queue()
+        self.counts.update({"v2_watches": 0, "v2_errors": 0, "v2_tg_sent": 0, "v2_tg_failed": 0, "v2_tg_merged": 0,
+                            "v2_tg_skipped": 0})
 
     # ---- clocks -----------------------------------------------------------------------------------
 
@@ -87,6 +98,15 @@ class LiveRunner:
         daily = await daily_closes(self.client, self.s.cache_dir, syms, day - timedelta(days=1), self.tz)
         confirms = self.source.confirms(day, syms)
         self.ob = build_observer(syms, day, self.tz, hist, daily, confirms, self.source.options_context)
+        if self.v2db is not None:
+            try:
+                from .v2_replay import build_v2
+                self.v2 = build_v2(syms, day, self.tz, hist, daily, confirms, self.source.options_context)
+                for ev in confirms:
+                    self.v2db.confirm(str(day), ev)
+            except Exception:
+                self.v2 = None
+                log.exception("v2 start failed (v1 unaffected)")
         self.day = day
         self.pending.clear()
         for ev in confirms:
@@ -188,6 +208,24 @@ class LiveRunner:
                          " opening_shadow_only" if ev["opening_shadow_only"] else "")
             elif ev["kind"] == "end":
                 log.info("SHADOW watch end %s %s (%s)", ev["watch_id"], ev["state"], ev["end_reason"])
+        if self.v2 is not None:
+            self._process_v2(sym, b, source, received_at, gap)
+
+    def _process_v2(self, sym: str, b: Bar, source: str, received_at: float | None, gap: bool) -> None:
+        """Research track; runs after v1 is done with the bar. Errors stay here."""
+        try:
+            events = self.v2.process(sym, b, gap, received_at)
+            self.v2db.bar1(str(self.day), sym, b, source)
+            new = self.v2db.apply_v2(events, "live", received_at)
+            self.counts["v2_watches"] += len(new)
+            for ev in events:
+                if ev["kind"] == "v2_watch" and ev["watch_id"] in new:
+                    log.info("V2 WATCH %s %s %s %s @ %.2f (%s, pre-EMA %s)", ev["family"], ev["lane"], ev["sym"],
+                             ev["side"], ev["watch_price"], ev["leg_id"], ev["pre_ema"])
+                    self._maybe_queue_v2(ev)
+        except Exception:
+            self.counts["v2_errors"] += 1
+            log.exception("v2 processing failed for %s (v1 unaffected)", sym)
 
     # ---- Telegram pilot ---------------------------------------------------------------------------
 
@@ -201,6 +239,40 @@ class LiveRunner:
             return
         self.outbox.put_nowait(ev)
         self.counts["tg_queued"] += 1
+
+    def _maybe_queue_v2(self, w: dict) -> None:
+        if not (self.s.v2_telegram and self.sender is not None):
+            return
+        verdict, info = self.v2tg.decide(w, int(self.clock() * 1000))
+        if verdict == "send":
+            fams = sorted({k[0] for k in self.v2.open if k[1] == w["sym"] and k[2] == w["side"]} | {w["family"]})
+            self.v2_outbox.put_nowait((w, fams, info))
+        elif verdict == "merged":
+            self.counts["v2_tg_merged"] += 1
+            self.v2db.mark_v2_telegram(w["watch_id"], False, None, f"merged into {info}", info, self.clock())
+        else:
+            self.counts["v2_tg_skipped"] += 1
+            self.v2db.mark_v2_telegram(w["watch_id"], False, None, f"not sent: {info}", None, self.clock())
+
+    async def v2_send_worker(self, stop: asyncio.Event) -> None:
+        from .v2 import v2_text
+        while not stop.is_set():
+            try:
+                w, fams, group = await asyncio.wait_for(self.v2_outbox.get(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                ids = await asyncio.wait_for(self.sender.send(v2_text(w, fams, self.tz)), timeout=30)
+                self.v2db.mark_v2_telegram(w["watch_id"], True, ids, None, group, self.clock())
+                self.counts["v2_tg_sent"] += 1
+            except Exception as exc:
+                self.counts["v2_tg_failed"] += 1
+                try:
+                    self.v2db.mark_v2_telegram(w["watch_id"], False, None, f"{type(exc).__name__}: {exc}"[:300],
+                                               group, self.clock())
+                    self.feed("v2_telegram_failed", f"{w['watch_id']}: {type(exc).__name__}")
+                except Exception:
+                    log.exception("could not record the v2 telegram failure")
 
     async def send_worker(self, stop: asyncio.Event) -> None:
         from .message import watch_text
@@ -231,6 +303,12 @@ class LiveRunner:
         for ev in self.source.confirms(self.day, self.s.symbols):
             if self.ob.add_confirm(ev):
                 self.db.confirm(str(self.day), ev)
+            if self.v2 is not None:
+                try:
+                    if self.v2.add_confirm(ev):
+                        self.v2db.confirm(str(self.day), ev)
+                except Exception:
+                    log.exception("v2 confirm failed")
 
     async def end_of_day(self) -> None:
         if self.ob is None or str(self.day) in self.finalized:
@@ -251,6 +329,17 @@ class LiveRunner:
                   Path("data/observer/daily") / str(self.day), day=str(self.day))
         except Exception:
             log.exception("end-of-day report failed")
+        if self.v2 is not None:
+            try:
+                async with self.lock:
+                    self.v2db.apply_v2(self.v2.finalize(), "live")
+                    self.v2db.db.execute("UPDATE v2_watches SET state='EXPIRED', end_reason='session_end_orphan', "
+                                         "end_at=? WHERE day=? AND state='WATCH'", (self.ob.t_close, str(self.day)))
+                from .v2_report import build_v2_report
+                build_v2_report(self.v2db, self.tz, Path("data/observer/daily") / str(self.day), day=str(self.day),
+                                v1db=self.db, title=f"Early Watch v1 vs v2 — live session {self.day}")
+            except Exception:
+                log.exception("v2 end of day failed")
         rows = self.db.watches("day = ?", (str(self.day),))
         self.feed("day_end", f"{self.day}: {len(rows)} shadow watches "
                              f"({sum(r['lane'] == 'main' for r in rows)} main, "
@@ -328,7 +417,11 @@ async def main(cfg, settings) -> None:
         except NotImplementedError:
             pass
     sender = None
-    if settings.telegram:
+    v2db = None
+    if settings.v2:
+        from .v2_log import V2DB
+        v2db = V2DB(settings.v2_db_path)
+    if settings.telegram or (settings.v2 and settings.v2_telegram):
         if cfg.telegram_token and cfg.telegram_alert_chats:
             from .telegram import WatchSender
             sender = WatchSender(cfg.telegram_token, cfg.telegram_alert_chats)
@@ -336,16 +429,20 @@ async def main(cfg, settings) -> None:
             log.warning("observer telegram = true but no bot token / alert chat: watches are only logged")
     async with MassiveClient(cfg.api_key, cfg.base_url, timeout=cfg.request_timeout, max_retries=cfg.max_retries,
                              max_concurrency=4) as client:
-        runner = LiveRunner(cfg, settings, client, db, source, sender=sender)
+        runner = LiveRunner(cfg, settings, client, db, source, sender=sender, v2db=v2db)
         stream = StreamClient(settings.ws_url, cfg.api_key, settings.symbols, on_bar=runner.on_bar,
                               on_connect=runner.on_connect, on_feed=runner.feed, in_session=runner.in_session,
                               watchdog_s=settings.watchdog_s)
         runner.stream = stream
-        runner.feed("start", f"{len(settings.symbols)} symbols, telegram "
-                             f"{'PILOT ON (initial main-lane watch messages only)' if sender else 'disabled'}")
+        runner.feed("start", f"{len(settings.symbols)} symbols, v1 telegram "
+                             f"{'PILOT ON (initial main-lane watch messages only)' if sender and settings.telegram else 'off'}"
+                             f", v2 research {'ON' if v2db else 'off'}, v2 telegram "
+                             f"{'ON' if sender and v2db and settings.v2_telegram else 'off'}")
         tasks = [stream.run(stop, runner.connect_window), runner.loop(stop)]
         if sender:
             tasks.append(runner.send_worker(stop))
+            if v2db is not None and settings.v2_telegram:
+                tasks.append(runner.v2_send_worker(stop))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -353,3 +450,5 @@ async def main(cfg, settings) -> None:
             if sender:
                 await sender.close()
             db.close()
+            if v2db is not None:
+                v2db.close()

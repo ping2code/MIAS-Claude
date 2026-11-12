@@ -237,6 +237,24 @@ def build(db, tz: ZoneInfo, title: str, out_dir: Path, day: str | None = None) -
           f"days with none {sum(c == 0 for c in counts)} of {len(days)}" if days else "- no days",
           f"- per symbol per day (when a symbol had any): mean "
           f"{mean(per_sym_day.values()):.2f} · max {max(per_sym_day.values())}" if per_sym_day else "- –", ""]
+    # terminology (2026-11-11): raw candidate legs -> suppressed -> watch events created -> Telegram sent
+    legs = db.db.execute("SELECT lane, day, sym, side, leg_id FROM watches WHERE ? IS NULL OR day = ? UNION "
+                         "SELECT lane, day, sym, side, leg_id FROM suppressed WHERE ? IS NULL OR day = ?",
+                         (day, day, day, day)).fetchall()
+    watched = {(w["lane"], w["day"], w["sym"], w["side"], w["leg_id"]) for w in watches}
+    never = [k for k in legs if k not in watched and k[0] == "main"]
+    first = Counter()
+    for k in never:
+        rs = [r[0] for r in db.db.execute("SELECT reason FROM suppressed WHERE lane=? AND day=? AND sym=? AND side=? "
+                                          "AND leg_id=? ORDER BY at", k)]
+        first[rs[0] if rs else "?"] += 1
+    L += ["Funnel (main lane): RAW CANDIDATE LEGS (symbol / side / leg on which the criteria held on 2 closes) → "
+          "WATCH EVENTS CREATED → TELEGRAM SENT. Suppression records count each lane / symbol / side / leg / reason "
+          "once; a leg can be suppressed and still be watched later.", "",
+          f"- raw candidate legs {sum(1 for k in legs if k[0] == 'main')} → watch events created {len(main)} → "
+          f"Telegram sent {sum(1 for w in main if w.get('telegram_sent'))}",
+          f"- legs never watched {len(never)}, by first recorded reason: "
+          + ", ".join(f"{r} {n}" for r, n in first.most_common()), ""]
     L += ["| Symbol | Main watches | per day | Upgraded | Invalidated |", "|---|---|---|---|---|"]
     sym_c = Counter(w["sym"] for w in main)
     for s, n in sym_c.most_common():

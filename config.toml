@@ -342,3 +342,10 @@ confirm_poll_seconds = 20     # read-only poll of MIAS confirmed events (paper e
 # 09:30-09:45 candidates, nothing found late by a restart backfill. Same bot and alert chats as MIAS. false = log only.
 telegram = true
 telegram_max_age_seconds = 180
+# 2026-11-11 (user): Early Watch v2 RESEARCH (post-hoc hypotheses, docs/observer/V2_PREREGISTRATION.md, frozen at
+# 934a2e2): structure / VWAP / opening-range families, EMA as context only, own database. v1 above is the control and
+# is unchanged. v2 Telegram: own policy (1 per family / symbol / side / setup, families combined within 5 min, 6 per
+# hour, main lane 09:45-15:00 only), messages end "RESEARCH WATCH ONLY — NOT A TRADE SIGNAL".
+v2 = true
+v2_db_path = "data/observer/v2.db"
+v2_telegram = true

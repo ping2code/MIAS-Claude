@@ -28,6 +28,14 @@ def main(argv=None) -> int:
     v = sub.add_parser("validate", help="REST vs WebSocket bars for a day (Phase A)")
     v.add_argument("--date", default=None)
     sub.add_parser("status", help="last status line, feed events and today's watches")
+    v2r = sub.add_parser("v2-replay", help="Early Watch v2 research replay for a fixed period")
+    v2r.add_argument("--period", choices=["development", "holdout"], required=True)
+    v2r.add_argument("--db", default=None)
+    v2p = sub.add_parser("v2-report", help="v2 research report (v1 as control)")
+    v2p.add_argument("--db", default="data/observer/v2.db")
+    v2p.add_argument("--v1db", default=None)
+    v2p.add_argument("--day", default=None)
+    v2p.add_argument("--out", default=None)
     sub.add_parser("telegram-test", help="send one clearly-labelled test message through the observer sender")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -85,6 +93,25 @@ def main(argv=None) -> int:
         out.write_text(text)
         print(text)
         db.close()
+        return 0
+    if args.cmd == "v2-replay":
+        from .sources import MiasSource
+        from .v2_replay import replay_v2
+        periods = {"development": (date(2026, 7, 1), date(2026, 9, 16)),
+                   "holdout": (date(2026, 9, 17), date(2026, 11, 11))}      # V2_PREREGISTRATION.md section 6
+        start, end = periods[args.period]
+        db_path = Path(args.db or f"data/observer/v2_{args.period}.db")
+        src = MiasSource(Path(cfg.db_path), cfg, REPLAY_CSV)
+        print(asyncio.run(replay_v2(cfg, s, start, end, db_path, src)))
+        return 0
+    if args.cmd == "v2-report":
+        from .log import ObserverDB
+        from .v2_log import V2DB
+        from .v2_report import build_v2_report
+        db = V2DB(Path(args.db))
+        v1 = ObserverDB(Path(args.v1db)) if args.v1db else None
+        out = Path(args.out) if args.out else Path(args.db).parent / (Path(args.db).stem + "_report")
+        print(build_v2_report(db, cfg.tz, out, day=args.day, v1db=v1, title=f"Early Watch v2 — {Path(args.db).name}"))
         return 0
     if args.cmd == "telegram-test":
         from .telegram import WatchSender

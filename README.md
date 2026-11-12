@@ -613,6 +613,12 @@ Stopping or restarting it does not affect `mias-claude`.
 
 First replay (40 days to 2026-11-11): `docs/observer/replay_2026-11-11.md`.
 
+**Early Watch v2 (research, post-hoc):** three separately measured families that do not require the EMA cross —
+structure first, VWAP reclaim / rejection first, opening range first — run beside v1 (the frozen control) in the same
+process with their own database (`data/observer/v2.db`) and Telegram policy. Rules, periods and acceptance criteria:
+`docs/observer/V2_PREREGISTRATION.md` (frozen before any v2 result). `python -m mias.observer v2-replay --period
+development|holdout`, `v2-report --db … [--v1db …] [--day …]`.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

@@ -21,6 +21,9 @@ class Settings:
     confirm_poll_s: float
     telegram: bool          # pilot: send the initial message of fresh main-lane watches (user, 2026-11-11)
     telegram_max_age_s: float = 180   # a watch older than this when found (e.g. restart backfill) is not sent
+    v2: bool = False                  # Early Watch v2 research families (docs/observer/V2_PREREGISTRATION.md)
+    v2_db_path: Path = Path("data/observer/v2.db")
+    v2_telegram: bool = False
 
 
 def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = None) -> Settings:
@@ -41,4 +44,6 @@ def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = 
         connect_until=time.fromisoformat(str(raw.get("connect_until", "20:05"))),
         confirm_poll_s=float(raw.get("confirm_poll_seconds", 20)),
         telegram=bool(raw.get("telegram", False)),
-        telegram_max_age_s=float(raw.get("telegram_max_age_seconds", 180)))
+        telegram_max_age_s=float(raw.get("telegram_max_age_seconds", 180)),
+        v2=bool(raw.get("v2", False)), v2_db_path=Path(raw.get("v2_db_path", "data/observer/v2.db")),
+        v2_telegram=bool(raw.get("v2_telegram", False)))
