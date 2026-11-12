@@ -586,6 +586,33 @@ the index ETFs? It is **not** one of the `[daytrade] strategies`: its own module
 - **Exit:** sell all at the bid when the mid reaches +25% (never above the target price) or −20%, or at 15:10. No
   partials, runners, breakeven, trail, chart invalidation or loss limit.
 
+## Live Observer + Early Watch (shadow mode)
+
+A separate process and service (`python -m mias.observer run`, `deploy/systemd/mias-observer.service`) that watches
+the 11 EMA day-trade symbols like a person watching a chart and logs an informational **EARLY WATCH** ("something may
+be developing") to its own database, `data/observer/observer.db`. Shadow mode: it sends no Telegram (there is no
+sender), opens no paper trade, names no contract, never writes `data/mias.db` and never calls the strategy engines.
+Stopping or restarting it does not affect `mias-claude`.
+
+* Data: one Massive stocks WebSocket connection, per-minute aggregates (`AM`), observer symbols only; REST 1-minute
+  bars warm it up and fill any gap (after a reconnect, before evaluation).
+* State from completed 1-minute bars: forming 5-minute bar, EMA 9/21 (and provisional), VWAP, opening range, ATR,
+  confirmed 5-minute pivots (k = 2, known only at confirmation) and developing Higher Low / Lower High.
+* Rules (frozen, `docs/observer/PREREGISTRATION.md`): VWAP side, EMA 9/21 relationship and widening spread, and a
+  developing HL/LH or opening-range break, all on 2 completed closes, 09:45–15:00 ET; 30-min cooldown, chop lock,
+  3 per symbol per day, 6 per hour. 09:30–09:45 candidates are logged as research only.
+* A watch is UPGRADED when an existing confirmed event (B / C / D / E7 / E21 / Simple entry, swing or strong alert)
+  follows on the same side within 60 minutes, otherwise INVALIDATED or EXPIRED.
+
+```
+.venv/bin/python -m mias.observer status                  # connection, lag per symbol, today's watches
+.venv/bin/python -m mias.observer validate --date 2026-11-12   # REST vs WebSocket bars (written nightly at 20:10 ET)
+.venv/bin/python -m mias.observer report                  # score the live shadow database
+.venv/bin/python -m mias.observer replay --days 40        # same code on historical REST bars (data/observer/replay.db)
+```
+
+First replay (40 days to 2026-11-11): `docs/observer/replay_2026-11-11.md`.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market
