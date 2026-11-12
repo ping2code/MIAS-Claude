@@ -128,7 +128,7 @@ async def replay(cfg, settings, days: int, end: date, db_path: Path, cache_dir: 
         for s in syms:
             for b in hist.get(s, {}).get(d, []):
                 db.bar1(str(d), s, b, "rest")
-        summary["watches"] += db.apply(events, "replay")
+        summary["watches"] += len(db.apply(events, "replay"))
     db.put("replay", {"days": summary["days"], "end": str(end), "symbols": syms})
     db.close()
     return summary

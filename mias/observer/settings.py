@@ -19,7 +19,8 @@ class Settings:
     connect_from: time
     connect_until: time
     confirm_poll_s: float
-    telegram: bool          # always False in v1: there is no sender; the formatter exists for review only
+    telegram: bool          # pilot: send the initial message of fresh main-lane watches (user, 2026-11-11)
+    telegram_max_age_s: float = 180   # a watch older than this when found (e.g. restart backfill) is not sent
 
 
 def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = None) -> Settings:
@@ -39,4 +40,5 @@ def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = 
         connect_from=time.fromisoformat(str(raw.get("connect_from", "04:00"))),
         connect_until=time.fromisoformat(str(raw.get("connect_until", "20:05"))),
         confirm_poll_s=float(raw.get("confirm_poll_seconds", 20)),
-        telegram=False)
+        telegram=bool(raw.get("telegram", False)),
+        telegram_max_age_s=float(raw.get("telegram_max_age_seconds", 180)))

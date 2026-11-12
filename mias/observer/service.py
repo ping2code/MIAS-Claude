@@ -9,6 +9,11 @@ processed in symbol order (SPY first). Before a symbol's bar is processed, a gap
 filled from REST; if REST cannot be reached the bar is processed with gap=True (stale for 2 bars). After a
 reconnect every symbol is backfilled from REST before newer stream bars are evaluated. Bars older than the last
 processed bar of that symbol are recorded but never evaluated.
+
+Telegram pilot ([observer] telegram = true): after a new main-lane watch is stored, its initial message (and nothing
+else) is queued for a separate send worker if the watch is fresh (created within telegram_max_age_seconds, so a
+restart backfill never re-sends or sends stale watches). The send outcome is written to the watch row; a failed or
+slow send never blocks or changes observer state.
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ log = logging.getLogger("mias.observer")
 
 
 class LiveRunner:
-    def __init__(self, cfg, settings, client, db: ObserverDB, source, clock=time.time):
+    def __init__(self, cfg, settings, client, db: ObserverDB, source, clock=time.time, sender=None):
         self.cfg, self.s, self.client, self.db, self.source = cfg, settings, client, db, source
         self.tz = cfg.tz
         self.clock = clock
@@ -46,6 +51,9 @@ class LiveRunner:
         self.last_status = 0.0
         self.last_poll = 0.0
         self.stream: StreamClient | None = None
+        self.sender = sender
+        self.outbox: asyncio.Queue = asyncio.Queue()
+        self.counts.update({"tg_queued": 0, "tg_sent": 0, "tg_failed": 0, "tg_skipped_stale": 0})
 
     # ---- clocks -----------------------------------------------------------------------------------
 
@@ -171,14 +179,49 @@ class LiveRunner:
         self.db.bar1(str(self.day), sym, b, source)
         new = self.db.apply(events, "live")
         self.counts["processed"] += 1
-        self.counts["watches"] += new
+        self.counts["watches"] += len(new)
         for ev in events:
-            if ev["kind"] == "watch" and new:
+            if ev["kind"] == "watch" and ev["watch_id"] in new:
+                self._maybe_queue(ev)
                 log.info("SHADOW EARLY WATCH %s %s %s %s @ %.2f (%s)%s", ev["lane"], ev["sym"], ev["side"],
                          ev["structure_type"], ev["price"], ev["leg_id"],
                          " opening_shadow_only" if ev["opening_shadow_only"] else "")
             elif ev["kind"] == "end":
                 log.info("SHADOW watch end %s %s (%s)", ev["watch_id"], ev["state"], ev["end_reason"])
+
+    # ---- Telegram pilot ---------------------------------------------------------------------------
+
+    def _maybe_queue(self, ev: dict) -> None:
+        if not (self.s.telegram and self.sender is not None) or ev["lane"] != "main" or ev["opening_shadow_only"]:
+            return
+        age = self.clock() - ev["created_at"] / 1000
+        if age > self.s.telegram_max_age_s:
+            self.counts["tg_skipped_stale"] += 1
+            self.db.mark_telegram(ev["watch_id"], False, None, f"not sent: {age:.0f}s old when found", self.clock())
+            return
+        self.outbox.put_nowait(ev)
+        self.counts["tg_queued"] += 1
+
+    async def send_worker(self, stop: asyncio.Event) -> None:
+        from .message import watch_text
+        while not stop.is_set():
+            try:
+                ev = await asyncio.wait_for(self.outbox.get(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            try:
+                ids = await asyncio.wait_for(self.sender.send(watch_text(ev, self.tz)), timeout=30)
+                self.db.mark_telegram(ev["watch_id"], True, ids, None, self.clock())
+                self.counts["tg_sent"] += 1
+                log.info("telegram sent %s (message %s)", ev["watch_id"], ",".join(ids))
+            except Exception as exc:                      # never let delivery affect the observer
+                self.counts["tg_failed"] += 1
+                try:
+                    self.db.mark_telegram(ev["watch_id"], False, None, f"{type(exc).__name__}: {exc}"[:300],
+                                          self.clock())
+                    self.feed("telegram_failed", f"{ev['watch_id']}: {type(exc).__name__}")
+                except Exception:
+                    log.exception("could not record the telegram failure")
 
     # ---- confirmed events / end of day ------------------------------------------------------------
 
@@ -202,6 +245,12 @@ class LiveRunner:
             self.db.db.execute("UPDATE watches SET state='EXPIRED', end_reason='session_end_orphan', end_at=? "
                                "WHERE day=? AND state='WATCH'", (self.ob.t_close, str(self.day)))
         self.finalized.add(str(self.day))
+        try:
+            from .report import build
+            build(self.db, self.tz, f"Early Watch v1 — live session {self.day}",
+                  Path("data/observer/daily") / str(self.day), day=str(self.day))
+        except Exception:
+            log.exception("end-of-day report failed")
         rows = self.db.watches("day = ?", (str(self.day),))
         self.feed("day_end", f"{self.day}: {len(rows)} shadow watches "
                              f"({sum(r['lane'] == 'main' for r in rows)} main, "
@@ -226,6 +275,13 @@ class LiveRunner:
               "connected": bool(self.stream and self.stream.connected),
               "last_msg_age_s": round(self.clock() - self.stream.last_msg, 1) if self.stream and self.stream.last_msg
               else None, "reconnects": self.stream.reconnects if self.stream else 0, **self.counts}
+        try:
+            import resource
+            ru = resource.getrusage(resource.RUSAGE_SELF)
+            st["rss_mb"] = round(ru.ru_maxrss / 1024, 1)
+            st["cpu_s"] = round(ru.ru_utime + ru.ru_stime, 1)
+        except Exception:
+            pass
         if self.ob is not None:
             now_ms = int(self.clock() * 1000)
             st["lag_min"] = {s: None if x.last_e is None else round((now_ms - x.last_e) / ONE, 1)
@@ -271,16 +327,29 @@ async def main(cfg, settings) -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
+    sender = None
+    if settings.telegram:
+        if cfg.telegram_token and cfg.telegram_alert_chats:
+            from .telegram import WatchSender
+            sender = WatchSender(cfg.telegram_token, cfg.telegram_alert_chats)
+        else:
+            log.warning("observer telegram = true but no bot token / alert chat: watches are only logged")
     async with MassiveClient(cfg.api_key, cfg.base_url, timeout=cfg.request_timeout, max_retries=cfg.max_retries,
                              max_concurrency=4) as client:
-        runner = LiveRunner(cfg, settings, client, db, source)
+        runner = LiveRunner(cfg, settings, client, db, source, sender=sender)
         stream = StreamClient(settings.ws_url, cfg.api_key, settings.symbols, on_bar=runner.on_bar,
                               on_connect=runner.on_connect, on_feed=runner.feed, in_session=runner.in_session,
                               watchdog_s=settings.watchdog_s)
         runner.stream = stream
-        runner.feed("start", f"shadow mode, {len(settings.symbols)} symbols, telegram disabled")
+        runner.feed("start", f"{len(settings.symbols)} symbols, telegram "
+                             f"{'PILOT ON (initial main-lane watch messages only)' if sender else 'disabled'}")
+        tasks = [stream.run(stop, runner.connect_window), runner.loop(stop)]
+        if sender:
+            tasks.append(runner.send_worker(stop))
         try:
-            await asyncio.gather(stream.run(stop, runner.connect_window), runner.loop(stop))
+            await asyncio.gather(*tasks)
         finally:
             runner.feed("stop", "")
+            if sender:
+                await sender.close()
             db.close()

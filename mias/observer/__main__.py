@@ -28,6 +28,7 @@ def main(argv=None) -> int:
     v = sub.add_parser("validate", help="REST vs WebSocket bars for a day (Phase A)")
     v.add_argument("--date", default=None)
     sub.add_parser("status", help="last status line, feed events and today's watches")
+    sub.add_parser("telegram-test", help="send one clearly-labelled test message through the observer sender")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -84,6 +85,24 @@ def main(argv=None) -> int:
         out.write_text(text)
         print(text)
         db.close()
+        return 0
+    if args.cmd == "telegram-test":
+        from .telegram import WatchSender
+        if not (cfg.telegram_token and cfg.telegram_alert_chats):
+            print("no Telegram bot token / alert chat configured")
+            return 1
+        text = ("👀 EARLY WATCH pilot — delivery test (not a watch)\n"
+                f"Live Early Watch messages {'are ON' if s.telegram else 'are OFF'} for the 09:45–15:00 ET session.\n"
+                "Each one is informational only: WATCH ONLY — NOT A TRADE SIGNAL")
+
+        async def go():
+            snd = WatchSender(cfg.telegram_token, cfg.telegram_alert_chats)
+            try:
+                return await snd.send(text)
+            finally:
+                await snd.close()
+        ids = asyncio.run(go())
+        print(f"sent to {len(ids)} chat(s), message ids {', '.join(ids)}")
         return 0
     if args.cmd == "status":
         from .log import ObserverDB

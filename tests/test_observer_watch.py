@@ -242,8 +242,9 @@ def test_telegram_text_is_watch_only():
         assert word not in text.lower()
 
 
-def test_observer_package_has_no_telegram_sender():
+def test_observer_never_uses_the_mias_outbox_or_notifier():
     import pathlib
     src = "".join(p.read_text() for p in pathlib.Path("mias/observer").glob("*.py"))
-    assert "api.telegram.org" not in src and "notify" not in src and "Telegram(" not in src
-    assert "enqueue(" not in src                               # never writes the MIAS outbox
+    assert "enqueue(" not in src and "Dispatcher" not in src and "from ..notify" not in src
+    others = [p for p in pathlib.Path("mias/observer").glob("*.py") if p.name != "telegram.py"]
+    assert not any("api.telegram.org" in p.read_text() for p in others)   # one sender, in telegram.py only

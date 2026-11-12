@@ -48,6 +48,11 @@ class ObserverDB:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(watches)")}
+        for col, typ in (("telegram_sent", "INTEGER NOT NULL DEFAULT 0"), ("telegram_message_id", "TEXT"),
+                         ("telegram_error", "TEXT"), ("telegram_sent_at", "REAL")):
+            if col not in have:
+                self.db.execute(f"ALTER TABLE watches ADD COLUMN {col} {typ}")
 
     def close(self) -> None:
         self.db.close()
@@ -78,9 +83,9 @@ class ObserverDB:
 
     # ---- observer events ------------------------------------------------------------------------
 
-    def apply(self, events: list[dict], mode: str) -> int:
-        """Persist observer events. Returns the number of NEW watches (not seen before)."""
-        new = 0
+    def apply(self, events: list[dict], mode: str) -> list[str]:
+        """Persist observer events. Returns the ids of NEW watches (not seen before)."""
+        new: list[str] = []
         for ev in events:
             k = ev["kind"]
             if k == "watch":
@@ -89,7 +94,8 @@ class ObserverDB:
                 cur = self.db.execute(
                     f"INSERT OR IGNORE INTO watches ({','.join(WATCH_COLS)}) VALUES ({','.join('?' * len(WATCH_COLS))})",
                     [row.get(c) for c in WATCH_COLS])
-                new += cur.rowcount
+                if cur.rowcount:
+                    new.append(ev["watch_id"])
             elif k == "end":
                 self.db.execute("UPDATE watches SET state=?, end_at=?, end_reason=?, upgrade_source=?, upgrade_at=?, "
                                 "upgrade_price=? WHERE watch_id=? AND state='WATCH'",
@@ -106,6 +112,12 @@ class ObserverDB:
                 self.db.execute("INSERT OR IGNORE INTO structure VALUES (?,?,?,?,?,?,?)",
                                 (ev["day"], ev["sym"], ev["event"], ev["level"], ev["anchor_t"], ev["at"], None))
         return new
+
+    def mark_telegram(self, watch_id: str, sent: bool, ids: list[str] | None, error: str | None,
+                      at: float) -> None:
+        self.db.execute("UPDATE watches SET telegram_sent=?, sent=?, telegram_message_id=?, telegram_error=?, "
+                        "telegram_sent_at=? WHERE watch_id=?",
+                        (int(sent), int(sent), ",".join(ids or []) or None, error, at if sent else None, watch_id))
 
     def confirm(self, day: str, ev: dict) -> None:
         self.db.execute("INSERT OR IGNORE INTO confirms VALUES (?,?,?,?,?)",
