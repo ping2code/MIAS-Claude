@@ -65,6 +65,19 @@ def _block(title: str, rows: list[dict], since: date, days: int, fee: float, con
     return lines
 
 
+def _not_running(name: str, rules) -> str:
+    """Label for a logged strategy that is not in [daytrade] strategies: retired (A) or paused (B, 2026-11-13)."""
+    if name in rules.strategies:
+        return ""
+    from .paperscore import CODES, PAUSED, RETIRED
+    code = CODES.get(name)
+    if code in PAUSED:
+        return f" (paused — benchmark; no new entries after {PAUSED[code]})"
+    if code in RETIRED:
+        return f" (retired {RETIRED[code]})"
+    return " (no longer running)"
+
+
 def report(store, cfg, now: datetime, days: int = 7) -> str:
     rules = cfg.daytrade
     today = now.astimezone(cfg.tz).date()
@@ -76,8 +89,7 @@ def report(store, cfg, now: datetime, days: int = 7) -> str:
     names = list(dict.fromkeys(list(rules.strategies) + [t.get("strategy", "retest") for t in log]))
     for name in names:
         meta = emacross.STRATEGIES.get(name, {})
-        title = f"<b>EMA {rules.fast}/{rules.slow} {meta.get('title', name).lower()}</b>" \
-            + ("" if name in rules.strategies else " (no longer running)")
+        title = f"<b>EMA {rules.fast}/{rules.slow} {meta.get('title', name).lower()}</b>" + _not_running(name, rules)
         lines += _block(title, [t for t in log if t.get("strategy", "retest") == name], since, days, fee,
                         rules.contracts)
     close = store.get(closeplay.LOG_KEY) or []

@@ -25,6 +25,10 @@ NAMES = {"A": "EMA Retest (A)", "B": "EMA Cross (B)", "C": "Qualified (C)", "D":
          "E21": "E21 (21DTE)", "Simple": "Simple EMA — SPY/QQQ/IWM", "Close fade": "3:45 PM close fade"}
 # Retired from active paper trading (removed from [daytrade] strategies); code and logged trades are kept.
 RETIRED = {"A": "2026-11-09"}
+# Paused from NEW forward paper entries (2026-11-13, user decision; "cross" removed from [daytrade] strategies,
+# [ema_simple] enabled = false). Benchmark / research only: code, logged trades, replays and backtests are kept and
+# still reported. Shown as paused only while the configuration has them off; re-enabling makes them active again.
+PAUSED = {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET"}
 EXITS = {"target": "target", "stop": "stop", "invalidated": "invalidation", "time": "time", "trailed": "trailing",
          "breakeven": "breakeven", "force": "force-close", "force_close": "force-close"}
 EXIT_ORDER = ("target", "stop", "invalidation", "time", "trailing", "breakeven", "force-close", "other")
@@ -299,15 +303,28 @@ def _line(s: dict) -> str:
             f"({_m(s['per_trade'])}/trade) · PF {_pf(s)}")
 
 
+def _configured(code: str, cfg) -> bool:
+    if code == "Simple":
+        return bool(cfg.ema_simple_enabled)
+    if code == "Close fade":
+        return bool(cfg.closeplay_enabled)
+    name = next((k for k, v in CODES.items() if v == code), None)
+    return name in cfg.daytrade.strategies
+
+
 def _status(code: str, cfg) -> str:
     if code in RETIRED:
         return f"retired {RETIRED[code]}"
-    if code == "Simple":
-        return "active" if cfg.ema_simple_enabled else "off"
-    if code == "Close fade":
-        return "active" if cfg.closeplay_enabled else "off"
-    name = next((k for k, v in CODES.items() if v == code), None)
-    return "active" if name in cfg.daytrade.strategies else "off"
+    on = _configured(code, cfg)
+    if code in PAUSED and not on:
+        return "paused — benchmark"
+    if not on:
+        return "off"
+    return "active research" if code in CORRELATED else "active"
+
+
+def _live(code: str, cfg) -> bool:
+    return _status(code, cfg).startswith("active")
 
 
 def _table(groups: dict, cfg) -> list[str]:
@@ -355,6 +372,9 @@ def _split(label: str, groups: dict) -> str:
 def _block(code: str, rows: list[dict], cfg, full: bool) -> list[str]:
     s = stats(rows)
     lines = [f"\n<b>{NAMES[code]}</b> ({_status(code, cfg)})"]
+    if code in PAUSED and not _configured(code, cfg):
+        lines.append(f"  <i>no new forward paper entries after {PAUSED[code]} (paused; benchmark / research only; "
+                     "history below is unchanged)</i>")
     if not s["n"]:
         return lines + ["  FORWARD PAPER: no trades yet", f"  HISTORICAL: {HISTORICAL.get(code, 'none')}"]
     flag = " · <b>INSUFFICIENT FOR PERFORMANCE JUDGMENT</b>" if insufficient(s["n"], s["days"]) else ""
@@ -456,13 +476,13 @@ def _setup_lines(title: str, rows: list[dict], tz) -> list[str]:
 
 def _setups(rows: list[dict], cfg) -> list[str]:
     tz = cfg.tz
-    active = [r for r in rows if r["code"] not in RETIRED]
+    active = [r for r in rows if _live(r["code"], cfg)]
     corr = [r for r in rows if r["code"] in CORRELATED]
     lines = ["\n<b>Setup-level view</b> (REPORT ONLY; same day, symbol and direction, each entry within 10 minutes "
              "of the previous = one setup; exposure = premium paid, the most a long option can lose; no risk cap is "
              "applied)"]
-    lines += _setup_lines("All strategies incl. retired A", rows, tz)
-    lines += _setup_lines("Active set (excluding A)", active, tz)
+    lines += _setup_lines("All strategies incl. retired A and paused B / Simple", rows, tz)
+    lines += _setup_lines("Current active set", active, tz)
     lines += _setup_lines("D-family (C / D / E7 / E21)", corr, tz)
     c = count_once(corr)
     if c:
@@ -497,9 +517,9 @@ def report(store, cfg, full: bool = False) -> str:
     if not rows:
         return "\n".join(lines + ["No paper trades logged yet."])
     lines += _table(groups, cfg)
-    retired = set(RETIRED)
-    lines += _portfolio("All strategies incl. retired A history", rows)
-    lines += _portfolio("Current active set (excluding A)", [r for r in rows if r["code"] not in retired])
+    lines += _portfolio("All strategies incl. retired A and paused B / Simple history", rows)
+    lines += _portfolio(f"Current active set ({' / '.join(c for c in ORDER if _live(c, cfg))}; history of those "
+                        "strategies only)", [r for r in rows if _live(r["code"], cfg)])
     for code in ORDER:
         lines += _block(code, groups.get(code, []), cfg, full)
     if full:

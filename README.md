@@ -454,7 +454,17 @@ minutes = one setup). Portfolio totals are shown including retired A's history a
 
 **Strategy A (EMA retest) retired from active paper trading on 2026-11-09:** `"retest"` was removed from
 `[daytrade] strategies`. Its code and logged trades are kept, so its results stay reportable; adding the name back
-runs it again. The close fade logs report-only market context with each trade (SPY / SPX day change, direction, day
+runs it again.
+
+**Strategy B (EMA cross) and Simple EMA paused on 2026-11-13 (00:59 ET):** they open no new forward paper trades.
+`"cross"` was removed from `[daytrade] strategies` and `[ema_simple] enabled = false`. No B or Simple position was
+open at the time. Both stay as benchmarks and research controls: code, logged trades, scorecard history, replays,
+backtests and Simple's exit research are kept and still reported. The scorecard shows them as "paused — benchmark",
+with "no new forward paper entries after …". Restoring the config line runs them again. C / D / E7 / E21 ("active
+research", one correlated D-family setup) and the close fade are unchanged. Early Watch v1 / v2 are separate
+observers and never trigger or modify an EMA entry.
+
+The close fade logs report-only market context with each trade (SPY / SPX day change, direction, day
 range, moves beyond 1 / 2 / 3%); it never affects whether or how it trades.
 
 ## Strategy report

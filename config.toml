@@ -226,7 +226,11 @@ swing_filter = false       # true: skip entries against the swing trend (see the
 # 4-year backtest (8,932 trades, -$365,800) and forward paper (73 trades, -$9,428 net). Its code (emacross
 # STRATEGIES["retest"], scan(retest=True)) and its logged trades are kept, so its results stay reproducible and
 # reportable (python -m mias paper-scorecard, /strategies). Re-adding "retest" here would run it again.
-strategies = ["cross", "qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21"]
+# 2026-11-13 00:59 ET: "cross" (Strategy B) PAUSED from new forward paper entries by removing it from this list
+# (user decision: 4-year replay 17,718 trades, -$809,529, negative every year; bid/ask research did not rescue it;
+# forward paper runner-dependent and noisy). No B position was open. Its code (emacross STRATEGIES["cross"]), logged
+# trades, scorecard history, replays and backtests are kept as a benchmark; re-adding "cross" here runs it again.
+strategies = ["qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21"]
 # "qualified" = EXPERIMENTAL Strategy C ([ema_qualified]); "ema_9_21_d" = EXPERIMENTAL Strategy D: the backtested
 # "A + trend + time windows" rule with a +50% first target and the -20% stop, fixed in code (mias/qualify.py D_GATES).
 # "ema_9_21_e7" / "ema_9_21_e21" = EXPERIMENTAL E7 / E21: D's signal with a 7DTE / 21DTE ~0.50-delta contract,
@@ -243,7 +247,10 @@ fee_per_contract = 0.65    # commission per contract per side, taken off in the 
 # per symbol per day (each symbol counted separately), ATM call / put on the 0DTE (next expiry from 13:00), 5 contracts
 # bought at the ask, all sold at the bid at +25% or -20% (judged on the mid) or at 15:10. Its own state, log and
 # alerts; A-E21 are untouched. Trades only SPY, QQQ, IWM (their 5-minute bars are fetched whenever this is on).
-enabled = true
+# 2026-11-13 00:59 ET: PAUSED from new forward paper entries (user decision: 4-year entry history negative every
+# year; exit research cut losses but found no entry edge). No Simple position was open. Code, logged trades,
+# scorecard history, replay and exit research are kept as a frozen benchmark; enabled = true runs it again.
+enabled = false
 
 [ema_qualified]
 # EXPERIMENTAL Strategy C (mias/qualify.py), test-only, paper: the retest setup (A) traded only when it qualifies.
