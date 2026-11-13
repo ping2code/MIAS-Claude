@@ -40,6 +40,17 @@ WATCH_COLS = ["watch_id", "day", "lane", "sym", "side", "leg_id", "created_at", 
               "upgrade_source", "upgrade_at", "upgrade_price", "rules_version", "mode"]
 
 
+FRESH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fresh_while_open (
+    fresh_id TEXT PRIMARY KEY, day TEXT, version TEXT, lane TEXT, family TEXT, setup TEXT, sym TEXT, side TEXT,
+    leg_id TEXT, cand_at INTEGER, cand_price REAL, old_watch_id TEXT, old_created_at INTEGER, old_leg_id TEXT,
+    remaining_min REAL, would_qualify INTEGER, qualify_detail TEXT, updated_at INTEGER, mode TEXT);
+"""
+FRESH_COLS = ["fresh_id", "day", "version", "lane", "family", "setup", "sym", "side", "leg_id", "cand_at",
+              "cand_price", "old_watch_id", "old_created_at", "old_leg_id", "remaining_min", "would_qualify",
+              "qualify_detail"]
+
+
 class ObserverDB:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,6 +59,7 @@ class ObserverDB:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        self.db.executescript(FRESH_SCHEMA)
         have = {r[1] for r in self.db.execute("PRAGMA table_info(watches)")}
         for col, typ in (("telegram_sent", "INTEGER NOT NULL DEFAULT 0"), ("telegram_message_id", "TEXT"),
                          ("telegram_error", "TEXT"), ("telegram_sent_at", "REAL")):
@@ -111,7 +123,20 @@ class ObserverDB:
             elif k == "dev":
                 self.db.execute("INSERT OR IGNORE INTO structure VALUES (?,?,?,?,?,?,?)",
                                 (ev["day"], ev["sym"], ev["event"], ev["level"], ev["anchor_t"], ev["at"], None))
+        self.apply_fresh(events, mode)
         return new
+
+    def apply_fresh(self, events: list[dict], mode: str) -> None:
+        """Research instrumentation rows (mias/observer/fresh.py): measurement only, never read by the observer."""
+        for ev in events:
+            if ev["kind"] == "fresh_while_open":
+                self.db.execute(f"INSERT OR IGNORE INTO fresh_while_open ({','.join(FRESH_COLS)}, mode) "
+                                f"VALUES ({','.join('?' * (len(FRESH_COLS) + 1))})",
+                                [ev.get(c) for c in FRESH_COLS] + [mode])
+            elif ev["kind"] == "fresh_update":
+                self.db.execute("UPDATE fresh_while_open SET would_qualify=?, qualify_detail=?, updated_at=? "
+                                "WHERE fresh_id=?", (ev["would_qualify"], ev["qualify_detail"], ev["at"],
+                                                      ev["fresh_id"]))
 
     def mark_telegram(self, watch_id: str, sent: bool, ids: list[str] | None, error: str | None,
                       at: float) -> None:

@@ -22,6 +22,7 @@ from pathlib import Path
 from statistics import mean, median
 from zoneinfo import ZoneInfo
 
+from . import delivery as DL
 from .rules import ONE
 
 STRATEGY = {"B", "C", "D", "E7", "E21", "Simple"}
@@ -79,6 +80,8 @@ def enrich(db, tz: ZoneInfo, day: str | None = None) -> tuple[list[dict], list[d
                        .replace(hour=16, minute=0, second=0, microsecond=0).timestamp() * 1000)
         for n in (5, 15, 30, 60):
             w[f"r{n}"] = _ret(sg, w["price"], bars.close_at(day, sym, t + n * ONE)) if t + n * ONE <= close_ms else None
+        w.update(DL.horizon_scores(bars, day, sym, w["side"], t, w["price"], tz))   # + r10, fixed-window MFE/MAE
+        w["stage"], w["stage_reason"] = DL.v1_stage(w)
         until = w["upgrade_at"] or w["end_at"] or t + 60 * ONE
         path = bars.path(day, sym, t, until)
         if path:
@@ -207,7 +210,9 @@ def build(db, tz: ZoneInfo, title: str, out_dir: Path, day: str | None = None) -
     cols = ["watch_id", "day", "lane", "sym", "side", "structure_type", "leg_id", "created_at", "hour",
             "minutes_since_open", "price", "level", "vwap", "ema9", "ema21", "atr", "state", "end_reason", "end_at",
             "upgrade_source", "upgrade_at", "upgrade_price", "lead_min", "price_adv", "r5", "r15", "r30", "r60",
-            "mfe", "mae", "A", "B", "C", "strategy_entry", "strategies", "opening_shadow_only", "or_break"]
+            "mfe", "mae", "A", "B", "C", "strategy_entry", "strategies", "opening_shadow_only", "or_break", "r10"] + \
+        [f"{k}_{n}" for n in DL.HORIZONS for k in ("mfe", "mae")] + \
+        ["telegram_sent", "telegram_message_id", "telegram_error", "stage", "stage_reason"]
     with (out_dir / "watches.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(cols + ["context"])
@@ -349,6 +354,23 @@ def build(db, tz: ZoneInfo, title: str, out_dir: Path, day: str | None = None) -
                   f"{100 * top3d / len(main):.0f}%"]
     L += [""]
     L += ["## 10. Every watch, in order", ""] + chronological(watches, tz) + [""]
+    # 11-14 detection vs delivery, short horizons, fresh setups (added 2026-11-12; report only)
+    raw_open = sum(1 for k in legs if k[0] == "opening")
+    rows = [dict(w, family="v1", t=w["created_at"]) for w in watches]
+    L += ["## 11. Detection vs delivery", "",
+          "Stages: RAW CANDIDATE → WATCH CREATED → TELEGRAM ELIGIBLE (= sent + failed) → TELEGRAM SENT / FAILED; "
+          "TELEGRAM SUPPRESSED = a watch the delivery policy did not send. v1's hourly_cap, active_watch, cooldown, "
+          "chop_lock, same_leg and symbol_cap are FROZEN DETECTOR reasons (section 2): no watch was created, so they "
+          "never appear as Telegram suppressions. v1 Telegram has no message cap.", ""]
+    L += DL.funnel_lines([("v1 main lane", sum(1 for k in legs if k[0] == "main"), [r for r in rows if r["lane"] == "main"]),
+                          ("v1 opening lane (research only)", raw_open, [r for r in rows if r["lane"] != "main"])])
+    L += ["", "## 12. Detected but not delivered", "",
+          "Every v1 watch that was created but did not reach Telegram (signed stock %, from the watch).", ""]
+    L += DL.missed_lines(rows, tz)
+    L += ["## 13. Short-horizon direction (main lane)", ""]
+    L += DL.horizon_lines([("v1", main)] + [(f"v1 {k}", v) for k, v in _by(main, lambda w: w["side"])])
+    L += ["## 14. Fresh same-direction setups while a watch was open (v1)", ""]
+    L += DL.fresh_lines(DL.fresh_rows(db, Bars(db), tz, day), tz)
     text = "\n".join(L)
     (out_dir / "REPORT.md").write_text(text)
     return text

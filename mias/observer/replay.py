@@ -54,8 +54,12 @@ def run_day(symbols: list[str], day: date, tz: ZoneInfo, history, daily, confirm
     ob = build_observer(symbols, day, tz, history, daily, confirms, context, rules)
     events: list[dict] = []
     today = {s: (history.get(s) or {}).get(day, []) for s in symbols}
+    from .fresh import V1Fresh
+    fresh = V1Fresh(ob)                        # measurement only; never changes the observer
     for sym, b in ordered(symbols, today):
-        events += ob.process(sym, b)
+        p = ob.prev.get(sym)
+        evs = ob.process(sym, b)
+        events += evs + fresh.after(sym, p, evs)
     events += ob.finalize()
     return events, ob
 

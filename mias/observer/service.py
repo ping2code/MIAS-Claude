@@ -36,6 +36,9 @@ from .state import at
 from .stream import Recorder, StreamClient
 
 log = logging.getLogger("mias.observer")
+# Upper bound for one queued message, including waiting behind other messages for the shared, paced sender (one
+# group chat = 1 message per 3 s, so a burst of ~50 messages still fits). Not a delivery cap.
+SEND_TIMEOUT_S = 180
 
 
 class LiveRunner:
@@ -194,8 +197,28 @@ class LiveRunner:
                 self.feed("gap_unfilled", f"{sym}: {exc}")
         self._process(sym, b, "ws", received_at, gap)
 
+    def _fresh(self, kind: str, sym: str, *args) -> list[dict]:
+        """Measurement only (mias/observer/fresh.py); a failure here never reaches the observers."""
+        from .fresh import V1Fresh, V2Fresh
+        if kind == "v1" and not hasattr(self.ob, "lanes") or kind == "v2" and not hasattr(self.v2, "open"):
+            return []                                       # not a real observer (test doubles)
+        try:
+            if kind == "v1":
+                if getattr(self, "_v1fresh", None) is None or self._v1fresh.ob is not self.ob:
+                    self._v1fresh = V1Fresh(self.ob)
+                return self._v1fresh.after(sym, *args)
+            if getattr(self, "_v2fresh", None) is None or self._v2fresh.v2 is not self.v2:
+                self._v2fresh = V2Fresh(self.v2)
+            return self._v2fresh.after(sym, *args)
+        except Exception:
+            self.counts["fresh_errors"] = self.counts.get("fresh_errors", 0) + 1
+            log.exception("fresh-candidate instrumentation failed for %s (observers unaffected)", sym)
+            return []
+
     def _process(self, sym: str, b: Bar, source: str, received_at: float | None, gap: bool = False) -> None:
+        p_before = getattr(self.ob, "prev", {}).get(sym)
         events = self.ob.process(sym, b, gap, received_at)
+        events = events + self._fresh("v1", sym, p_before, events)
         self.db.bar1(str(self.day), sym, b, source)
         new = self.db.apply(events, "live")
         self.counts["processed"] += 1
@@ -215,6 +238,7 @@ class LiveRunner:
         """Research track; runs after v1 is done with the bar. Errors stay here."""
         try:
             events = self.v2.process(sym, b, gap, received_at)
+            events = events + self._fresh("v2", sym, events)
             self.v2db.bar1(str(self.day), sym, b, source)
             new = self.v2db.apply_v2(events, "live", received_at)
             self.counts["v2_watches"] += len(new)
@@ -262,7 +286,7 @@ class LiveRunner:
             except asyncio.TimeoutError:
                 continue
             try:
-                ids = await asyncio.wait_for(self.sender.send(v2_text(w, fams, self.tz)), timeout=30)
+                ids = await asyncio.wait_for(self.sender.send(v2_text(w, fams, self.tz)), timeout=SEND_TIMEOUT_S)
                 self.v2db.mark_v2_telegram(w["watch_id"], True, ids, None, group, self.clock())
                 self.counts["v2_tg_sent"] += 1
             except Exception as exc:
@@ -282,7 +306,7 @@ class LiveRunner:
             except asyncio.TimeoutError:
                 continue
             try:
-                ids = await asyncio.wait_for(self.sender.send(watch_text(ev, self.tz)), timeout=30)
+                ids = await asyncio.wait_for(self.sender.send(watch_text(ev, self.tz)), timeout=SEND_TIMEOUT_S)
                 self.db.mark_telegram(ev["watch_id"], True, ids, None, self.clock())
                 self.counts["tg_sent"] += 1
                 log.info("telegram sent %s (message %s)", ev["watch_id"], ",".join(ids))
@@ -371,6 +395,9 @@ class LiveRunner:
             st["cpu_s"] = round(ru.ru_utime + ru.ru_stime, 1)
         except Exception:
             pass
+        if self.sender is not None:
+            st["tg_rate_limited"] = getattr(self.sender, "rate_limited", 0)
+            st["tg_backlog"] = self.outbox.qsize() + self.v2_outbox.qsize()
         if self.ob is not None:
             now_ms = int(self.clock() * 1000)
             st["lag_min"] = {s: None if x.last_e is None else round((now_ms - x.last_e) / ONE, 1)

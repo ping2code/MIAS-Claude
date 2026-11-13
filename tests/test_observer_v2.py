@@ -135,11 +135,9 @@ def test_v2_telegram_policy():
     assert p.decide(_w("vwap", leg="VW2", t=ms(10, 25)), ms(10, 25) + 1000)[0] == "send"
     assert p.decide(_w(lane="opening", leg="P9"), now)[0] == "skip"
     assert p.decide(_w(leg="P8"), now + 600_000) == ("skip", "found late")
-    q = V2Telegram()
-    for i in range(6):
-        assert q.decide(_w(sym=f"S{i}", leg="P1", t=ms(11, i)), ms(11, i) + 1000)[0] == "send"
-    assert q.decide(_w(sym="S9", leg="P1", t=ms(11, 30)), ms(11, 30) + 1000) == ("skip", "hourly cap")
-    assert q.decide(_w(sym="S9", leg="P2", t=ms(12, 1)), ms(12, 1) + 1000)[0] == "send"
+    q = V2Telegram()                    # no MIAS hourly cap since 2026-11-12: every distinct setup is sent
+    for i in range(12):
+        assert q.decide(_w(sym=f"S{i}", leg="P1", t=ms(11, 2 * i)), ms(11, 2 * i) + 1000)[0] == "send"
     o = V2Telegram()
     assert o.decide(_w("or", leg="OR1"), now)[0] == "send"
     assert o.decide(_w("or", leg="OR2", t=ms(11, 0)), ms(11, 0) + 1000) == ("skip", "setup already sent")

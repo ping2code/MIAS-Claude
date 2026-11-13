@@ -17,6 +17,7 @@ from pathlib import Path
 from statistics import median
 from zoneinfo import ZoneInfo
 
+from . import delivery as DL
 from .report import Bars, enrich
 from .rules import ONE
 
@@ -52,6 +53,7 @@ def outcomes(rows: list[dict], confirms: list[dict], bars: Bars, tz: ZoneInfo) -
         cm = _close_ms(t, tz)
         for n in (5, 15, 30, 60):
             w[f"r{n}"] = _ret(sg, px, bars.close_at(day, sym, t + n * ONE)) if t + n * ONE <= cm else None
+        w.update(DL.horizon_scores(bars, day, sym, w["side"], t, px, tz))   # + r10, fixed-window MFE/MAE
         until = w.get("upgrade_at") or w.get("end_at") or t + 60 * ONE
         path = bars.path(day, sym, t, until)
         if path:
@@ -123,6 +125,8 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
     watches = db.v2_watches(q, args)
     rows = [dict(w, t=w["watch_at"], price=w["watch_price"]) for w in watches]
     outcomes(rows, confirms, bars, tz)
+    for w in rows:
+        w["stage"], w["stage_reason"] = DL.v2_stage(w)
     cross = defaultdict(list)
     for d, s, side, t in db.db.execute("SELECT day, sym, side, at FROM v2_ema_cross"):
         cross[(d, s, side)].append(t)
@@ -171,7 +175,8 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
                v1db.db.execute(f"SELECT day, sym, side, ts, source FROM confirms WHERE {q}", args)]
         v1rows = outcomes([dict(day=w["day"], sym=w["sym"], side=w["side"], t=w["created_at"], price=w["price"],
                                 state=w["state"], end_at=w["end_at"], upgrade_at=w["upgrade_at"],
-                                telegram_sent=w.get("telegram_sent"))
+                                telegram_sent=w.get("telegram_sent"), family="v1", lane=w["lane"],
+                                stage=w["stage"], stage_reason=w["stage_reason"])
                            for w in v1w if w["lane"] == "main"], v1c, Bars(v1db), tz)
         v1cand = len({(r[0], r[1], r[2], r[3]) for r in v1db.db.execute(
             f"SELECT day, sym, side, leg_id FROM watches WHERE lane='main' AND {q} UNION "
@@ -263,13 +268,35 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
                  f"{hm(w['candidate_at'])} @ {f2(w['candidate_price'])} | {f2(w['watch_price'])} | {f2(w['level'])} | "
                  f"{'yes' if w['pre_ema'] else 'no'} | {tgs} | {w['state']} | {w['upgrade_source'] or w['end_reason']} |"
                  f" {f2(w['lead_b'], 1)} | {f2(w['lead_any'], 1)} | {f2(w['r15'], 3)} | {f2(w['r60'], 3)} |")
+    # 8-11 detection vs delivery, short horizons, fresh setups (added 2026-11-12; report only)
+    v1raw = v1cand if v1db is not None else None
+    L += ["", "## 8. Detection vs delivery (main lane for v1; every lane for v2)", "",
+          "Stages: RAW CANDIDATE → WATCH CREATED → TELEGRAM ELIGIBLE (= sent + failed) → TELEGRAM SENT / FAILED; "
+          "TELEGRAM SUPPRESSED = a watch the delivery policy did not send, with its reason. The v2 6-per-hour "
+          "Telegram cap was removed on 2026-11-12 (docs/observer/OPERATIONAL_CHANGES.md); older rows that carry "
+          "'hourly_cap' are kept as recorded. 'combined' watches were not shown separately: a same symbol / "
+          "direction v2 message had gone out ≤ 5 min earlier.", ""]
+    L += DL.funnel_lines([("V1 (control)", v1raw, v1rows)] +
+                         [(FAM_NAMES[f], sum(n for g, s_, n in cands if g == f), [w for w in rows if w["family"] == f])
+                          for f in ("structure", "vwap", "or")])
+    L += ["", "## 9. Detected but not delivered", "",
+          "Every v1 (main lane) and v2 watch that was created but did not reach Telegram (signed stock %, from the "
+          "watch).", ""]
+    L += DL.missed_lines(v1rows + rows, tz)
+    L += ["## 10. Short-horizon direction (main lane)", "",
+          "Question: does a watch give a useful 5–15 minute directional window even if the 60-minute outcome is flat? "
+          "Measurement only; no rule changes from it.", ""]
+    L += DL.horizon_lines(cols)
+    L += ["## 11. Fresh same-direction setups while a watch was open (v2)", ""]
+    L += DL.fresh_lines(DL.fresh_rows(db, bars, tz, day), tz)
     text = "\n".join(L)
     (out_dir / "V2_REPORT.md").write_text(text)
     keys = ["watch_id", "family", "lane", "day", "sym", "side", "candidate_at", "candidate_price", "watch_at",
             "watch_price", "level", "pre_ema", "min_to_cross", "state", "end_reason", "upgrade_source", "lead_b",
             "lead_any", "confirm_src", "confirm_px", "price_adv", "r5", "r15", "r30", "r60", "mfe", "mae",
             "S_open_watch", "S_watch_conf", "S_conf_60", "L_start_cand", "L_cand_watch", "later", "telegram_sent",
-            "telegram_message_id", "telegram_error", "detect_min", "tg_delay_s"]
+            "telegram_message_id", "telegram_error", "detect_min", "tg_delay_s", "r10"] + \
+        [f"{k}_{n}" for n in DL.HORIZONS for k in ("mfe", "mae")] + ["stage", "stage_reason"]
     with (out_dir / "v2_watches.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
         wr.writerow(keys + ["ema_watch", "context"])

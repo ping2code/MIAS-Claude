@@ -24,8 +24,11 @@ def build_v2(symbols, day, tz, history, daily, confirms, context=None) -> V2Obse
 def run_v2_day(symbols, day, tz, history, daily, confirms, context=None):
     ob = build_v2(symbols, day, tz, history, daily, confirms, context)
     events = []
+    from .fresh import V2Fresh
+    fresh = V2Fresh(ob)                        # measurement only; never changes the observer
     for sym, b in ordered(symbols, {s: (history.get(s) or {}).get(day, []) for s in symbols}):
-        events += ob.process(sym, b)
+        evs = ob.process(sym, b)
+        events += evs + fresh.after(sym, evs)
     events += ob.finalize()
     return events, ob
 

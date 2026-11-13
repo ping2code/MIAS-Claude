@@ -70,6 +70,7 @@ class V2DB(ObserverDB):
             elif k == "v2_ema_cross":
                 self.db.execute("INSERT OR IGNORE INTO v2_ema_cross VALUES (?,?,?,?)",
                                 (ev["day"], ev["sym"], ev["side"], ev["at"]))
+        self.apply_fresh(events, mode)
         return new
 
     def mark_v2_telegram(self, watch_id: str, sent: bool, ids, error, group, at) -> None:

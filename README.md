@@ -619,6 +619,13 @@ process with their own database (`data/observer/v2.db`) and Telegram policy. Rul
 `docs/observer/V2_PREREGISTRATION.md` (frozen before any v2 result). `python -m mias.observer v2-replay --period
 development|holdout`, `v2-report --db … [--v1db …] [--day …]`.
 
+**Delivery (2026-11-12, `docs/observer/OPERATIONAL_CHANGES.md`):** there is no MIAS hourly Telegram cap. The v2
+6-per-hour message limit is removed. v1 sends every fresh main-lane watch; its "6 per hour" is the frozen
+watch-creation rule above, not a message cap. These protections stay: the 180 s maximum age, one message per watch /
+setup, main lane only, and Telegram's own rate limits (paced, `retry_after` respected). The daily reports now show
+detection vs delivery stages, "Detected but not delivered", 5/10/15/30/60-minute direction and MFE / MAE, and fresh
+same-direction setups that formed while a watch was open. These are measurement only.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

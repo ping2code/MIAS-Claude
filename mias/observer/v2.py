@@ -295,16 +295,18 @@ def _r(x, n):
     return None if x is None else round(x, n)
 
 
-# ---- Telegram policy (operational, frozen) -------------------------------------------------------------
+# ---- Telegram policy (operational; hourly cap removed 2026-11-12) ---------------------------------------
 
 class V2Telegram:
-    """Decides which v2 watches get a message. Pure; the service sends. Pre-registration section 5."""
+    """Decides which v2 watches get a message. Pure; the service sends. Pre-registration section 5, amended
+    2026-11-12 (docs/observer/OPERATIONAL_CHANGES.md): the 6-per-hour MIAS message cap is REMOVED. That is a
+    delivery change only; no v2 detection rule changed. Kept: main lane only, the maximum age, one message per
+    family / symbol / side / setup, and the 5-minute same symbol / side combination."""
 
-    def __init__(self, max_per_hour: int = 6, combine_s: int = 300, max_age_s: float = 180):
-        self.max_per_hour, self.combine_ms, self.max_age_ms = max_per_hour, combine_s * 1000, max_age_s * 1000
+    def __init__(self, combine_s: int = 300, max_age_s: float = 180):
+        self.combine_ms, self.max_age_ms = combine_s * 1000, max_age_s * 1000
         self.sent_setups: set = set()
         self.recent: dict[tuple, tuple[int, str]] = {}     # (sym, side) -> (sent_at_ms, group id)
-        self.sent_times: list[int] = []
 
     @staticmethod
     def setup(w: dict) -> str:
@@ -323,13 +325,9 @@ class V2Telegram:
         if last and w["watch_at"] - last[0] <= self.combine_ms:
             self.sent_setups.add(key)
             return "merged", last[1]
-        self.sent_times = [t for t in self.sent_times if t > w["watch_at"] - 3_600_000]
-        if len(self.sent_times) >= self.max_per_hour:
-            return "skip", "hourly cap"
         group = w["watch_id"]
         self.sent_setups.add(key)
         self.recent[(w["sym"], w["side"])] = (w["watch_at"], group)
-        self.sent_times.append(w["watch_at"])
         return "send", group
 
 
