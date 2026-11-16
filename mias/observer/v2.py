@@ -350,6 +350,8 @@ def v2_text(w: dict, open_families: list[str], tz: ZoneInfo) -> str:
     rv, spy = ctx.get("rel_vol"), ctx.get("spy_pct")
     lines.append(f"○ Volume {rv:.1f}× normal" if rv is not None else "○ Volume n/a")
     lines.append(f"○ SPY {spy:+.2f}%" if spy is not None else "○ SPY n/a")
+    from .optctx import options_lines      # context only (2026-11-15); not a gate, no effect on delivery
+    lines += options_lines(ctx, w["side"])
     if w["family"] == "vwap":
         lines.append(f"Invalid: 2 closes back {'below' if bull else 'above'} VWAP")
     else:

@@ -176,7 +176,7 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
         v1rows = outcomes([dict(day=w["day"], sym=w["sym"], side=w["side"], t=w["created_at"], price=w["price"],
                                 state=w["state"], end_at=w["end_at"], upgrade_at=w["upgrade_at"],
                                 telegram_sent=w.get("telegram_sent"), family="v1", lane=w["lane"],
-                                stage=w["stage"], stage_reason=w["stage_reason"])
+                                stage=w["stage"], stage_reason=w["stage_reason"], context=w.get("context"))
                            for w in v1w if w["lane"] == "main"], v1c, Bars(v1db), tz)
         v1cand = len({(r[0], r[1], r[2], r[3]) for r in v1db.db.execute(
             f"SELECT day, sym, side, leg_id FROM watches WHERE lane='main' AND {q} UNION "
@@ -289,6 +289,8 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
     L += DL.horizon_lines(cols)
     L += ["## 11. Fresh same-direction setups while a watch was open (v2)", ""]
     L += DL.fresh_lines(DL.fresh_rows(db, bars, tz, day), tz)
+    from . import optreport                      # 12: options context at watch time (2026-11-15; report only)
+    L += optreport.lines(v1rows, main, FAM_NAMES, tz)
     text = "\n".join(L)
     (out_dir / "V2_REPORT.md").write_text(text)
     keys = ["watch_id", "family", "lane", "day", "sym", "side", "candidate_at", "candidate_price", "watch_at",
@@ -299,7 +301,8 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
         [f"{k}_{n}" for n in DL.HORIZONS for k in ("mfe", "mae")] + ["stage", "stage_reason"]
     with (out_dir / "v2_watches.csv").open("w", newline="") as fh:
         wr = csv.writer(fh)
-        wr.writerow(keys + ["ema_watch", "context"])
+        wr.writerow(keys + optreport.CSV_KEYS + ["ema_watch", "context"])
         for w in rows:
-            wr.writerow([w.get(k) for k in keys] + [json.dumps(w["ema_watch"]), json.dumps(w["context"])])
+            wr.writerow([w.get(k) for k in keys] + optreport.csv_values(w) +
+                        [json.dumps(w["ema_watch"]), json.dumps(w["context"])])
     return text

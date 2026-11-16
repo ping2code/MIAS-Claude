@@ -636,6 +636,12 @@ setup, main lane only, and Telegram's own rate limits (paced, `retry_after` resp
 detection vs delivery stages, "Detected but not delivered", 5/10/15/30/60-minute direction and MFE / MAE, and fresh
 same-direction setups that formed while a watch was open. These are measurement only.
 
+**Options context (2026-11-15, `mias/observer/optctx.py`, context only):** every watch stores the options read that
+existed when it fired. That read comes from the MIAS cycle snapshot, read-only, with no extra API call. It covers
+flow (leading), PCR volume / OI, rolling 15/30-minute PCR (all and non-0DTE), skew, freshness and liquidity, and
+divergence notes. The Telegram message shows it as one to three short lines. It is never a gate: watches fire exactly
+as before. The v2 report section 12 measures outcomes by context.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

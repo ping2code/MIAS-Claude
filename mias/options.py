@@ -60,10 +60,12 @@ class Window:
     gross_delta: float = 0.0
     call_volume: float = 0.0
     put_volume: float = 0.0
+    call_volume_0dte: float = 0.0   # same-day-expiration part (added 2026-11-15, Early Watch context only)
+    put_volume_0dte: float = 0.0
 
     def add(self, other: "Window") -> None:
         for k in ("bull_premium", "bear_premium", "neutral_premium", "net_delta", "gross_delta",
-                  "call_volume", "put_volume"):
+                  "call_volume", "put_volume", "call_volume_0dte", "put_volume_0dte"):
             setattr(self, k, getattr(self, k) + getattr(other, k))
 
 
@@ -135,6 +137,13 @@ class OptionsSnapshot:
     thin: bool = False                       # too little volume for flow to mean much
     ideas: dict[str, dict[str, Idea]] = field(default_factory=dict)   # template -> call/put -> Idea
     iv_term: list[tuple[str, int, float]] = field(default_factory=list)  # (expiry, dte, ATM IV %) up to 100 DTE
+    # Same-day-expiration (0DTE) part of the totals above, and the largest single contract's share of today's
+    # volume. Added 2026-11-15 for the Early Watch options context (report / context only; not used by the bias).
+    call_volume_0dte: float = 0.0
+    put_volume_0dte: float = 0.0
+    call_oi_0dte: float = 0.0
+    put_oi_0dte: float = 0.0
+    top_volume_share: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -261,6 +270,7 @@ def analyze(raw_chain: list[dict], *, ref_spot: float, prev_volumes: dict[str, f
     spot = spot_rt or ref_spot
 
     cv = pv = cp = pp = coi = poi = gex = 0.0
+    cv0 = pv0 = coi0 = poi0 = top = 0.0
     call_oi_by_k: dict[float, float] = {}
     put_oi_by_k: dict[float, float] = {}
     unusual: list[Print] = []
@@ -275,6 +285,12 @@ def analyze(raw_chain: list[dict], *, ref_spot: float, prev_volumes: dict[str, f
             quoted += 1
         price = c.day_vwap or c.last_price or c.mid or 0.0
         prem = c.volume * price * 100
+        top = max(top, c.volume)
+        if c.dte == 0:
+            if c.kind == "call":
+                cv0 += c.volume; coi0 += c.oi
+            else:
+                pv0 += c.volume; poi0 += c.oi
         if c.kind == "call":
             cv += c.volume; cp += prem; coi += c.oi
             call_oi_by_k[c.strike] = call_oi_by_k.get(c.strike, 0) + c.oi
@@ -311,8 +327,10 @@ def analyze(raw_chain: list[dict], *, ref_spot: float, prev_volumes: dict[str, f
             window.gross_delta += abs(d_dollars)
         if c.kind == "call":
             window.call_volume += dv
+            window.call_volume_0dte += dv if c.dte == 0 else 0.0
         else:
             window.put_volume += dv
+            window.put_volume_0dte += dv if c.dte == 0 else 0.0
         if reportable and wprem >= block_premium:
             blocks.append(Print(c.ticker, c.kind, c.strike, c.expiry.isoformat(), side_name, dv, wprem, c.oi,
                                 c.last_price))
@@ -344,6 +362,8 @@ def analyze(raw_chain: list[dict], *, ref_spot: float, prev_volumes: dict[str, f
         ideas={name: pick_contracts(contracts, t) for name, t in (idea_templates or {}).items()},
         iv_term=[(e.isoformat(), (e - today).days, iv) for e in expiries if 1 <= (e - today).days <= 100
                  for iv in [_atm_iv(contracts, e, spot)] if iv],
+        call_volume_0dte=cv0, put_volume_0dte=pv0, call_oi_0dte=coi0, put_oi_0dte=poi0,
+        top_volume_share=round(top / (cv + pv), 4) if cv + pv else None,
     )
     return snap, volumes
 

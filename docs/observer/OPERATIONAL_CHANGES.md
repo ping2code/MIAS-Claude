@@ -65,3 +65,51 @@ detected but not shown, only because of the MIAS v2 Telegram limit of 6 messages
   - It never creates, ends or blocks a watch.
 
 No Early Watch rule may be changed on the basis of these measurements without explicit approval.
+
+## 2026-11-15 — Options context attached to every watch (context only)
+
+Requested by the user to answer, for each watch: does current options sentiment support it, conflict with it, or
+give no useful confirmation? **Context only.** It never creates, delays, suppresses, upgrades, downgrades or
+invalidates a watch. It does not touch any watch rule, lifetime, cap, Telegram policy or EMA / paper strategy.
+Verified by replaying 2026-11-12 and 11-13 for v1 and v2 with the old lookup and with the new context: every event
+apart from the `context` field is identical, including watch ids and timestamps.
+
+- **Where it comes from:** `mias/observer/optctx.py`.
+  - It reads the MIAS cycle `metrics` rows in data/mias.db, read-only, on one persistent connection with a 200 ms
+    busy timeout. The database uses WAL.
+  - No Massive request is made.
+  - The detectors' existing `context(sym, ts)` hook stores it in the watch's `context.optx` at creation time.
+- **PCR inputs:**
+  - `pcr_volume`: today's put volume ÷ call volume. `pcr_oi`: put OI ÷ call OI.
+  - Both cover the MIAS chain scope: expirations 0–100 days out, strikes ±15 % of spot.
+  - Same-day (0DTE) expirations are INCLUDED.
+  - From 2026-11-16 the snapshot also records the 0DTE part (`call/put_volume_0dte`, `call/put_oi_0dte`), the
+    0DTE part of each cycle's flow window, and `top_volume_share`. These are additive fields in `mias/options.py`;
+    the options-bias calculation is unchanged.
+  - Updated every MIAS cycle (150 s).
+- **Freshness:** the snapshot is stale if it is older than 330 s at watch time (2 cycles + 30 s). It is then shown
+  as "STALE / INSUFFICIENT DATA".
+- **Insufficient data** if any of:
+  - options marked thin (fewer than 5,000 contracts today, `thin_options_volume`);
+  - quote coverage below 80 %;
+  - one contract carrying more than 25 % of today's volume;
+  - no flow components yet.
+  Rolling PCR additionally needs at least 1,000 contracts and at least 80 % window coverage.
+- **Rolling PCR:** 15 and 30 min, current vs previous window, from the per-cycle flow windows.
+- **Interpretation:**
+  - Flow first: 0.6 × recent + 0.4 × session.
+  - PCR direction and skew can only support or contradict the flow direction.
+  - Divergences use the detector's own confirmed 5-minute pivots and are weak context only.
+  - The classifications: `optctx.py` docstring.
+- **Telegram:** one to three compact lines per watch. "Options context: CONFIRMING / CONFLICT / NEUTRAL /
+  INSUFFICIENT DATA / STALE / unavailable", then flow / PCR / skew directions, then for single stocks
+  stock vs market (SPY + QQQ) options.
+  - They are built only from the stored context, so what was shown is what is stored.
+  - They never wait for options data.
+- **Reports:** v2 report section 12 groups outcomes (5–60 min) by context, by family, Structure on its own, time of
+  day, index vs single stock, the market overlay, and divergence. It also gives sample quality per symbol.
+  - Watches from before 2026-11-16 are "not recorded".
+  - Any reconstruction is labelled "post-hoc reconstructed" and never pooled with live snapshots.
+  - Replays keep the old one-field lookup, so historical replays are unchanged.
+
+No Early Watch rule or threshold may be changed on the basis of these statistics without explicit approval.

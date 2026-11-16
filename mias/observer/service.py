@@ -100,11 +100,20 @@ class LiveRunner:
                                     day - timedelta(days=1), self.tz)
         daily = await daily_closes(self.client, self.s.cache_dir, syms, day - timedelta(days=1), self.tz)
         confirms = self.source.confirms(day, syms)
-        self.ob = build_observer(syms, day, self.tz, hist, daily, confirms, self.source.options_context)
+        for old in getattr(self, "_octx", ()):
+            getattr(old, "close", lambda: None)()
+        ctx1 = self._options_context()
+        ctx2 = ctx1.sibling() if hasattr(ctx1, "sibling") else ctx1
+        self._octx = (ctx1, ctx2)
+        self.ob = build_observer(syms, day, self.tz, hist, daily, confirms, ctx1)
+        if hasattr(ctx1, "pivots"):
+            ctx1.pivots = lambda s, ob=self.ob: ob.states[s].structure.pivots
         if self.v2db is not None:
             try:
                 from .v2_replay import build_v2
-                self.v2 = build_v2(syms, day, self.tz, hist, daily, confirms, self.source.options_context)
+                self.v2 = build_v2(syms, day, self.tz, hist, daily, confirms, ctx2)
+                if hasattr(ctx2, "pivots"):
+                    ctx2.pivots = lambda s, v2=self.v2: v2.states[s].structure.pivots
                 for ev in confirms:
                     self.v2db.confirm(str(day), ev)
             except Exception:
@@ -116,6 +125,17 @@ class LiveRunner:
             self.db.confirm(str(day), ev)
         self.feed("day_start", f"{day}: warmed {len(syms)} symbols, {len(confirms)} confirmed events so far")
         await self.backfill("start")
+
+    def _options_context(self):
+        """Live: the options-context snapshot (mias.observer.optctx, context only, never a gate; read-only on the
+        MIAS metrics rows, no provider call). Falls back to the old one-field lookup if it cannot be built."""
+        try:
+            from .optctx import OptionsContext
+            db = getattr(self.source, "db_path", None)
+            return OptionsContext(db, self.tz, clock=self.clock) if db else self.source.options_context
+        except Exception:
+            log.exception("options context unavailable; using the plain options-bias lookup")
+            return self.source.options_context
 
     async def backfill(self, reason: str) -> None:
         if self.ob is None:
@@ -233,6 +253,19 @@ class LiveRunner:
                 log.info("SHADOW watch end %s %s (%s)", ev["watch_id"], ev["state"], ev["end_reason"])
         if self.v2 is not None:
             self._process_v2(sym, b, source, received_at, gap)
+        self._warm_options(sym)
+
+    def _warm_options(self, sym: str) -> None:
+        """After the bar (and any Telegram queueing) is done: pull new MIAS options rows into the context cache
+        so a later watch-time lookup does not parse the day. Context only; errors are ignored."""
+        c = (getattr(self, "_octx", None) or (None,))[0]
+        if c is None or not hasattr(c, "warm"):
+            return
+        try:
+            from .optctx import INDEX, MARKET
+            c.warm([sym] + ([] if sym in INDEX else [m for m in MARKET]), self.clock())
+        except Exception:
+            log.debug("options context warm-up failed for %s", sym, exc_info=True)
 
     def _process_v2(self, sym: str, b: Bar, source: str, received_at: float | None, gap: bool) -> None:
         """Research track; runs after v1 is done with the bar. Errors stay here."""

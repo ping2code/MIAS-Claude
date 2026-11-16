@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from .optctx import options_lines   # context only (2026-11-15): never changes whether / when a watch is sent
+
 
 def watch_text(w: dict, tz: ZoneInfo) -> str:
     bull = w["side"] == "bull"
@@ -23,7 +25,7 @@ def watch_text(w: dict, tz: ZoneInfo) -> str:
         f"○ Volume {rv:.1f}× normal" if rv is not None else "○ Volume n/a",
         f"○ SMA200 {ctx['sma200_side']}" if ctx.get("sma200_side") else "○ SMA200 n/a",
         f"○ SPY {spy:+.2f}%" if spy is not None else "○ SPY n/a",
-        "○ Options not confirmed",
+        *options_lines(ctx, w["side"]),
         f"Invalid {'below' if bull else 'above'}: ${w['level']:,.2f}",
         "WATCH ONLY — NOT A TRADE SIGNAL",
     ]
