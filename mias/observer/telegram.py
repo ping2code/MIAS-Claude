@@ -49,10 +49,11 @@ class WatchSender:
     async def send(self, text: str) -> list[str]:
         """Send to every alert chat; returns the message ids. Raises SendError if any chat failed."""
         ids, errors = [], []
+        entities = heading_entities(text)
         async with self._lock:
             for chat in self.chats:
                 try:
-                    ids.append(str(await self._one(chat, text)))
+                    ids.append(str(await self._one(chat, text, entities)))
                 except SendError as exc:
                     errors.append(str(exc))
         if errors:
@@ -63,7 +64,7 @@ class WatchSender:
     def _gap(chat: str) -> float:
         return GROUP_GAP_S if str(chat).startswith("-") else PRIVATE_GAP_S
 
-    async def _one(self, chat: str, text: str):
+    async def _one(self, chat: str, text: str, entities: list | None = None):
         err = "unknown"
         for attempt in range(2):
             wait = self._next.get(chat, 0.0) - self._clock()
@@ -73,8 +74,16 @@ class WatchSender:
             if wait > 0:
                 await self._sleep(wait)
             try:
-                resp = await self._http.post(self._url, json={"chat_id": chat, "text": text,
-                                                              "disable_web_page_preview": True})
+                body = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+                if entities:
+                    body["entities"] = entities
+                resp = await self._http.post(self._url, json=body)
+                if resp.status_code == 400 and entities:
+                    # formatting is cosmetic: if Telegram rejects the bold span, send the same text plain
+                    log.warning("telegram rejected the bold heading; sending the alert as plain text")
+                    entities = None
+                    body.pop("entities")
+                    resp = await self._http.post(self._url, json=body)
             except httpx.HTTPError as exc:
                 err = f"network error: {type(exc).__name__}"
                 self._next[chat] = self._clock() + 1 + attempt
@@ -102,3 +111,27 @@ class WatchSender:
                 desc = ""
             raise SendError(f"HTTP {resp.status_code}: {desc[:150]}")
         raise SendError(err)
+
+
+HEADING_EMOJI = ("👀 ", "🧭 ")
+DIRECTIONS = ("BULLISH", "BEARISH")
+
+
+def _u16(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def heading_entities(text: str) -> list[dict] | None:
+    """Telegram bold entity for an Early Watch heading: the title, symbol and direction after the emoji, e.g.
+    "V2 STRUCTURE WATCH · NVDA · BEARISH". Plain text (no parse mode), so nothing in the message needs escaping
+    and the text itself is unchanged. Offsets are UTF-16 code units, as Telegram requires. None if the first
+    line is not an Early Watch heading (e.g. the telegram-test message)."""
+    first = text.split("\n", 1)[0]
+    start = next((len(e) for e in HEADING_EMOJI if first.startswith(e)), None)
+    if start is None or "WATCH" not in first:
+        return None
+    ends = [first.find(d, start) + len(d) for d in DIRECTIONS if first.find(d, start) >= 0]
+    if not ends:
+        return None
+    end = min(ends)
+    return [{"type": "bold", "offset": _u16(first[:start]), "length": _u16(first[start:end])}]

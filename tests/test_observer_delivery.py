@@ -220,3 +220,51 @@ def test_fresh_rows_are_stored_and_updated(tmp_path):
     db.apply_v2(inst, "replay")
     row = db.db.execute("SELECT family, would_qualify, qualify_detail FROM fresh_while_open").fetchall()
     assert row == [("structure", 1, "persistence: watched")]
+
+
+# ---- 2026-11-16: bold heading (presentation only; plain text + a Telegram "bold" entity, no parse mode) -------
+
+def _bold(req):
+    import json as _j
+    body = _j.loads(req.content)
+    e = (body.get("entities") or [None])[0]
+    u = body["text"].encode("utf-16-le")
+    return body, (None if e is None else u[2 * e["offset"]:2 * (e["offset"] + e["length"])].decode("utf-16-le"))
+
+
+def test_v1_and_v2_headings_are_bold_and_the_text_is_unchanged():
+    from mias.observer.message import watch_text
+    from mias.observer.v2 import v2_text
+    w1 = watch()
+    w1.update(structure_type="HL", price=101.0, level=100.3, context={})
+    w2 = [e for e in _v2_run(False)[0] if e["kind"] == "v2_watch"][0]
+    for text, want in ((watch_text(w1, ET), "EARLY WATCH · META · BULLISH"),
+                       (v2_text(w2, [w2["family"]], ET), "V2 STRUCTURE WATCH · META · BULLISH")):
+        s, seen, _ = sender([])
+        assert asyncio.run(s.send(text)) == ["7"]
+        body, bold = _bold(seen[0])
+        assert body["text"] == text and bold == want and "parse_mode" not in body
+        assert body["entities"] == [{"type": "bold", "offset": 3, "length": len(want.encode("utf-16-le")) // 2}]
+
+
+def test_symbols_need_no_escaping_and_other_messages_are_not_bolded():
+    from mias.observer.telegram import heading_entities
+    text = "🧭 V2 VWAP WATCH · BRK.B_<x>*[1] · BEARISH · 10:00 ET @ $1.00\nbody <b> & _x_"
+    assert heading_entities(text) and _bold_text(text) == "V2 VWAP WATCH · BRK.B_<x>*[1] · BEARISH"
+    assert heading_entities("MIAS observer test message") is None
+
+
+def _bold_text(text):
+    from mias.observer.telegram import heading_entities
+    e = heading_entities(text)[0]
+    u = text.encode("utf-16-le")
+    return u[2 * e["offset"]:2 * (e["offset"] + e["length"])].decode("utf-16-le")
+
+
+def test_rejected_formatting_falls_back_to_the_same_text_plain():
+    s, seen, _ = sender([httpx.Response(400, json={"ok": False, "description": "can't parse entities"})])
+    text = "👀 EARLY WATCH · NVDA · BEARISH · 11:00 ET @ $160.00\nWATCH ONLY — NOT A TRADE SIGNAL"
+    assert asyncio.run(s.send(text)) == ["7"]
+    import json as _j
+    first, second = (_j.loads(r.content) for r in seen)
+    assert "entities" in first and "entities" not in second and second["text"] == first["text"] == text
