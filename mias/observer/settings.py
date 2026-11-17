@@ -24,6 +24,7 @@ class Settings:
     v2: bool = False                  # Early Watch v2 research families (docs/observer/V2_PREREGISTRATION.md)
     v2_db_path: Path = Path("data/observer/v2.db")
     v2_telegram: bool = False
+    v2_telegram_muted: tuple[str, ...] = ()   # v2 families detected / stored / scored but never sent alone (2026-11-16)
 
 
 def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = None) -> Settings:
@@ -46,4 +47,5 @@ def load(path: str | Path = "config.toml", fallback_symbols: list[str] | None = 
         telegram=bool(raw.get("telegram", False)),
         telegram_max_age_s=float(raw.get("telegram_max_age_seconds", 180)),
         v2=bool(raw.get("v2", False)), v2_db_path=Path(raw.get("v2_db_path", "data/observer/v2.db")),
-        v2_telegram=bool(raw.get("v2_telegram", False)))
+        v2_telegram=bool(raw.get("v2_telegram", False)),
+        v2_telegram_muted=tuple(str(f).lower() for f in raw.get("v2_telegram_muted_families") or ()))

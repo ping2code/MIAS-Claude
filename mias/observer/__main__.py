@@ -111,7 +111,8 @@ def main(argv=None) -> int:
         db = V2DB(Path(args.db))
         v1 = ObserverDB(Path(args.v1db)) if args.v1db else None
         out = Path(args.out) if args.out else Path(args.db).parent / (Path(args.db).stem + "_report")
-        print(build_v2_report(db, cfg.tz, out, day=args.day, v1db=v1, title=f"Early Watch v2 — {Path(args.db).name}"))
+        print(build_v2_report(db, cfg.tz, out, day=args.day, v1db=v1, title=f"Early Watch v2 — {Path(args.db).name}",
+                              muted=s.v2_telegram_muted))
         return 0
     if args.cmd == "telegram-test":
         from .telegram import WatchSender

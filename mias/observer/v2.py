@@ -301,10 +301,16 @@ class V2Telegram:
     """Decides which v2 watches get a message. Pure; the service sends. Pre-registration section 5, amended
     2026-11-12 (docs/observer/OPERATIONAL_CHANGES.md): the 6-per-hour MIAS message cap is REMOVED. That is a
     delivery change only; no v2 detection rule changed. Kept: main lane only, the maximum age, one message per
-    family / symbol / side / setup, and the 5-minute same symbol / side combination."""
+    family / symbol / side / setup, and the 5-minute same symbol / side combination.
 
-    def __init__(self, combine_s: int = 300, max_age_s: float = 180):
+    2026-11-16 (user): ``muted`` families (config ``v2_telegram_muted_families``, set to ["structure"]) never send a
+    message of their own: they are recorded as ('muted', '<family>_telegram_muted') and leave the policy state
+    untouched, so a VWAP / opening-range watch on the same symbol / side is decided exactly as if the muted watch
+    had not been offered. Delivery only: detection, storage, context and scoring of muted families are unchanged."""
+
+    def __init__(self, combine_s: int = 300, max_age_s: float = 180, muted: tuple[str, ...] | list[str] = ()):
         self.combine_ms, self.max_age_ms = combine_s * 1000, max_age_s * 1000
+        self.muted = frozenset(muted)
         self.sent_setups: set = set()
         self.recent: dict[tuple, tuple[int, str]] = {}     # (sym, side) -> (sent_at_ms, group id)
 
@@ -313,9 +319,11 @@ class V2Telegram:
         return f"OR{w['day']}" if w["family"] == "or" else w["leg_id"]
 
     def decide(self, w: dict, now_ms: int) -> tuple[str, str | None]:
-        """('send', group) | ('merged', group) | ('skip', reason)."""
+        """('send', group) | ('merged', group) | ('muted', reason) | ('skip', reason)."""
         if w["lane"] != "main":
             return "skip", f"lane {w['lane']}"
+        if w["family"] in self.muted:
+            return "muted", f"{w['family']}_telegram_muted"
         if now_ms - w["watch_at"] > self.max_age_ms:
             return "skip", "found late"
         key = (w["family"], w["sym"], w["side"], self.setup(w))

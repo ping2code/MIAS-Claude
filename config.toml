@@ -356,3 +356,7 @@ telegram_max_age_seconds = 180
 v2 = true
 v2_db_path = "data/observer/v2.db"
 v2_telegram = true
+# 2026-11-16 (user): V2-A Structure is a Telegram-only mute. Structure is still detected, stored, given options
+# context, tracked and scored in every v2 report; it just never sends a message of its own. A VWAP / opening-range
+# message still lists Structure when a Structure watch is open on the same symbol / side. Delivery policy only.
+v2_telegram_muted_families = ["structure"]

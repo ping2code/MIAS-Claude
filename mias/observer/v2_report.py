@@ -114,7 +114,8 @@ def summary(ws: list[dict]) -> dict:
             "pre": _pct(sum(1 for w in ws if w.get("pre_ema")), n) if ws and "pre_ema" in ws[0] else "n/a"}
 
 
-def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1db=None, title: str = "") -> str:
+def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1db=None, title: str = "",
+                    muted=("structure",)) -> str:
     out_dir.mkdir(parents=True, exist_ok=True)
     bars = Bars(db)
     q = "day = ?" if day else "1=1"
@@ -152,8 +153,8 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
     L += ["## 1. Funnel per family (candidate → watch → Telegram)", "",
           "| Family | Raw candidates | Pending → watched | → not confirmed | → stale | Blocked at trigger "
           "(open watch / pending / same leg / stale) | Watches (main / opening / late) | Telegram sent | merged | "
-          "not sent | Detect delay min (candidate→watch, med) | Telegram delay s (med) |",
-          "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+          "not sent | muted (policy) | Detect delay min (candidate→watch, med) | Telegram delay s (med) |",
+          "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for fam in ("structure", "vwap", "or"):
         cs = {s: n for f, s, n in cands if f == fam}
         es = {s: n for f, s, n in ends if f == fam}
@@ -162,10 +163,11 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
         sent = sum(1 for w in ws if w["telegram_sent"])
         merged = sum(1 for w in ws if (w.get("telegram_error") or "").startswith("merged"))
         nots = sum(1 for w in ws if (w.get("telegram_error") or "").startswith("not sent"))
+        muts = sum(1 for w in ws if (w.get("telegram_error") or "").startswith("muted"))
         L.append(f"| {FAM_NAMES[fam]} | {sum(cs.values())} | {es.get('watched', 0)} | {es.get('not_confirmed', 0)} | "
                  f"{es.get('stale', 0)} | {cs.get('open_watch_exists', 0)} / {cs.get('pending_exists', 0)} / "
                  f"{cs.get('same_leg', 0)} / {cs.get('stale', 0)} | {lanes['main']} / {lanes['opening']} / "
-                 f"{lanes['late']} | {sent} | {merged} | {nots} | {_medn([w['detect_min'] for w in ws])} | "
+                 f"{lanes['late']} | {sent} | {merged} | {nots} | {muts} | {_medn([w['detect_min'] for w in ws])} | "
                  f"{_medn([w['tg_delay_s'] for w in ws])} |")
     # comparison
     v1rows = []
@@ -279,6 +281,7 @@ def build_v2_report(db, tz: ZoneInfo, out_dir: Path, day: str | None = None, v1d
     L += DL.funnel_lines([("V1 (control)", v1raw, v1rows)] +
                          [(FAM_NAMES[f], sum(n for g, s_, n in cands if g == f), [w for w in rows if w["family"] == f])
                           for f in ("structure", "vwap", "or")])
+    L += DL.mute_lines(rows, tuple(muted), FAM_NAMES)      # 8a (2026-11-16): family Telegram-only mute
     L += ["", "## 9. Detected but not delivered", "",
           "Every v1 (main lane) and v2 watch that was created but did not reach Telegram (signed stock %, from the "
           "watch).", ""]

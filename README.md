@@ -642,6 +642,12 @@ flow (leading), PCR volume / OI, rolling 15/30-minute PCR (all and non-0DTE), sk
 divergence notes. The Telegram message shows it as one to three short lines. It is never a gate: watches fire exactly
 as before. The v2 report section 12 measures outcomes by context.
 
+**V2-A Structure Telegram-only mute (2026-11-16, `v2_telegram_muted_families = ["structure"]`):** Structure watches
+are still detected, stored, given options context, tracked and scored in every v2 report, but never send a Telegram
+message of their own (stage TELEGRAM MUTED, reason `structure_telegram_muted`). VWAP and opening-range messages are
+unchanged and still list Structure when a Structure watch is open on the same symbol / side. v2 report section 8a
+compares recorded delivery with a replay of the current policy.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

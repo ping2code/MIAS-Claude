@@ -64,10 +64,12 @@ class LiveRunner:
         from .v2 import V2Telegram
         self.v2db = v2db
         self.v2 = None
-        self.v2tg = V2Telegram(max_age_s=settings.telegram_max_age_s)
+        self.v2tg = V2Telegram(max_age_s=settings.telegram_max_age_s,
+                               muted=getattr(settings, "v2_telegram_muted", ()))
         self.v2_outbox: asyncio.Queue = asyncio.Queue()
+        self._v2_shown: set[str] = set()     # muted watches already recorded as listed in a sent message
         self.counts.update({"v2_watches": 0, "v2_errors": 0, "v2_tg_sent": 0, "v2_tg_failed": 0, "v2_tg_merged": 0,
-                            "v2_tg_skipped": 0})
+                            "v2_tg_skipped": 0, "v2_tg_muted": 0})
 
     # ---- clocks -----------------------------------------------------------------------------------
 
@@ -303,7 +305,12 @@ class LiveRunner:
         verdict, info = self.v2tg.decide(w, int(self.clock() * 1000))
         if verdict == "send":
             fams = sorted({k[0] for k in self.v2.open if k[1] == w["sym"] and k[2] == w["side"]} | {w["family"]})
-            self.v2_outbox.put_nowait((w, fams, info))
+            shown = [ow["watch_id"] for k, ow in self.v2.open.items()       # muted watches this message will list
+                     if k[0] in self.v2tg.muted and k[1] == w["sym"] and k[2] == w["side"]]
+            self.v2_outbox.put_nowait((w, fams, info, shown))
+        elif verdict == "muted":                 # delivery policy (2026-11-16): never a failure / stale / duplicate
+            self.counts["v2_tg_muted"] += 1
+            self.v2db.mark_v2_telegram(w["watch_id"], False, None, f"muted: {info}", None, self.clock())
         elif verdict == "merged":
             self.counts["v2_tg_merged"] += 1
             self.v2db.mark_v2_telegram(w["watch_id"], False, None, f"merged into {info}", info, self.clock())
@@ -315,13 +322,21 @@ class LiveRunner:
         from .v2 import v2_text
         while not stop.is_set():
             try:
-                w, fams, group = await asyncio.wait_for(self.v2_outbox.get(), timeout=1)
+                w, fams, group, shown = await asyncio.wait_for(self.v2_outbox.get(), timeout=1)
             except asyncio.TimeoutError:
                 continue
             try:
                 ids = await asyncio.wait_for(self.sender.send(v2_text(w, fams, self.tz)), timeout=SEND_TIMEOUT_S)
                 self.v2db.mark_v2_telegram(w["watch_id"], True, ids, None, group, self.clock())
                 self.counts["v2_tg_sent"] += 1
+                for mid in shown:                # a muted watch listed in this VWAP / OR message (first one only)
+                    if mid not in self._v2_shown:
+                        self._v2_shown.add(mid)
+                        # only a row recorded as muted alone; a recorded send (e.g. before the change) is never touched
+                        self.v2db.db.execute("UPDATE v2_watches SET telegram_error = telegram_error || ?, "
+                                             "telegram_group = ? WHERE watch_id = ? AND telegram_sent = 0 AND "
+                                             "telegram_error LIKE 'muted: %' AND telegram_error NOT LIKE '%;%'",
+                                             (f"; shown in combined message {group}", group, mid))
             except Exception as exc:
                 self.counts["v2_tg_failed"] += 1
                 try:
@@ -394,7 +409,8 @@ class LiveRunner:
                                          "end_at=? WHERE day=? AND state='WATCH'", (self.ob.t_close, str(self.day)))
                 from .v2_report import build_v2_report
                 build_v2_report(self.v2db, self.tz, Path("data/observer/daily") / str(self.day), day=str(self.day),
-                                v1db=self.db, title=f"Early Watch v1 vs v2 — live session {self.day}")
+                                v1db=self.db, title=f"Early Watch v1 vs v2 — live session {self.day}",
+                                muted=self.v2tg.muted)
             except Exception:
                 log.exception("v2 end of day failed")
         rows = self.db.watches("day = ?", (str(self.day),))
@@ -497,7 +513,9 @@ async def main(cfg, settings) -> None:
         runner.feed("start", f"{len(settings.symbols)} symbols, v1 telegram "
                              f"{'PILOT ON (initial main-lane watch messages only)' if sender and settings.telegram else 'off'}"
                              f", v2 research {'ON' if v2db else 'off'}, v2 telegram "
-                             f"{'ON' if sender and v2db and settings.v2_telegram else 'off'}")
+                             f"{'ON' if sender and v2db and settings.v2_telegram else 'off'}"
+                             + (f" (muted alone: {', '.join(settings.v2_telegram_muted)})"
+                                if settings.v2_telegram_muted else ""))
         tasks = [stream.run(stop, runner.connect_window), runner.loop(stop)]
         if sender:
             tasks.append(runner.send_worker(stop))

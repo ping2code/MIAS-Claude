@@ -113,3 +113,27 @@ apart from the `context` field is identical, including watch ids and timestamps.
   - Replays keep the old one-field lookup, so historical replays are unchanged.
 
 No Early Watch rule or threshold may be changed on the basis of these statistics without explicit approval.
+
+## 2026-11-16 — V2-A Structure: Telegram-only mute (delivery policy only)
+
+User request, 2026-11-16, after the first live day with options context: stop sending V2-A Structure alerts to
+Telegram and keep Structure fully active as a research family.
+
+- **Change:** `[observer] v2_telegram_muted_families = ["structure"]` → `V2Telegram(muted=...)`. After the lane check, a
+  watch of a muted family returns `('muted', 'structure_telegram_muted')`, recorded as `telegram_error =
+  "muted: structure_telegram_muted"`, stage **TELEGRAM MUTED** (not failed / stale / duplicate / rate limited). A muted
+  watch leaves the policy state untouched, so a VWAP / opening-range watch on the same symbol / side is decided as if
+  the Structure watch had not been offered.
+- **Combined messages:** a VWAP / opening-range message still lists every open v2 family for that symbol / side, so it
+  shows "✓ Structure" when a Structure watch is open. That Structure watch is recorded as
+  `muted: structure_telegram_muted; shown in combined message <group>`. Structure alone never causes a message.
+- **Unchanged:** v1 (detection, storage, Telegram), V2-A / B / C detection, watch ids, timestamps, lifetime,
+  invalidation, deduplication, the options context, EMA strategies, paper trading and Close Fade. A full synthetic
+  day gives identical v1 and v2 watch rows, candidates and open detector state with and without the mute.
+- **Reports:** Structure stays in every v2 section. Section 1 has a "muted (policy)" column, section 8 a TELEGRAM
+  MUTED column, and new section 8a shows historical actual delivery (as recorded) next to a replay of the current
+  policy over the same stored watches, with outcomes and options-context groups for muted Structure watches.
+  Rows recorded before the change keep their actual delivery; nothing is rewritten.
+- **Nov 16 estimate (replay of stored watches):** 123 v2 messages recorded (the no-mute replay reproduces 123) →
+  46 under the current policy.
+
