@@ -311,6 +311,20 @@ hard_exit_days = 7          # days before expiry
 enabled = true
 # Answer /trend, /market, /list, /status, /help from the configured chat (only that chat).
 commands = true
+# Delivery policy only (2026-11-17): alerts with these rules are still queued, logged and kept in the alerts
+# table (marked "muted: telegram policy"), but never sent. The strategies behind them (EMA C / D / E7 / E21,
+# paused B and Simple, the 3:45 close fade) keep trading on paper exactly as before; entries, exits, fills, P/L,
+# logs, scorecards and reports are unchanged. Early Watch v1 / v2 are sent by mias-observer, not from here.
+#   ema_entry                                 every EMA paper entry (A / B / C / D / E7 / E21)
+#   ema_partial ema_trail ema_target          EMA first target, trail raised, all-out target
+#   ema_stop ema_breakeven ema_trailed        EMA stop, runners at breakeven, trailed out
+#   ema_invalidated ema_time                  EMA chart invalidation, 15:10 force close
+#   ema_simple                                Simple EMA (SPY / QQQ / IWM) entries and exits
+#   closeplay                                 3:45 close fade: the 15:45 call / put / no-trade read and the 15:59 sale
+# Not muted: ema_summary (the once-a-day 15:10 EMA paper summaries), system, scorecard, strategies, and every
+# market / options alert. Remove a rule here to send it again.
+muted_rules = ["ema_entry", "ema_partial", "ema_trail", "ema_target", "ema_stop", "ema_breakeven", "ema_trailed",
+               "ema_invalidated", "ema_time", "ema_simple", "closeplay"]
 
 [screen]
 # Options-tradability screen (~200 symbols) shown on the dashboard. Runs at startup when no result exists,

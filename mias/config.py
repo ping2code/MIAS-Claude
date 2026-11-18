@@ -166,6 +166,7 @@ class Config:
     telegram_alert_chats: list[str] = field(repr=False, default_factory=list)
     telegram_allowed_users: list[str] = field(repr=False, default_factory=list)
     telegram_allowed_chats: list[str] = field(repr=False, default_factory=list)
+    telegram_muted_rules: tuple[str, ...] = ()   # [telegram] muted_rules: recorded, never sent (delivery only)
     ema_qualified: "QualRules | None" = None   # [ema_qualified]: Strategy C's gates (experimental; mias/qualify.py)
     ema_simple_enabled: bool = False     # [ema_simple]: EMA 9/21 Simple on SPY/QQQ/IWM (experimental paper; mias/simple.py)
     alert_symbols: tuple[str, ...] = ()  # [alerts] symbols: per-symbol alerts only for these (empty = every watched)
@@ -405,6 +406,7 @@ def load(path: str | Path = "config.toml", *, require_secrets: bool = True) -> C
         closeplay_contracts=max(1, int(raw.get("closeplay", {}).get("contracts", 1))),
         telegram_enabled=bool(tg.get("enabled", True)),
         telegram_commands=bool(tg.get("commands", True)),
+        telegram_muted_rules=tuple(str(r) for r in tg.get("muted_rules") or ()),
         web_enabled=bool(web.get("enabled", True)),
         screen_enabled=bool(scr.get("enabled", True)),
         screen_interval_minutes=max(30, int(scr.get("interval_minutes", 120))),

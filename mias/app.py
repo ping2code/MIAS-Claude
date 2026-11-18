@@ -36,7 +36,8 @@ class Service:
         elif cfg.telegram_enabled:
             log.warning("Telegram enabled but TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID missing: alerts are only logged")
         self.telegram = tg
-        self.dispatcher = Dispatcher(self.store, tg, cfg.telegram_alert_chats)
+        self.dispatcher = Dispatcher(self.store, tg, cfg.telegram_alert_chats,
+                                     muted=getattr(cfg, "telegram_muted_rules", ()))
         self.engine = Engine(cfg, self.client, self.store, self.dispatcher)
         self._live_day = None                  # date of the last live cycle (closing summary)
         self._pre_cache: dict = {}             # daily bars for the pre-market messages, per day

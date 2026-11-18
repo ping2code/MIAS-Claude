@@ -6,6 +6,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+MUTED = "muted: telegram policy"   # alerts.last_error of an alert the delivery policy did not send
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS metrics (
@@ -76,11 +78,16 @@ class Store:
     def mark_delivered(self, alert_id: int) -> None:
         self.db.execute("UPDATE alerts SET delivered=?, attempts=attempts+1 WHERE id=?", (time.time(), alert_id))
 
+    def mark_muted(self, alert_id: int) -> None:
+        """Recorded, not sent: the Telegram delivery policy mutes this rule (not a failure, never retried)."""
+        self.db.execute("UPDATE alerts SET delivered=?, last_error=? WHERE id=?",
+                        (time.time(), MUTED, alert_id))
+
     def mark_failed(self, alert_id: int, error: str, sent_to: str | None = None) -> None:
         self.db.execute("UPDATE alerts SET attempts=attempts+1, last_error=?, sent_to=COALESCE(?, sent_to) WHERE id=?",
                         (error[:300], sent_to, alert_id))
 
     def recent_alerts(self, limit: int = 50) -> list[dict]:
-        rows = self.db.execute("SELECT ts, symbol, rule, text, delivered FROM alerts ORDER BY id DESC LIMIT ?",
-                               (limit,)).fetchall()
-        return [dict(ts=r[0], symbol=r[1], rule=r[2], text=r[3], delivered=r[4]) for r in rows]
+        rows = self.db.execute("SELECT ts, symbol, rule, text, delivered, last_error FROM alerts ORDER BY id DESC "
+                               "LIMIT ?", (limit,)).fetchall()
+        return [dict(ts=r[0], symbol=r[1], rule=r[2], text=r[3], delivered=r[4], muted=r[5] == MUTED) for r in rows]

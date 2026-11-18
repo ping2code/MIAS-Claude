@@ -95,10 +95,16 @@ class Dispatcher:
     Each alert remembers which chats already received it, so a failure in one chat is retried without
     re-sending to the others."""
 
-    def __init__(self, store: Store, telegram: Telegram | None, chats: list[str] | None = None):
+    def __init__(self, store: Store, telegram: Telegram | None, chats: list[str] | None = None,
+                 muted: tuple[str, ...] | list[str] = ()):
         self.store = store
         self.telegram = telegram
         self.chats = [c for c in (chats or []) if c]
+        # Delivery policy only ([telegram] muted_rules): an alert whose rule is listed stays in the outbox table,
+        # is logged, and is marked "muted: telegram policy" instead of being sent. The code that queued it (a paper
+        # strategy, its entries, exits and records) runs exactly the same either way.
+        self.muted = frozenset(muted)
+        self.muted_count = 0
         self.last_error: str | None = None
         self._lock = asyncio.Lock()
 
@@ -108,7 +114,12 @@ class Dispatcher:
             for alert_id, rule, text, sent_to, only in self.store.pending():
                 done = [c for c in (sent_to or "").split(",") if c]
                 if not done:
-                    log.info("ALERT [%s]\n%s", rule, strip_html(text))
+                    log.info("ALERT [%s]%s\n%s", rule, " (Telegram muted)" if rule in self.muted else "",
+                             strip_html(text))
+                if rule in self.muted:
+                    self.store.mark_muted(alert_id)
+                    self.muted_count += 1
+                    continue
                 chats = [only] if only else self.chats
                 if self.telegram is None or not chats:
                     self.store.mark_delivered(alert_id)

@@ -137,3 +137,20 @@ Telegram and keep Structure fully active as a research family.
 - **Nov 16 estimate (replay of stored watches):** 123 v2 messages recorded (the no-mute replay reproduces 123) →
   46 under the current policy.
 
+## 2026-11-17 — MIAS paper strategies: live Telegram alerts muted (delivery policy only)
+
+User request, 2026-11-17: keep every EMA paper strategy and the close fade running for evidence collection, but
+stop their live Telegram alerts so Telegram is reserved for Early Watch v1 / v2.
+
+- **Change (mias-claude, not the observer):** `[telegram] muted_rules` → `Dispatcher(muted=...)`. An outbox alert
+  whose rule is listed is logged and marked delivered with `last_error = "muted: telegram policy"`; it is never sent
+  or retried. Muted: `ema_entry`, `ema_partial`, `ema_trail`, `ema_target`, `ema_stop`, `ema_breakeven`,
+  `ema_trailed`, `ema_invalidated`, `ema_time`, `ema_simple`, `closeplay`.
+- **Unchanged:** strategy code and rules (C, D, E7, E21 active; B and Simple paused; A retired), paper entries, open-
+  position management, exits, bid/ask fills, commissions, P/L, trade logs, scorecards, reports, replays. The muting
+  sits after the strategies have written their state, so state is identical with the policy on or off (tested).
+- **Still on Telegram:** Early Watch v1 / v2 (mias-observer, its own sender; Structure mute unchanged), the 15:10 EMA
+  paper summaries (`ema_summary`, kept: once a day, not live trade alerts), `system` (start, degraded / recovered,
+  health-gate holds), scorecard / strategy reports, market / options alerts, personal position alerts.
+- No EMA or close-fade paper position was open when the change was deployed (after the close).
+

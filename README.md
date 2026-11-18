@@ -65,6 +65,16 @@ the confidence verdict, and their options flip alerts are suppressed.
 
 ## What you receive
 
+**Telegram policy for paper strategies (2026-11-17, `[telegram] muted_rules`):** Telegram is for Early Watch
+awareness. The live alerts of the paper strategies — every EMA paper entry and exit (C, D, E7, E21, and A / B /
+Simple if re-enabled: `ema_entry`, `ema_partial`, `ema_trail`, `ema_target`, `ema_stop`, `ema_breakeven`,
+`ema_trailed`, `ema_invalidated`, `ema_time`, `ema_simple`) and the 3:45 close fade (`closeplay`) — are still queued,
+logged and kept in the `alerts` table, marked `muted: telegram policy`, but never sent. The strategies themselves are
+unchanged: entries, management, stops / targets / time exits, bid/ask fills, fees, P/L, MFE / MAE, logs, scorecards,
+`/strategies`, the weekly reports and replays all run as before. Still sent: Early Watch v1 / v2 (from mias-observer),
+the once-a-day 15:10 EMA paper summaries (`ema_summary`), system / health messages, scorecard and strategy reports, and
+every market / options alert. Remove a rule from the list to send it again.
+
 Alerts are **tiered** by urgency (`[alerts] mode = "tiered"`, since 2026-10-25):
 
 **Alert symbols** (`[alerts] symbols`, since 2026-11-09): per-symbol alerts (pullback, swing trend, roll-call, trend / options changes, wall breaks, IV spikes, blocks, unusual-activity listings) are posted only for SPY, QQQ, IWM, NVDA, TSLA, META, MSFT, AAPL, AMZN, AMD, COST, PG and WMT. Every watched symbol is still evaluated (sector board, market line, position alerts, `/trend`).

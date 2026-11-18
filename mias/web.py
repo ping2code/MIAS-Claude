@@ -117,7 +117,7 @@ class WebServer:
             )) + "</tr>")
         alerts = "".join(
             f"<li><b>{datetime.fromtimestamp(a['ts'], cfg.tz):%m-%d %H:%M}</b> "
-            f"[{escape(a['rule'])}] {'' if a['delivered'] else '(pending) '}"
+            f"[{escape(a['rule'])}] {'(Telegram muted) ' if a.get('muted') else '' if a['delivered'] else '(pending) '}"
             f"<pre>{escape(strip_html_safe(a['text']))}</pre></li>"
             for a in self.svc.store.recent_alerts(20))
         market = eng.last_market
