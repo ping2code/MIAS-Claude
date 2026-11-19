@@ -683,8 +683,10 @@ has its own process (user unit `mias-early-watch-v3`, `python -m mias.early_watc
   kill switch cannot affect V1 / V2.
 - **Telegram:** all three families send at launch, each with a `send_*` flag. V3 does not copy V2's Structure
   mute. Pacing and safety are copied from V2: main lane only, a 180 s maximum age, one message per setup, and
-  same-symbol / same-side Watches within 5 min combined into one message. Messages go through V3's own sender
-  instance (its own rate-limit state) to the V3 chat.
+  same-symbol / same-side Watches within 5 min combined into one message. Messages go through V3's OWN bot
+  (token in env `TELEGRAM_BOT_TOKEN_V3`, from the service environment or the gitignored `.env.v3`) and V3's own
+  sender instance (its own rate-limit state) to the V3 chat only. V3 never uses the V1 / V2 bot token or chats:
+  without a V3 token it detects and stores only and records `send skipped: no V3 token`.
 - **Message format:** each message has a bold header
   `V3 EARLY WATCH · <family tags> · SYMBOL · DIR · HH:MM ET @ price`. It shows six ✓ / ✗ / ○ checks relative to
   the Watch direction: VWAP, EMA9/21, SMA200, SPY, volume and options. It also shows level margins in % and ATR,
@@ -706,7 +708,8 @@ has its own process (user unit `mias-early-watch-v3`, `python -m mias.early_watc
 
 Commands: `python -m mias.early_watch_v3 replay 2026-11-17` (own replay database, no Telegram),
 `... render --db data/early_watch_v3/replay.db --day 2026-11-17 --sym AMZN --side bear --near 14:47`,
-`... report --day <day>`, `... status`, `... telegram-test`.
+`... report --day <day>`, `... status`, `... chat-check` (read-only getMe / getChat with the V3 bot),
+`... telegram-test` (one delivery test, stored in `v3_delivery_tests`, never counted as a Watch).
 
 ## Health gate
 

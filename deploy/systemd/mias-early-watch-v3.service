@@ -11,6 +11,8 @@ Wants=network-online.target
 
 [Service]
 WorkingDirectory=%h/MyRepos/MIAS-Claude
+# V3's own bot token (TELEGRAM_BOT_TOKEN_V3=...), gitignored; optional (no token = detect + store only)
+EnvironmentFile=-%h/MyRepos/MIAS-Claude/.env.v3
 ExecStart=%h/MyRepos/MIAS-Claude/.venv/bin/python -m mias.early_watch_v3 run
 Restart=always
 RestartSec=20

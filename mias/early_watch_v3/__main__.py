@@ -29,11 +29,15 @@ def main(argv=None) -> int:
     rd.add_argument("--sym", required=True)
     rd.add_argument("--side", choices=["bull", "bear"], default=None)
     rd.add_argument("--near", default=None, help="HH:MM ET")
-    sub.add_parser("telegram-test", help="one clearly labelled delivery test to the V3 chat")
+    sub.add_parser("telegram-test", help="one clearly labelled delivery test to the V3 chat (V3 bot)")
+    sub.add_parser("chat-check", help="read-only getMe / getChat (/ getUpdates) with the V3 bot")
     sub.add_parser("status", help="last status and feed lines")
     args = p.parse_args(argv)
     logging.basicConfig(level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)       # request URLs (which carry tokens) are never logged
+    from . import tg as _tg
+    _tg.load_secrets()
+    _tg.install_log_redaction()
 
     from .. import config as mias_config
     from . import config as v3config
@@ -87,24 +91,35 @@ def main(argv=None) -> int:
             print(w["text"] or f"(no text: {w['render_error']})")
         db.close()
         return 0
-    if args.cmd == "telegram-test":
-        from .service import make_sender
-        sender, chats = make_sender(cfg, v3)
+    if args.cmd in ("telegram-test", "chat-check"):
+        from . import tg
+        tg.load_secrets()
+        if args.cmd == "chat-check":
+            print(json.dumps(tg.check_chat(v3.chat_id), indent=1, default=str))
+            return 0
+        from .store import V3DB
+        sender, why = tg.make_sender(v3)
+        db = V3DB(v3.db_path)
         if sender is None:
-            print("no bot token / V3 chat configured")
+            db.delivery_test(v3.chat_id, tg.TEST_TEXT, False, None, why)
+            print(why)
             return 1
-        text = ("🧭 V3 EARLY WATCH · delivery test (not a Watch)\n"
-                "This chat receives V3 EARLY WATCH research messages (all three families: V3-A Structure, V3-B VWAP, "
-                "V3-C OR) from the next session, 09:45–15:00 ET.\n"
-                "WATCH ONLY — NOT A TRADE SIGNAL")
 
         async def go():
             try:
-                return await sender.send(text)
+                return await sender.send(tg.TEST_TEXT)
             finally:
                 await sender.close()
-        ids = asyncio.run(go())
-        print(f"sent to {len(ids)} chat(s), message ids {', '.join(ids)}")
+        try:
+            ids = asyncio.run(go())
+        except Exception as exc:
+            err = tg.redact(f"{type(exc).__name__}: {exc}")[:300]
+            db.delivery_test(v3.chat_id, tg.TEST_TEXT, False, None, err)
+            print(f"delivery test failed: {err}")
+            return 1
+        db.delivery_test(v3.chat_id, tg.TEST_TEXT, True, ",".join(ids), None)
+        db.close()
+        print(f"delivered to {v3.chat_id}: message_id {', '.join(ids)}")
         return 0
     if args.cmd == "status":
         from .store import V3DB

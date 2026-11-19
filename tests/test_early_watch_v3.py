@@ -16,6 +16,7 @@ import pytest
 from mias.early_watch_v3 import config as C
 from mias.early_watch_v3 import present as Pr
 from mias.early_watch_v3 import service as Svc
+from mias.early_watch_v3 import tg
 from mias.early_watch_v3.atr import atr_5m
 from mias.early_watch_v3.detector import V3Detector
 from mias.early_watch_v3.outcomes import outcomes
@@ -322,7 +323,7 @@ class FakeSender:
 
 
 def _cfg():
-    return SimpleNamespace(tz=ET, telegram_token="t", telegram_alert_chats=["-100"], db_path=Path("/nonexistent"))
+    return SimpleNamespace(tz=ET, db_path=Path("/nonexistent"))
 
 
 def _setup(tmp_path, seed=7, toml_edits=(), sender=None, options_factory=None):
@@ -493,22 +494,127 @@ def test_telegram_failure_is_recorded_and_changes_nothing_else(tmp_path):
     assert all(w["text"] and w["view"] for w in ws)
 
 
-def test_own_sender_and_rate_limit_queue():
+V1V2_TOKEN = "111111:V1V2-BOT-TOKEN-must-never-be-used"
+V3_TOKEN = "222222:V3-BOT-TOKEN-secret"
+
+
+def test_v3_uses_its_own_token_and_chat_and_own_rate_limit_queue(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", V1V2_TOKEN)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", V3_TOKEN)
     v3 = C.load(V3TOML)
-    cfg = SimpleNamespace(telegram_token="t", telegram_alert_chats=["-100", "123"])
-    s1, chats = Svc.make_sender(cfg, v3)
-    s2, _ = Svc.make_sender(cfg, v3)
+    s1, why = tg.make_sender(v3)
+    s2, _ = tg.make_sender(v3)
     try:
-        assert chats == ["-5328364952"] and s1.chats == ["-5328364952"]
+        assert why is None and s1.chats == ["-5328364952"]
+        assert V3_TOKEN in str(s1._url) and V1V2_TOKEN not in str(s1._url)
         assert s1 is not s2 and s1._next is not s2._next and s1._lock is not s2._lock   # own pacing state
         assert s1._gap("-5328364952") == v3.tg.group_gap_s and s1._gap("123") == v3.tg.private_gap_s
         assert s1.max_wait_s == v3.tg.max_wait_s
-        fb, fchats = Svc.make_sender(cfg, replace(v3, chat_id=None))     # fallback chats, still its own queue
-        assert fchats == ["-100", "123"] and fb._next is not s1._next
-        asyncio.run(fb.close())
     finally:
         asyncio.run(s1.close())
         asyncio.run(s2.close())
+
+
+def test_no_fallback_to_the_v1_v2_token_or_chats(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", V1V2_TOKEN)
+    monkeypatch.setenv("TELEGRAM_ALERT_CHATS", "-100,-5323269951")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN_V3", raising=False)
+    assert tg.make_sender(C.load(V3TOML)) == (None, "send skipped: no V3 token")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", V3_TOKEN)
+    assert tg.make_sender(replace(C.load(V3TOML), chat_id=None)) == (None, "send skipped: no V3 chat")
+    import inspect
+    from mias.early_watch_v3 import service
+    for mod in (tg, service):                           # nothing in V3 reads the V1 / V2 token or alert chats
+        src = inspect.getsource(mod)
+        assert "telegram_token" not in src and "telegram_alert_chats" not in src
+        assert not re.search(r"TELEGRAM_BOT_TOKEN(?!_V3)", src)
+
+
+def test_secrets_file_loads_only_the_v3_token(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN_V3", raising=False)
+    monkeypatch.delenv("SOMETHING_ELSE", raising=False)
+    f = tmp_path / ".env.v3"
+    f.write_text(f"# V3 only\nexport TELEGRAM_BOT_TOKEN_V3='{V3_TOKEN}'\nSOMETHING_ELSE=x\n")
+    tg.load_secrets(f)
+    import os
+    assert tg.token() == V3_TOKEN and "SOMETHING_ELSE" not in os.environ
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", "from-the-service-env")
+    tg.load_secrets(f)
+    assert tg.token() == "from-the-service-env"         # the real environment wins
+
+
+def test_missing_token_means_detect_store_and_log_only(tmp_path, monkeypatch, caplog):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN_V3", raising=False)
+    sender, why = tg.make_sender(C.load(V3TOML))
+    assert sender is None
+    r, store, sim, _ = _setup(tmp_path, sender=None)
+    r.no_sender_reason = why
+    _run_all(r, sim)
+    ws = store.watches()
+    would = [w for w in ws if w["v3_verdict"] == "send"]
+    assert ws and would and r.outbox.empty() and r.counts["tg_no_token"] == len(would)
+    assert all(w["telegram_error"] == "send skipped: no V3 token" and not w["telegram_sent"] for w in would)
+    assert all(w["text"] and w["view"] for w in ws)                   # still fully detected + stored
+    assert r.counts["errors_detector"] == r.counts["errors_store"] == 0
+
+
+def test_token_never_in_logs_or_stored_records(tmp_path, monkeypatch, caplog):
+    import logging
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", V3_TOKEN)
+
+    class LeakySender(FakeSender):                     # an error text that (wrongly) contains the token
+        async def send(self, text):
+            raise RuntimeError(f"POST https://api.telegram.org/bot{V3_TOKEN}/sendMessage failed")
+    r, store, sim, _ = _setup(tmp_path, sender=LeakySender())
+    handler = logging.StreamHandler()
+    logging.getLogger().addHandler(handler)
+    tg.install_log_redaction()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            caplog.handler.addFilter(tg.RedactFilter())
+            logging.getLogger("mias.early_watch_v3").warning("leak test %s", f"bot{V3_TOKEN}")
+            _run_all(r, sim)
+            _drain(r)
+            store.delivery_test("-5328364952", tg.TEST_TEXT, False, None, tg.redact(f"x {V3_TOKEN}"))
+    finally:
+        logging.getLogger().removeHandler(handler)
+    assert V3_TOKEN not in caplog.text and "<V3 token>" in caplog.text
+    store.close()
+    for p in Path(tmp_path / "v3").glob("v3.db*"):
+        assert V3_TOKEN.encode() not in p.read_bytes(), p
+    failed = [w for w in V3DB(tmp_path / "v3" / "v3.db").watches() if w["v3_verdict"] == "send"]
+    assert failed and all("<V3 token>" in w["telegram_error"] for w in failed)
+
+
+def test_bot_checks_report_username_chat_and_ids_from_updates(monkeypatch):
+    import httpx
+    import json
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", V3_TOKEN)
+    calls = []
+
+    def handler(req):
+        m = req.url.path.rsplit("/", 1)[-1]
+        calls.append((m, json.loads(req.content or b"{}")))
+        if m == "getMe":
+            return httpx.Response(200, json={"ok": True, "result": {"username": "mias_v3_bot"}})
+        if m == "getChat":
+            return httpx.Response(400, json={"ok": False, "description": "Bad Request: chat not found"})
+        return httpx.Response(200, json={"ok": True, "result": [
+            {"my_chat_member": {"chat": {"id": -1005328364952, "type": "supergroup", "title": "MIAS V3"}}},
+            {"message": {"chat": {"id": 42, "type": "private"}}}]})
+    out = tg.check_chat("-5328364952", transport=httpx.MockTransport(handler))
+    assert out["bot"] == "mias_v3_bot" and not out["chat_ok"] and out["chat_error"].endswith("chat not found")
+    assert out["chats_in_updates"] == [{"id": -1005328364952, "type": "supergroup", "title": "MIAS V3"}]
+    assert [c[0] for c in calls] == ["getMe", "getChat", "getUpdates"]
+    assert V3_TOKEN not in json.dumps(out)
+
+
+def test_delivery_test_record_is_separate_from_watches(tmp_path):
+    store = V3DB(tmp_path / "v3.db")
+    store.delivery_test("-5328364952", tg.TEST_TEXT, True, "17", None)
+    assert store.db.execute("SELECT COUNT(*) FROM v3_delivery_tests").fetchone()[0] == 1
+    assert store.watches() == [] and "Watches: **0**" in build(store, ET, str(TODAY), None)
+    assert tg.TEST_TEXT == "V3 EARLY WATCH · delivery test · not a Watch"
 
 
 def test_telegram_send_uses_bold_heading_and_v3_chat(monkeypatch):
@@ -517,16 +623,19 @@ def test_telegram_send_uses_bold_heading_and_v3_chat(monkeypatch):
 
     def handler(req):
         import json
-        seen.append(json.loads(req.content))
+        seen.append((str(req.url), json.loads(req.content)))
         return httpx.Response(200, json={"ok": True, "result": {"message_id": 7}})
-    v3 = C.load(V3TOML)
-    snd, _ = Svc.make_sender(SimpleNamespace(telegram_token="t", telegram_alert_chats=[]), v3)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", V1V2_TOKEN)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN_V3", V3_TOKEN)
+    snd, _ = tg.make_sender(C.load(V3TOML))
     snd._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     text = Pr.render(view(W("bull", "vwap"), fams=["vwap"]))
     ids = asyncio.run(snd.send(text))
     asyncio.run(snd.close())
-    assert ids == ["7"] and seen[0]["chat_id"] == "-5328364952" and seen[0]["text"] == text
-    assert seen[0]["entities"][0]["type"] == "bold"
+    url, body = seen[0]
+    assert ids == ["7"] and body["chat_id"] == "-5328364952" and body["text"] == text
+    assert f"/bot{V3_TOKEN}/" in url and V1V2_TOKEN not in url
+    assert body["entities"][0]["type"] == "bold"
 
 
 # ---- 6. kill switch ---------------------------------------------------------------------------------------

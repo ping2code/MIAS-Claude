@@ -10,7 +10,9 @@
 [early_watch_v3]
 enabled = true                      # false: V3 stops entirely (no processing, no storage, no sends); V1 / V2 unaffected
 telegram_enabled = true             # false: V3 keeps detecting and recording, sends nothing
-telegram_chat_id_v3 = "-5328364952" # V3's own Telegram chat (V1 / V2 keep their chats); same bot token from .env
+telegram_chat_id_v3 = "-5328364952" # V3's own Telegram chat, V3's OWN bot: token in env TELEGRAM_BOT_TOKEN_V3
+                                    # (service environment or the gitignored .env.v3). Never the V1 / V2 bot or chats;
+                                    # without a V3 token V3 detects + stores only ("send skipped: no V3 token").
 symbols = ["SPY", "QQQ", "IWM", "NVDA", "TSLA", "META", "MSFT", "AAPL", "AMZN", "AMD", "PG"]   # = V2 ([observer] symbols)
 db_path = "data/early_watch_v3/v3.db"         # V3 storage (never a V1 / V2 file)
 cache_dir = "data/early_watch_v3/cache"       # V3's own warm-up cache

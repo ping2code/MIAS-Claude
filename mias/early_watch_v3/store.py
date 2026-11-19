@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS v3_ema_cross (day TEXT, sym TEXT, side TEXT, at INTEG
 CREATE TABLE IF NOT EXISTS v3_confirms (
     day TEXT, sym TEXT, side TEXT, ts REAL, source TEXT, PRIMARY KEY (sym, side, ts, source));
 CREATE TABLE IF NOT EXISTS v3_feed (ts REAL NOT NULL, kind TEXT NOT NULL, detail TEXT);
+CREATE TABLE IF NOT EXISTS v3_delivery_tests (
+    at REAL NOT NULL, chat_id TEXT, text TEXT, ok INTEGER NOT NULL, message_id TEXT, error TEXT);
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL);
 """
 
@@ -56,6 +58,12 @@ WCOLS = ["watch_id", "cand_id", "day", "family", "lane", "sym", "side", "leg_id"
          "mode", "bar_received_at", "bar_seen_at", "created_at"]
 JSON = ("ema_watch", "leg_start", "context", "view", "families")
 HORIZONS = (5, 10, 15, 30, 60)
+
+
+def _clean(text):
+    """Every stored error / feed text passes through the V3 token scrub (defence in depth)."""
+    from .tg import redact
+    return redact(text)
 
 
 class V3DB:
@@ -81,7 +89,7 @@ class V3DB:
         return json.loads(r[0]) if r else default
 
     def feed(self, kind: str, detail: str = "") -> None:
-        self.db.execute("INSERT INTO v3_feed VALUES (?, ?, ?)", (time.time(), kind, detail[:500]))
+        self.db.execute("INSERT INTO v3_feed VALUES (?, ?, ?)", (time.time(), kind, _clean(detail)[:500]))
 
     def bar(self, day: str, sym: str, b, source: str, src_rowid=None, received_at=None, seen_at=None,
             gap=False) -> None:
@@ -147,7 +155,7 @@ class V3DB:
 
     def set_view(self, watch_id: str, view: dict | None, text: str | None, error: str | None = None) -> None:
         cols, vals = ["view", "text", "render_error", "families"], [
-            json.dumps(view, sort_keys=True, default=str) if view else None, text, error,
+            json.dumps(view, sort_keys=True, default=str) if view else None, text, _clean(error),
             json.dumps((view or {}).get("families")) if view else None]
         if view:
             for c in ("vwap", "ema", "sma200", "spy", "volume", "options"):
@@ -172,12 +180,18 @@ class V3DB:
         self.db.execute("UPDATE v3_watches SET telegram_sent=?, telegram_message_id=?, telegram_sent_at=?, "
                         "telegram_error=?, telegram_group=?, telegram_text=COALESCE(?, telegram_text) "
                         "WHERE watch_id=?",
-                        (int(sent), ",".join(ids or []) or None, at if sent else None, error, group, text, watch_id))
+                        (int(sent), ",".join(ids or []) or None, at if sent else None, _clean(error), group, text,
+                         watch_id))
 
     def set_outcomes(self, watch_id: str, o: dict) -> None:
         cols = [f"out_{h}" for h in HORIZONS] + ["mfe_pct", "mae_pct", "mfe_atr", "mae_atr"]
         self.db.execute(f"UPDATE v3_watches SET {', '.join(c + '=?' for c in cols)}, outcomes_at=? WHERE watch_id=?",
                         [o.get(c) for c in cols] + [time.time(), watch_id])
+
+    def delivery_test(self, chat_id, text: str, ok: bool, message_id=None, error=None) -> None:
+        """A delivery test record: its own table, never a Watch, never in any report."""
+        self.db.execute("INSERT INTO v3_delivery_tests VALUES (?,?,?,?,?,?)",
+                        (time.time(), chat_id, text, int(ok), message_id, _clean(error)))
 
     # ---- reads ------------------------------------------------------------------------------------
 

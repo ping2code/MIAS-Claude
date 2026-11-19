@@ -9,7 +9,8 @@ sources V2 uses. Nothing here writes a V1 / V2 table or file, and nothing V1 / V
 exception, restart or kill switch can never suppress, delay or change a V1 / V2 alert, state or record.
 
 Within V3: a detector error skips that bar for V3 only; a presentation, storage or Telegram error is logged and
-recorded, never reaches detection; Telegram sends run from a separate queue / worker with V3's own pacing.
+recorded, never reaches detection; Telegram sends run from a separate queue / worker with V3's own pacing, V3's own
+bot (TELEGRAM_BOT_TOKEN_V3, mias/early_watch_v3/tg.py) and V3's own chat; never the V1 / V2 bot or chats.
 Hot kill switch (early_watch_v3.toml, re-read every reload_seconds): enabled = false stops V3 entirely (idle),
 telegram_enabled = false keeps detection + storage and sends nothing.
 """
@@ -99,11 +100,13 @@ def ro_connect(path: Path, timeout_s: float = 0.5) -> sqlite3.Connection:
 class V3Runner:
     def __init__(self, cfg, v3: V3Config, store: V3DB, *, source=None, client=None, sender=None, clock=time.time,
                  options_factory=None, warm=None, v2_policy_factory=v2_policy, config_toml: str = "config.toml",
-                 mode: str = "live"):
+                 mode: str = "live", no_sender_reason: str | None = None):
         self.cfg, self.v3, self.store, self.source, self.client, self.sender = cfg, v3, store, source, client, sender
         self.tz = cfg.tz
         self.clock = clock
         self.mode = mode
+        from .tg import NO_TOKEN
+        self.no_sender_reason = no_sender_reason or NO_TOKEN
         self.syms = list(v3.symbols)
         self.det: V3Detector | None = None
         self.day: date | None = None
@@ -302,10 +305,11 @@ class V3Runner:
                     self.counts["tg_disabled"] += 1
                     self.store.mark_telegram(w["watch_id"], False, None, "not sent: telegram_enabled = false", info,
                                              self.clock())
-                elif self.sender is None or not m.get("text"):
-                    self.store.mark_telegram(w["watch_id"], False, None,
-                                             "not sent: " + ("no V3 sender" if self.sender is None else
-                                                             "render failed"), info, self.clock())
+                elif self.sender is None:
+                    self.counts["tg_no_token"] = self.counts.get("tg_no_token", 0) + 1
+                    self.store.mark_telegram(w["watch_id"], False, None, self.no_sender_reason, info, self.clock())
+                elif not m.get("text"):
+                    self.store.mark_telegram(w["watch_id"], False, None, "not sent: render failed", info, self.clock())
                 else:
                     self.outbox.put_nowait((w["watch_id"], m["text"], info))
                     self.counts["tg_queued"] += 1
@@ -340,7 +344,9 @@ class V3Runner:
         except Exception as exc:                      # delivery only: never reaches detection / storage of the Watch
             self.counts["tg_failed"] += 1
             try:
-                self.store.mark_telegram(wid, False, None, f"{type(exc).__name__}: {exc}"[:300], group, self.clock())
+                from .tg import redact
+                self.store.mark_telegram(wid, False, None, redact(f"{type(exc).__name__}: {exc}")[:300], group,
+                                         self.clock())
                 self.store.feed("telegram_failed", f"{wid}: {type(exc).__name__}")
             except Exception:
                 log.exception("could not record the V3 telegram failure")
@@ -417,21 +423,6 @@ class V3Runner:
                 pass
 
 
-def make_sender(cfg, v3: V3Config):
-    """V3's own sender instance (own pacing state = own rate-limit queue) to the V3 chat. Falls back to the V1 / V2
-    alert chats only if no V3 chat is configured; even then the queue and pacing are V3's own."""
-    from ..observer.telegram import WatchSender
-
-    class V3Sender(WatchSender):
-        def _gap(self, chat: str) -> float:
-            return v3.tg.group_gap_s if str(chat).startswith("-") else v3.tg.private_gap_s
-
-    chats = [v3.chat_id] if v3.chat_id else list(cfg.telegram_alert_chats)
-    if not (cfg.telegram_token and chats):
-        return None, chats
-    return V3Sender(cfg.telegram_token, chats, max_wait_s=v3.tg.max_wait_s), chats
-
-
 async def main(cfg, v3: V3Config) -> None:
     from ..massive import MassiveClient
     from ..observer.optctx import OptionsContext
@@ -445,14 +436,18 @@ async def main(cfg, v3: V3Config) -> None:
             loop.add_signal_handler(sig, stop.set)
         except NotImplementedError:
             pass
-    sender, chats = make_sender(cfg, v3)
+    from .tg import load_secrets, make_sender
+    load_secrets()
+    sender, why = make_sender(v3)                    # V3's own bot + chat only; never the V1 / V2 token or chats
+    if sender is None:
+        log.warning("V3 Telegram off (%s): Watches are detected and stored only", why)
     async with MassiveClient(cfg.api_key, cfg.base_url, timeout=cfg.request_timeout, max_retries=cfg.max_retries,
                              max_concurrency=2) as client:
-        runner = V3Runner(cfg, v3, store, source=source, client=client, sender=sender,
+        runner = V3Runner(cfg, v3, store, source=source, client=client, sender=sender, no_sender_reason=why,
                           options_factory=lambda: OptionsContext(Path(cfg.db_path), cfg.tz, source="live snapshot"))
         store.feed("start", f"{len(v3.symbols)} symbols, enabled {v3.enabled}, telegram "
-                            f"{'ON' if sender and v3.telegram_enabled else 'off'} "
-                            f"({'V3 chat' if v3.chat_id else 'fallback: V1/V2 chats, own queue'}), families "
+                            f"{'ON (V3 bot, V3 chat)' if sender and v3.telegram_enabled else 'off'}"
+                            f"{f' ({why})' if why else ''}, families "
                             f"{', '.join(f for f, on in v3.tg.send.items() if on)}")
         try:
             await asyncio.gather(runner.loop(stop), runner.send_worker(stop))
