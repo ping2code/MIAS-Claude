@@ -23,8 +23,12 @@ VIEW_DIR = {"BULLISH_CONFIRMATION": "bullish", "BEARISH_CONFIRMATION": "bearish"
 
 
 def _num(x: float, fmt: str) -> str:
-    """Signed numbers with a real minus sign (e.g. SPY −1.24%)."""
-    return format(x, fmt).replace("-", "−")
+    """Numbers with one minus sign everywhere (U+2212, e.g. SPY −1.24%); a value that rounds to zero is shown
+    unsigned ("0.00", never "−0.00" / "+0.00" / "-0.00")."""
+    s = format(x, fmt)
+    if float(s) == 0:
+        s = s.lstrip("+-")
+    return s.replace("-", "−")
 
 
 def _et(ms: int, tz: ZoneInfo) -> datetime:
@@ -152,8 +156,10 @@ def build_view(w: dict, open_fams: list[str], vwap_progress: tuple[int, int] | N
     if mv in VIEW_DIR and spy is not None and w["sym"] != "SPY":
         if (VIEW_DIR[mv] == "bullish" and spy < 0) or (VIEW_DIR[mv] == "bearish" and spy > 0):
             mismatch = f"Market mismatch: options {VIEW_DIR[mv]} while SPY {_num(spy, '+.2f')}%"
+    # display only: the mismatch is still computed and stored; the line is shown only for a real SPY move
+    shown = mismatch is not None and abs(spy) >= pres.market_mismatch_min_spy_pct
     v.update(options_status=o_status, options_age_s=age, options_snapshot_ts=snap, options_stock=stock,
-             options_market=market, options_overall=ovr, market_mismatch=mismatch)
+             options_market=market, options_overall=ovr, market_mismatch=mismatch, mismatch_shown=shown)
     ost = "support" if ovr == "CONFIRMING" else "against" if ovr == "CONFLICTING" else "neutral"
     checks["options"] = (ost, f"Options: {WORD.get(ovr, ovr)}")
 
@@ -194,6 +200,9 @@ def build_view(w: dict, open_fams: list[str], vwap_progress: tuple[int, int] | N
     else:
         v["inval_dist_pct"] = v["inval_dist_atr"] = None
     v["tight"] = v["inval_dist_atr"] is not None and v["inval_dist_atr"] < pres.tight_invalidation_atr
+    # the level sits at the Watch price (e.g. the confirming close equals a frozen LH / HL level): display only
+    v["invalidation_at_entry"] = v["inval_dist_atr"] is not None and abs(v["inval_dist_atr"]) < \
+        pres.inval_at_entry_atr
 
     t = _et(w["watch_at"], tz)
     v["hhmm"] = f"{t:%H:%M}"
@@ -215,7 +224,7 @@ def render(v: dict) -> str:
     mk = "n/a (index)" if v["is_index"] and v["options_market"] is None else WORD.get(v["options_market"], "n/a")
     lines.append(f"Stock options: {WORD.get(v['options_stock'])} | Market options: {mk} | "
                  f"Overall: {WORD.get(v['options_overall'])}")
-    if v.get("market_mismatch"):
+    if v.get("market_mismatch") and v.get("mismatch_shown", True):
         lines.append(v["market_mismatch"])
     if v["options_status"] == "unavailable":
         lines.append("Options: unavailable")
@@ -228,8 +237,11 @@ def render(v: dict) -> str:
         lines.append(f"ATR (14 × 5m): ${v['atr']:,.2f}")
     tight = " · tight — noise risk" if v["tight"] else ""
     if v["inval_level"] is not None:
-        dist = f"{_num(v['inval_dist_pct'], '+.2f')}%" + (f" · {v['inval_dist_atr']:.2f} ATR"
-                                                         if v["inval_dist_atr"] is not None else "")
+        if v.get("invalidation_at_entry"):
+            dist = "at entry (0 ATR)"
+        else:
+            dist = f"{_num(v['inval_dist_pct'], '+.2f')}%" + (f" · {_num(v['inval_dist_atr'], '.2f')} ATR"
+                                                             if v["inval_dist_atr"] is not None else "")
         if v["family"] == "vwap":
             lines.append(f"Invalidation: 2 closes back {'below' if bull else 'above'} VWAP "
                          f"(now ${v['inval_level']:,.2f} · {dist}){tight}")

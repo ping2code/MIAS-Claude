@@ -61,6 +61,7 @@ def test_config_values_are_a_copy_of_current_v2():
     p = v3.pres
     assert (p.marginal_atr, p.tight_invalidation_atr, p.low_conviction_rvol, p.late_session_et) == \
         (0.10, 0.30, 0.8, time(14, 30))
+    assert (p.inval_at_entry_atr, p.market_mismatch_min_spy_pct) == (0.05, 0.50)
     assert v3.db_path != obs.db_path and v3.db_path != obs.v2_db_path and "early_watch_v3" in str(v3.db_path)
 
 
@@ -275,6 +276,71 @@ def test_invalidation_distance_tight_label_and_trigger_wording():
     assert "Trigger: OR breakout above $99.00 +0.51% · +1.00 ATR (V3-C OR)" in orb and "breakdown" not in orb
     ord_ = Pr.render(view(W("bear", "or", price=96.5, level=97.0), fams=["or"]))
     assert "OR breakdown below $97.00" in ord_ and "breakout" not in ord_
+
+
+def test_zero_distance_invalidation_shows_at_entry():
+    # PG 2026-11-19 11:36 ET: the confirming close equals the frozen LH level (V2 has the same level)
+    v = view(W("bear", "structure", price=168.27, level=168.27, atr14_5m=0.3911))
+    t = Pr.render(v)
+    assert "Invalidation: $168.27 · at entry (0 ATR) · tight — noise risk" in t
+    assert v["invalidation_at_entry"] and v["tight"] and v["inval_level"] == 168.27
+    near = view(W("bull", "structure", price=100.0, level=99.98, atr14_5m=0.5))      # 0.04 ATR
+    assert near["invalidation_at_entry"] and "at entry (0 ATR)" in Pr.render(near)
+    far = view(W("bull", "structure", price=100.0, level=99.97, atr14_5m=0.5))       # 0.06 ATR
+    assert not far["invalidation_at_entry"] and "Invalidation: $99.97 · +0.03% · 0.06 ATR" in Pr.render(far)
+    vw = view(W("bull", "vwap", price=99.81, vwap_exact=99.8), fams=["vwap"])
+    assert vw["invalidation_at_entry"] and "(now $99.80 · at entry (0 ATR))" in Pr.render(vw)
+
+
+def test_number_format_one_minus_sign_and_no_negative_zero():
+    assert Pr._num(-0.0, "+.2f") == "0.00" and Pr._num(-0.004, "+.2f") == "0.00" and Pr._num(0.0, "+.2f") == "0.00"
+    assert Pr._num(-0.004, ".2f") == "0.00" and Pr._num(-1.24, "+.2f") == "−1.24" and Pr._num(0.4, "+.2f") == "+0.40"
+    texts = _many_texts() + [Pr.render(view(W(s, f, price=p, level=p, vwap_exact=p, spy_pct=sp, atr14_5m=0.39),
+                                            fams=[f]))
+                             for s in ("bull", "bear") for f in ("structure", "vwap", "or")
+                             for p in (168.27, 99.8) for sp in (-0.0, -0.001, 0.0, -1.24)]
+    for t in texts:
+        assert "-0.00" not in t and "−0.00" not in t and "+0.00" not in t
+        assert not re.search(r"(?<![A-Za-z0-9])-\d", t), t            # never an ASCII hyphen-minus on a number
+
+
+def test_market_mismatch_line_needs_a_half_percent_spy_move():
+    x = optx("NEUTRAL", market="BULLISH_CONFIRMATION")
+    small = view(W("bear", spy_pct=-0.18, optx=x))
+    assert small["market_mismatch"] == "Market mismatch: options bullish while SPY −0.18%"    # still stored
+    assert not small["mismatch_shown"] and "Market mismatch" not in Pr.render(small)
+    big = view(W("bear", spy_pct=-1.24, optx=x))
+    assert big["mismatch_shown"] and "Market mismatch: options bullish while SPY −1.24%" in Pr.render(big)
+    edge = view(W("bear", spy_pct=-0.50, optx=x))
+    assert edge["mismatch_shown"]
+    # display only: options verdicts and the quality counts do not depend on whether the line is shown
+    for k in ("options_stock", "options_market", "options_overall", "n_support", "n_against", "n_neutral",
+              "checks"):
+        assert small[k] == view(W("bear", spy_pct=-0.18, optx=x), pres=C.Presentation(
+            market_mismatch_min_spy_pct=0.0))[k]
+
+
+def test_presentation_flags_are_stored_and_backfilled_on_old_databases(tmp_path):
+    import sqlite3 as sq
+    from mias.early_watch_v3.store import V3DB, SCHEMA
+    old = tmp_path / "old.db"
+    c = sq.connect(old)
+    c.executescript(SCHEMA.replace(" mismatch_shown INTEGER, invalidation_at_entry INTEGER,", ""))
+    c.execute("INSERT INTO v3_watches (watch_id, inval_dist_atr, market_mismatch) VALUES ('a', -0.0, 'm')")
+    c.execute("INSERT INTO v3_watches (watch_id, inval_dist_atr) VALUES ('b', 0.48)")
+    c.commit(); c.close()
+    db = V3DB(old)
+    got = {w["watch_id"]: (w["invalidation_at_entry"], w["mismatch_shown"]) for w in db.watches()}
+    assert got == {"a": (1, 1), "b": (0, 0)}
+    db2 = V3DB(old)                                     # idempotent re-open
+    db2.close()
+    v = view(W("bear", "structure", price=168.27, level=168.27, spy_pct=-0.18,
+               optx=optx("NEUTRAL", market="BULLISH_CONFIRMATION")))
+    db.db.execute("INSERT INTO v3_watches (watch_id) VALUES ('c')")
+    db.set_view("c", v, Pr.render(v))
+    w = db.watches("watch_id='c'")[0]
+    assert w["invalidation_at_entry"] == 1 and w["mismatch_shown"] == 0 and w["market_mismatch"]
+    db.close()
 
 
 def test_header_family_tags_and_combined():

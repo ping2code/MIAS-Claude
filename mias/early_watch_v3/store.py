@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS v3_watches (
     inval_kind TEXT, inval_level REAL, inval_dist_pct REAL, inval_dist_atr REAL, tight INTEGER,
     rel_vol REAL, low_conviction INTEGER, late_session INTEGER, minutes_to_close INTEGER,
     options_status TEXT, options_snapshot_ts REAL, options_age_s REAL, options_stock TEXT, options_market TEXT,
-    options_overall TEXT, market_mismatch TEXT,
+    options_overall TEXT, market_mismatch TEXT, mismatch_shown INTEGER, invalidation_at_entry INTEGER,
     view TEXT, text TEXT, render_error TEXT,
     v2_would_send INTEGER, v2_verdict TEXT, v3_verdict TEXT,
     telegram_sent INTEGER NOT NULL DEFAULT 0, telegram_queued_at REAL, telegram_sent_at REAL, telegram_message_id TEXT,
@@ -52,7 +52,12 @@ CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL, update
 VIEW_COLS = ["atr", "vwap", "n_support", "n_against", "n_neutral", "vwap_dist_pct", "vwap_dist_atr", "vwap_marginal",
              "inval_kind", "inval_level", "inval_dist_pct", "inval_dist_atr", "tight", "rel_vol", "low_conviction",
              "late_session", "minutes_to_close", "options_status", "options_snapshot_ts", "options_age_s",
-             "options_stock", "options_market", "options_overall", "market_mismatch", "is_index"]
+             "options_stock", "options_market", "options_overall", "market_mismatch", "is_index",
+             "mismatch_shown", "invalidation_at_entry"]
+# presentation flags added 2026-11-19 (storage only): column -> backfill for rows written before them
+ADDED = {"mismatch_shown": "CASE WHEN market_mismatch IS NULL THEN 0 ELSE 1 END",   # the old text always showed it
+         "invalidation_at_entry": "CASE WHEN inval_dist_atr IS NULL THEN NULL "
+                                  "WHEN ABS(inval_dist_atr) < 0.05 THEN 1 ELSE 0 END"}
 WCOLS = ["watch_id", "cand_id", "day", "family", "lane", "sym", "side", "leg_id", "candidate_at", "candidate_price",
          "watch_at", "watch_price", "level", "pre_ema", "ema_watch", "leg_start", "context", "state", "rules_version",
          "mode", "bar_received_at", "bar_seen_at", "created_at"]
@@ -75,6 +80,11 @@ class V3DB:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(v3_watches)")}
+        for col, fill in ADDED.items():
+            if col not in have:
+                self.db.execute(f"ALTER TABLE v3_watches ADD COLUMN {col} INTEGER")
+                self.db.execute(f"UPDATE v3_watches SET {col} = {fill}")
 
     def close(self) -> None:
         self.db.close()

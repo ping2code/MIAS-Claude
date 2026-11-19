@@ -46,6 +46,8 @@ class Presentation:
     low_conviction_rvol: float = 0.8
     volume_support_rvol: float = 1.0
     late_session_et: time = time(14, 30)
+    inval_at_entry_atr: float = 0.05             # invalidation closer than this -> shown as "at entry"
+    market_mismatch_min_spy_pct: float = 0.50    # "Market mismatch" line shown only at |SPY move| >= this
 
 
 @dataclass(frozen=True)
@@ -122,7 +124,10 @@ def load(path: str | Path = DEFAULT_PATH) -> V3Config:
                         tight_invalidation_atr=float(pr.get("tight_invalidation_atr", p0.tight_invalidation_atr)),
                         low_conviction_rvol=float(pr.get("low_conviction_rvol", p0.low_conviction_rvol)),
                         volume_support_rvol=float(pr.get("volume_support_rvol", p0.volume_support_rvol)),
-                        late_session_et=_t(pr.get("late_session_et"), p0.late_session_et))
+                        late_session_et=_t(pr.get("late_session_et"), p0.late_session_et),
+                        inval_at_entry_atr=float(pr.get("inval_at_entry_atr", p0.inval_at_entry_atr)),
+                        market_mismatch_min_spy_pct=float(pr.get("market_mismatch_min_spy_pct",
+                                                                 p0.market_mismatch_min_spy_pct)))
     syms = [str(s).upper() for s in raw.get("symbols") or []]
     syms = ["SPY"] + [s for s in syms if s != "SPY"]           # = V2: SPY first (market context)
     chat = raw.get("telegram_chat_id_v3")

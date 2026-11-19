@@ -75,3 +75,5 @@ tight_invalidation_atr = 0.30
 low_conviction_rvol = 0.8
 volume_support_rvol = 1.0           # the volume check shows ✓ at >= 1.0x normal, ✗ below low_conviction_rvol
 late_session_et = "14:30"
+inval_at_entry_atr = 0.05           # invalidation distance < this -> "at entry (0 ATR)" (+ invalidation_at_entry)
+market_mismatch_min_spy_pct = 0.50  # "Market mismatch" line only when |SPY move| >= 0.50% (display only)
