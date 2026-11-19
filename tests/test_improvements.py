@@ -363,7 +363,10 @@ def _close_cfg(tmp_path, monkeypatch):
     from mias import config as config_mod
     monkeypatch.setenv("MASSIVE_API_KEY", "k")
     monkeypatch.setenv("MIAS_DB_PATH", str(tmp_path / "c.db"))
-    return config_mod.load(_P(__file__).resolve().parent.parent / "config.toml")
+    import dataclasses
+    # The close fade is paused in config.toml since 2026-11-18; its code is exercised here with it switched on.
+    return dataclasses.replace(config_mod.load(_P(__file__).resolve().parent.parent / "config.toml"),
+                               closeplay_enabled=True)
 
 
 def test_close_play_live_fade_trade(tmp_path, monkeypatch):

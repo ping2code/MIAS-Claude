@@ -67,12 +67,14 @@ def _block(title: str, rows: list[dict], since: date, days: int, fee: float, con
 
 def _not_running(name: str, rules) -> str:
     """Label for a logged strategy that is not in [daytrade] strategies: retired (A) or paused (B, 2026-11-13)."""
-    if name in rules.strategies:
-        return ""
-    from .paperscore import CODES, PAUSED, RETIRED
+    from .paperscore import CODES, PAUSED, RETIRED, pause_label
     code = CODES.get(name)
+    if code in RETIRED and name not in rules.strategies:
+        return f" (retired {RETIRED[code]})"
+    if rules.enabled and name in rules.strategies:
+        return ""
     if code in PAUSED:
-        return f" (paused — benchmark; no new entries after {PAUSED[code]})"
+        return f" ({pause_label(code)}; no new entries after {PAUSED[code]})"
     if code in RETIRED:
         return f" (retired {RETIRED[code]})"
     return " (no longer running)"
@@ -94,7 +96,9 @@ def report(store, cfg, now: datetime, days: int = 7) -> str:
                         rules.contracts)
     close = store.get(closeplay.LOG_KEY) or []
     if cfg.closeplay_enabled or close:
-        lines += _block("<b>3:45 PM close fade</b>" + ("" if cfg.closeplay_enabled else " (no longer running)"),
+        from .paperscore import PAUSED, pause_label
+        lines += _block("<b>3:45 PM close fade</b>" + ("" if cfg.closeplay_enabled else
+                        f" ({pause_label('Close fade')}; no new entries after {PAUSED['Close fade']})"),
                         close, since, days, fee, cfg.closeplay_contracts)
     held: dict[str, dict[str, int]] = {}
     for i in range(days):

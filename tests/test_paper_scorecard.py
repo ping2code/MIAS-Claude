@@ -28,19 +28,35 @@ def cfg(tmp_path, monkeypatch):
 
 def test_a_is_not_in_the_active_paper_strategies(cfg):
     assert "retest" not in cfg.daytrade.strategies
-    assert cfg.daytrade.strategies == ("qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21")
-    assert cfg.closeplay_enabled
+    assert cfg.daytrade.strategies == ("qualified", "ema_9_21_d")          # E7 / E21 retired 2026-11-18
+    assert not cfg.daytrade.enabled and not cfg.closeplay_enabled          # C / D / close fade paused 2026-11-18
     assert P._status("A", cfg).startswith("retired")
 
 
 # ---- 2026-11-13: B and Simple paused from new forward paper entries (config only) ------------------------
 
-def test_b_and_simple_are_paused_and_c_d_e_close_fade_stay_active(cfg):
+def test_status_after_the_2026_11_18_cleanup(cfg):
+    """Every paper strategy is archived: C / D / close fade paused, E7 / E21 retired; B / Simple / A as before."""
     assert "cross" not in cfg.daytrade.strategies and not cfg.ema_simple_enabled
     assert {c: P._status(c, cfg) for c in P.ORDER} == {
-        "A": "retired 2026-11-09", "B": "paused — benchmark", "C": "active research", "D": "active research",
-        "E7": "active research", "E21": "active research", "Simple": "paused — benchmark", "Close fade": "active"}
-    assert P.PAUSED == {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET"}
+        "A": "retired 2026-11-09", "B": "paused — benchmark", "C": "paused — benchmark/research",
+        "D": "paused — benchmark/research", "E7": "retired 2026-11-18 20:00 ET", "E21": "retired 2026-11-18 20:00 ET",
+        "Simple": "paused — benchmark", "Close fade": "paused — benchmark/research"}
+    assert P.PAUSED == {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET", "C": "2026-11-18 20:00 ET",
+                        "D": "2026-11-18 20:00 ET", "Close fade": "2026-11-18 20:00 ET"}
+    assert not any(P._live(c, cfg) for c in P.ORDER)
+
+
+def test_c_d_and_close_fade_re_enable_from_config_e7_e21_stay_retired(tmp_path, monkeypatch):
+    text = (ROOT / "config.toml").read_text()
+    text = text.replace("Re-enable only on request.\nenabled = false", "x\nenabled = true")
+    text = text.replace("true runs it again.\nenabled = false", "x\nenabled = true")
+    (tmp_path / "config.toml").write_text(text)
+    monkeypatch.setenv("MASSIVE_API_KEY", "k")
+    again = config_mod.load(tmp_path / "config.toml")
+    assert again.daytrade.enabled and again.closeplay_enabled
+    assert P._status("C", again) == P._status("D", again) == "active research"
+    assert P._status("Close fade", again) == "active" and P._status("E7", again).startswith("retired")
 
 
 def test_b_and_simple_code_remain_and_re_enabling_runs_them_again(tmp_path, monkeypatch):
@@ -48,6 +64,7 @@ def test_b_and_simple_code_remain_and_re_enabling_runs_them_again(tmp_path, monk
     text = (ROOT / "config.toml").read_text().replace('strategies = ["qualified",', 'strategies = ["cross", "qualified",')
     text = text.replace("scorecard history, replay and exit research are kept as a frozen benchmark; enabled = true runs "
                         "it again.\nenabled = false", "x\nenabled = true")
+    text = text.replace("Re-enable only on request.\nenabled = false", "x\nenabled = true")      # [daytrade] on
     (tmp_path / "config.toml").write_text(text)
     monkeypatch.setenv("MASSIVE_API_KEY", "k")
     again = config_mod.load(tmp_path / "config.toml")
@@ -67,8 +84,8 @@ def test_paused_strategies_keep_their_history_in_the_scorecard(tmp_path, cfg):
     assert "FORWARD PAPER: 1 trades / 1 trading days" in b and "17,718 trades" in b
     sm = text.split("Simple EMA")[1].split("\n<b>")[0]
     assert "paused — benchmark" in sm and "FORWARD PAPER: 1 trades" in sm
-    assert "All strategies incl. retired A and paused B / Simple history</b>: 2 trades" in text
-    assert "Current active set (C / D / E7 / E21 / Close fade; history of those strategies only)</b>: no trades" in text
+    assert "All strategies incl. retired and paused history</b>: 2 trades" in text
+    assert "Current active set (none: every paper strategy is paused or retired)</b>: no trades" in text
 
 
 def test_weekly_strategy_report_labels_b_paused(tmp_path, cfg):
@@ -238,8 +255,8 @@ def test_forward_and_historical_are_shown_separately(tmp_path, cfg):
     a = text.split("EMA Retest (A)")[1].split("\n<b>")[0]
     assert "FORWARD PAPER: 1 trades / 1 trading days" in a and "net +$94" in a
     assert "HISTORICAL: Oct 2022–Oct 2026" in a and "8,932 trades" in a
-    assert "All strategies incl. retired A and paused B / Simple history</b>: 1 trades" in text
-    assert "Current active set (C / D / E7 / E21 / Close fade; history of those strategies only)</b>: no trades" in text
+    assert "All strategies incl. retired and paused history</b>: 1 trades" in text
+    assert "Current active set (none: every paper strategy is paused or retired)</b>: no trades" in text
     assert "VALIDATED" not in text.upper().replace("NEVER LABELLED VALIDATED", "")
 
 

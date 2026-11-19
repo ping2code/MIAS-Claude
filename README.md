@@ -449,6 +449,13 @@ The service has a dashboard at `http://localhost:8080/` (auto-refreshes; no logi
 
 ## Paper Strategy Scorecard
 
+**Status since 2026-11-18 20:00 ET (archived / benchmark research; no paper strategy opens new trades):** A retired
+(2026-11-09) · B paused — benchmark · C paused — benchmark/research · D paused — benchmark/research · E7 retired ·
+E21 retired · Simple paused — benchmark · 3:45 close fade paused — benchmark/research. Config only: `[daytrade]
+enabled = false` (C / D, list kept), E7 / E21 removed from `[daytrade] strategies`, `[closeplay] enabled = false`.
+Code, logged trades, scorecard history, replays and backtests are kept; nothing was deleted or rewritten. Telegram
+live attention is Early Watch v1 / v2 only.
+
 `mias/paperscore.py`, `/paperscore` (`/paperscore full`) and `python -m mias paper-scorecard [--full]`. Report only;
 separate from the Alert Scorecard. For A, B, C, D, E7, E21, Simple and the 3:45 close fade: trades, distinct trading
 days, wins / losses, gross P/L, commissions ($0.65 per contract each way), net, net per trade (= expectancy),

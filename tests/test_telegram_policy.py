@@ -194,8 +194,7 @@ def test_benchmark_config_unchanged(d_cfg):  # noqa: F811
     import os
     os.environ.setdefault("MASSIVE_API_KEY", "k")
     c = config_mod.load(ROOT / "config.toml")
-    assert c.daytrade.strategies == ("qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21") or \
-        list(c.daytrade.strategies) == ["qualified", "ema_9_21_d", "ema_9_21_e7", "ema_9_21_e21"]
+    assert c.daytrade.strategies == ("qualified", "ema_9_21_d") and not c.daytrade.enabled   # 2026-11-18 cleanup
     assert c.ema_simple_enabled is False                               # paused benchmark, as before
     assert "retest" in E.STRATEGIES and "cross" in E.STRATEGIES        # A / B code kept for history and replay
 
