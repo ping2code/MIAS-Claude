@@ -1,0 +1,21 @@
+# V3 EARLY WATCH (research). Its own process, state, config (early_watch_v3.toml), storage (data/early_watch_v3/),
+# Telegram chat and send queue. It reads the observer's processed bars READ-ONLY and opens no market-data WebSocket,
+# so stopping, restarting or crashing it never affects mias-observer (V1 / V2) or mias-claude.
+#   cp deploy/systemd/mias-early-watch-v3.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now mias-early-watch-v3
+# Kill switch without any restart: early_watch_v3.toml enabled / telegram_enabled (re-read every 5 s).
+[Unit]
+Description=MIAS V3 EARLY WATCH (research, separate from V1 / V2)
+After=network-online.target mias-observer.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/MyRepos/MIAS-Claude
+ExecStart=%h/MyRepos/MIAS-Claude/.venv/bin/python -m mias.early_watch_v3 run
+Restart=always
+RestartSec=20
+Nice=15
+MemoryMax=512M
+
+[Install]
+WantedBy=default.target

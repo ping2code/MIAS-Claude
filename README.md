@@ -665,6 +665,49 @@ message of their own (stage TELEGRAM MUTED, reason `structure_telegram_muted`). 
 unchanged and still list Structure when a Structure watch is open on the same symbol / side. v2 report section 8a
 compares recorded delivery with a replay of the current policy.
 
+## V3 EARLY WATCH (research, separate pipeline, 2026-11-18)
+
+V1 and V2 are frozen baselines. V3 is a new, separate live research / alert pipeline in `mias/early_watch_v3/`. It
+has its own process (user unit `mias-early-watch-v3`, `python -m mias.early_watch_v3 run`), state, config
+(`early_watch_v3.toml`, not `config.toml`), storage (`data/early_watch_v3/v3.db`), Telegram chat
+(`telegram_chat_id_v3`), send queue and reports.
+
+- **Detection = a clone of the current V2:** V3-A Structure, V3-B VWAP and V3-C Opening Range, with V2's
+  definitions and values copied into `early_watch_v3.toml`. Tests check the values against V2 and check that, on
+  identical bars, every candidate, Watch, direction and lifecycle event equals V2's. A replay of the five live
+  sessions Nov 12–18 matched V2 exactly: 2,141 candidates and 1,047 Watches.
+- **Isolation:** V3 opens no market-data WebSocket. It follows the 1-minute bars the observer has already
+  processed (`data/observer/observer.db` `bars1`, in processing order) on a read-only connection. It reuses the
+  observer's cached warm-up files read-only. The confirmed events and options context come from the same read-only
+  MIAS sources V2 uses. No V1 / V2 file imports it, and it writes only its own files. A V3 exception, restart or
+  kill switch cannot affect V1 / V2.
+- **Telegram:** all three families send at launch, each with a `send_*` flag. V3 does not copy V2's Structure
+  mute. Pacing and safety are copied from V2: main lane only, a 180 s maximum age, one message per setup, and
+  same-symbol / same-side Watches within 5 min combined into one message. Messages go through V3's own sender
+  instance (its own rate-limit state) to the V3 chat.
+- **Message format:** each message has a bold header
+  `V3 EARLY WATCH · <family tags> · SYMBOL · DIR · HH:MM ET @ price`. It shows six ✓ / ✗ / ○ checks relative to
+  the Watch direction: VWAP, EMA9/21, SMA200, SPY, volume and options. It also shows level margins in % and ATR,
+  the invalidation distance with a "tight — noise risk" label, and one options line
+  `Stock | Market | Overall` with a market-mismatch note and the options age, STALE or unavailable. It ends with
+  the quality line, the low-conviction / late-session flags and minutes to close. The footer is exactly
+  `WATCH ONLY — NOT A TRADE SIGNAL`. There are no contract recommendations. All of this is presentation only and
+  never changes a Watch.
+- **ATR (one definition, `mias/early_watch_v3/atr.py`):** 14-period ATR on completed 5-minute bars, stored with
+  every Watch.
+- **Storage and reports:** every Watch stores its checks, counts, distances, ATR, flags, options snapshot and
+  age, `v2_would_send` (what V2's current policy would do), Telegram timings, lifecycle, 5/10/15/30/60-minute
+  outcomes and MFE / MAE. The daily report (`data/early_watch_v3/daily/<day>/v3_report.md`) shows totals,
+  outcomes, groups (rates only at n ≥ 30, otherwise "sample too small"), the V2-vs-V3 comparison and latency.
+- **Kill switch (hot, no restart of anything):** `enabled = false` stops V3 entirely. `telegram_enabled = false`
+  keeps it detecting and recording but sends nothing.
+- **Research rule:** collect evidence for two sessions. No tuning or threshold change after session 1 without the
+  user's explicit approval.
+
+Commands: `python -m mias.early_watch_v3 replay 2026-11-17` (own replay database, no Telegram),
+`... render --db data/early_watch_v3/replay.db --day 2026-11-17 --sym AMZN --side bear --near 14:47`,
+`... report --day <day>`, `... status`, `... telegram-test`.
+
 ## Health gate
 
 `mias/health.py`: a symbol whose data can't be trusted produces no signals rather than misleading ones. In market

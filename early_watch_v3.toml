@@ -1,0 +1,75 @@
+# V3 EARLY WATCH: its own config file, separate from config.toml (V1 / V2 settings live in config.toml [observer]
+# and are never read for V3 detection). Created 2026-11-18. The detection values below are a COPY of the current V2
+# values (mias/observer/rules.py RULES + mias/observer/v2.py constants); tests/test_early_watch_v3.py checks that
+# they still equal V2's. Research rule (user, 2026-11-18): collect evidence for two sessions, and change no value
+# after session 1 without the user's explicit approval.
+#
+# Hot settings (re-read every reload_seconds, no restart of anything): enabled, telegram_enabled and the
+# [early_watch_v3.telegram] send_* family flags. Any other change needs a restart of mias-early-watch-v3 only.
+
+[early_watch_v3]
+enabled = true                      # false: V3 stops entirely (no processing, no storage, no sends); V1 / V2 unaffected
+telegram_enabled = true             # false: V3 keeps detecting and recording, sends nothing
+telegram_chat_id_v3 = "-5328364952" # V3's own Telegram chat (V1 / V2 keep their chats); same bot token from .env
+symbols = ["SPY", "QQQ", "IWM", "NVDA", "TSLA", "META", "MSFT", "AAPL", "AMZN", "AMD", "PG"]   # = V2 ([observer] symbols)
+db_path = "data/early_watch_v3/v3.db"         # V3 storage (never a V1 / V2 file)
+cache_dir = "data/early_watch_v3/cache"       # V3's own warm-up cache
+# Shared, immutable market data, READ-ONLY (sqlite mode=ro / plain file reads; V3 never writes these):
+bars_db = "data/observer/observer.db"         # the completed 1-minute bars the observer processed (bars1, in order)
+source_cache_dir = "data/observer/cache"      # prior-session bars the observer already fetched (same warm-up data)
+v2_db = "data/observer/v2.db"                 # V2 records, only for the daily V2-vs-V3 comparison
+poll_seconds = 1.0                  # how often V3 looks for newly processed bars
+confirm_poll_seconds = 20           # = V2 (read-only poll of MIAS confirmed events for the UPGRADED link)
+reload_seconds = 5
+
+[early_watch_v3.session]            # ET; = V2
+session_open = "09:30"
+session_close = "16:00"
+or_end = "09:45"                    # opening range = the 09:30-09:45 1-minute bars
+main_start = "09:45"                # main lane: bars starting >= 09:45 and ending <= 15:00 (the only lane sent)
+main_end = "15:00"
+day_start_from = "09:22"            # operational: 2 min after V1 / V2 (09:20) so their warm-up files can be reused
+day_start_until = "16:30"
+end_of_day = "16:03"
+
+[early_watch_v3.structure]          # V3-A Structure = V2-A
+pivot_k = 2
+dev_atr_mult = 0.25
+atr_period = 14
+ema_fast = 9
+ema_slow = 21
+warm_sessions = 10
+stale_bars_after_gap = 2
+persistence_closes = 1
+
+[early_watch_v3.vwap]               # V3-B VWAP = V2-B
+prior_closes_other_side = 3
+persistence_closes = 2
+invalidation_closes_through = 2
+
+[early_watch_v3.or]                 # V3-C Opening Range = V2-C
+persistence_closes = 2
+
+[early_watch_v3.watch]
+lifetime_minutes = 60               # = V2: not upgraded within 60 min -> EXPIRED
+
+[early_watch_v3.options]
+fresh_seconds = 330                 # = mias/observer/optctx.py FRESH_S (2 MIAS cycles + 30 s); older -> STALE
+
+[early_watch_v3.telegram]           # pacing / safety = V2; launch policy: ALL three families send
+send_structure = true
+send_vwap = true
+send_or = true
+max_age_seconds = 180               # a Watch older than this when found (restart backfill) is never sent
+combine_seconds = 300               # same symbol / side within 5 min -> one combined message
+group_gap_seconds = 3.0             # Telegram pacing: 1 message per 3 s to a group chat
+private_gap_seconds = 1.0
+max_wait_seconds = 60
+send_timeout_seconds = 180
+
+[early_watch_v3.presentation]       # presentation ONLY: never creates, suppresses, delays or changes a Watch
+marginal_atr = 0.10
+tight_invalidation_atr = 0.30
+low_conviction_rvol = 0.8
+volume_support_rvol = 1.0           # the volume check shows ✓ at >= 1.0x normal, ✗ below low_conviction_rvol
+late_session_et = "14:30"
