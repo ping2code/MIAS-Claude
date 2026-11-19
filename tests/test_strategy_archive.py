@@ -95,12 +95,12 @@ def test_history_and_reports_keep_every_strategy(tmp_path, svc_cfg):  # noqa: F8
     for name in P.NAMES.values():
         if name != P.NAMES["Simple"]:
             assert name in text
-    assert "(retired 2026-11-18 20:00 ET)" in text and "(paused — benchmark/research)" in text
-    assert "no new forward paper entries after 2026-11-18 20:00 ET" in text
+    assert "(retired 2026-11-18 21:01 ET)" in text and "(paused — benchmark/research)" in text
+    assert "no new forward paper entries after 2026-11-18 21:01 ET" in text
     assert "All strategies incl. retired and paused history</b>: 7 trades" in text
     weekly = strategies.report(store, svc_cfg, datetime(2026, 11, 13, 16, 0, tzinfo=ET), 7)
-    assert "(paused — benchmark/research; no new entries after 2026-11-18 20:00 ET)" in weekly
-    assert "(retired 2026-11-18 20:00 ET)" in weekly and "3:45 PM close fade</b> (paused" in weekly
+    assert "(paused — benchmark/research; no new entries after 2026-11-18 21:01 ET)" in weekly
+    assert "(retired 2026-11-18 21:01 ET)" in weekly and "3:45 PM close fade</b> (paused" in weekly
     assert (store.get(emacross.LOG_KEY), store.get(closeplay.LOG_KEY)) == before          # nothing rewritten
 
 

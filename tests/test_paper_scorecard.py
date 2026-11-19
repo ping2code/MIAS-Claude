@@ -40,10 +40,10 @@ def test_status_after_the_2026_11_18_cleanup(cfg):
     assert "cross" not in cfg.daytrade.strategies and not cfg.ema_simple_enabled
     assert {c: P._status(c, cfg) for c in P.ORDER} == {
         "A": "retired 2026-11-09", "B": "paused — benchmark", "C": "paused — benchmark/research",
-        "D": "paused — benchmark/research", "E7": "retired 2026-11-18 20:00 ET", "E21": "retired 2026-11-18 20:00 ET",
+        "D": "paused — benchmark/research", "E7": "retired 2026-11-18 21:01 ET", "E21": "retired 2026-11-18 21:01 ET",
         "Simple": "paused — benchmark", "Close fade": "paused — benchmark/research"}
-    assert P.PAUSED == {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET", "C": "2026-11-18 20:00 ET",
-                        "D": "2026-11-18 20:00 ET", "Close fade": "2026-11-18 20:00 ET"}
+    assert P.PAUSED == {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET", "C": "2026-11-18 21:01 ET",
+                        "D": "2026-11-18 21:01 ET", "Close fade": "2026-11-18 21:01 ET"}
     assert not any(P._live(c, cfg) for c in P.ORDER)
 
 

@@ -24,15 +24,15 @@ ORDER = ("A", "B", "C", "D", "E7", "E21", "Simple", "Close fade")
 NAMES = {"A": "EMA Retest (A)", "B": "EMA Cross (B)", "C": "Qualified (C)", "D": "Strategy D", "E7": "E7 (7DTE)",
          "E21": "E21 (21DTE)", "Simple": "Simple EMA — SPY/QQQ/IWM", "Close fade": "3:45 PM close fade"}
 # Retired from active paper trading (removed from [daytrade] strategies); code and logged trades are kept.
-RETIRED = {"A": "2026-11-09", "E7": "2026-11-18 20:00 ET", "E21": "2026-11-18 20:00 ET"}
-# 2026-11-18 20:00 ET (user decision, before V3 work): E7 / E21 retired (removed from [daytrade] strategies); C / D
+RETIRED = {"A": "2026-11-09", "E7": "2026-11-18 21:01 ET", "E21": "2026-11-18 21:01 ET"}
+# 2026-11-18 21:01 ET (user decision, before V3 work): E7 / E21 retired (removed from [daytrade] strategies); C / D
 # paused ([daytrade] enabled = false) and the close fade paused ([closeplay] enabled = false). Code, logged trades,
 # scorecard history, replays and backtests are kept; nothing is deleted or rewritten.
 # Paused from NEW forward paper entries (2026-11-13, user decision; "cross" removed from [daytrade] strategies,
 # [ema_simple] enabled = false). Benchmark / research only: code, logged trades, replays and backtests are kept and
 # still reported. Shown as paused only while the configuration has them off; re-enabling makes them active again.
-PAUSED = {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET", "C": "2026-11-18 20:00 ET",
-          "D": "2026-11-18 20:00 ET", "Close fade": "2026-11-18 20:00 ET"}
+PAUSED = {"B": "2026-11-13 00:59 ET", "Simple": "2026-11-13 00:59 ET", "C": "2026-11-18 21:01 ET",
+          "D": "2026-11-18 21:01 ET", "Close fade": "2026-11-18 21:01 ET"}
 RESEARCH = ("C", "D", "Close fade")   # paused as benchmark / research (B and Simple: benchmark)
 
 
