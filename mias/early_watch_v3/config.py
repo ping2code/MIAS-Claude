@@ -53,6 +53,7 @@ class Presentation:
 @dataclass(frozen=True)
 class TelegramCfg:
     send: dict = field(default_factory=lambda: {f: True for f in FAMILIES})
+    min_families: int = 1          # Telegram only when >= this many families agree (1 = every family sends)
     max_age_s: float = 180
     combine_s: int = 300
     group_gap_s: float = 3.0
@@ -113,6 +114,7 @@ def load(path: str | Path = DEFAULT_PATH) -> V3Config:
         watch_minutes=int(wt.get("lifetime_minutes", d.watch_minutes)))
     t0 = TelegramCfg()
     tgc = TelegramCfg(send={f: bool(tg.get(f"send_{f}", True)) for f in FAMILIES},
+                      min_families=max(1, int(tg.get("min_families", t0.min_families))),
                       max_age_s=float(tg.get("max_age_seconds", t0.max_age_s)),
                       combine_s=int(tg.get("combine_seconds", t0.combine_s)),
                       group_gap_s=float(tg.get("group_gap_seconds", t0.group_gap_s)),
@@ -148,6 +150,7 @@ def load(path: str | Path = DEFAULT_PATH) -> V3Config:
 
 
 def hot(path: str | Path) -> dict:
-    """The settings V3 re-reads while running (kill switch + family send flags)."""
+    """The settings V3 re-reads while running (kill switch + family send flags + the confluence minimum)."""
     c = load(path)
-    return {"enabled": c.enabled, "telegram_enabled": c.telegram_enabled, "send": dict(c.tg.send)}
+    return {"enabled": c.enabled, "telegram_enabled": c.telegram_enabled, "send": dict(c.tg.send),
+            "min_families": c.tg.min_families}

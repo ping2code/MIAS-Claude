@@ -435,8 +435,8 @@ def _drain(r):
 
 
 def test_runner_stores_every_watch_sends_all_three_families_and_tags_v2_would_send(tmp_path):
-    snd = FakeSender()
-    r, store, sim, _ = _setup(tmp_path, sender=snd)
+    snd = FakeSender()                                      # launch policy (min_families = 1): every family sends
+    r, store, sim, _ = _setup(tmp_path, sender=snd, toml_edits=[("min_families = 2 ", "min_families = 1 ")])
     _run_all(r, sim)
     _drain(r)
     ws = store.watches()
@@ -753,6 +753,133 @@ def test_policy_pacing_matches_v2():
         assert p3.decide(w, w["watch_at"]) == p2.decide(w, w["watch_at"])
     assert p3.decide(dict(base, family="vwap", leg_id="VW9", watch_id="9"), 1_000_000 + 181_000) == \
         ("skip", "found late")
+
+
+# ---- 6b. confluence delivery policy (min_families = 2, 2026-11-24) ----------------------------------------
+
+NAMES = {"structure": "structure", "vwap": "vwap", "or": "opening_range"}
+
+
+def _session(tmp_path, seed, min_families=2, sender=None):
+    edits = [] if min_families == 2 else [("min_families = 2 ", f"min_families = {min_families} ")]
+    r, store, sim, p = _setup(tmp_path, seed=seed, sender=sender or FakeSender(), toml_edits=edits)
+    _run_all(r, sim)
+    _drain(r)
+    sim["t"] = datetime.combine(TODAY, time(16, 5), ET).timestamp()
+    report = r.end_of_day()
+    return r, store, report
+
+
+def test_config_ships_the_confluence_policy():
+    v3 = C.load(V3TOML)
+    assert v3.tg.min_families == 2 and all(v3.tg.send.values())
+    assert C.hot(V3TOML)["min_families"] == 2
+    assert C.TelegramCfg().min_families == 1                 # a file without the key keeps the launch behaviour
+
+
+def test_single_family_watches_are_created_stored_scored_and_never_sent(tmp_path):
+    muted_fams = set()
+    for seed in (7, 11):
+        snd = FakeSender()
+        r, store, report = _session(tmp_path / str(seed), seed, sender=snd)
+        ws = [w for w in store.watches() if w["lane"] == "main"]
+        single = [w for w in ws if len(set(w["families"])) == 1]
+        assert single
+        for w in single:
+            assert w["v3_verdict"] == "muted" and not w["telegram_sent"] and w["telegram_queued_at"] is None
+            assert w["telegram_error"] == f"muted: v3_single_family_muted: {NAMES[w['family']]}"
+            assert w["text"] and w["view"] and w["text"] not in snd.texts            # stored, rendered, not sent
+            assert w["outcomes_at"] is not None and w["state"] != "WATCH"            # lifecycle + outcomes scored
+            assert w["n_support"] + w["n_against"] + w["n_neutral"] == 6
+            assert w["chk_options"] in ("support", "against", "neutral") and w["options_status"] is not None
+            assert w["options_overall"] is not None and w["chk_spy"] is not None and w["inval_kind"] is not None
+            muted_fams.add(w["family"])
+        sent = [w for w in store.watches() if w["telegram_sent"]]
+        assert sent and len(snd.texts) == len(sent)
+        assert all(len(set(w["families"])) >= 2 for w in sent)                    # only confluence reaches Telegram
+        assert all(t.startswith("🧭 V3 EARLY WATCH · ") and " + " in t.splitlines()[0] for t in snd.texts)
+        assert "## Delivery policy" in report and "Structure only" in report and "Structure + VWAP + OR" in report
+        assert "standalone muted: Structure" in report
+    assert muted_fams == {"structure", "vwap", "or"}
+
+
+@pytest.mark.parametrize("seed", [7, 11])
+def test_detection_and_scoring_identical_under_both_delivery_policies(tmp_path, seed):
+    cols = ("watch_id", "family", "families", "lane", "sym", "side", "watch_at", "watch_price", "level", "state",
+            "end_at", "end_reason", "out_5", "out_60", "mfe_pct", "mae_pct", "n_support", "n_against",
+            "options_overall", "options_stock", "options_market", "chk_spy", "text")
+    runs = {}
+    for n in (1, 2):
+        _, store, _ = _session(tmp_path / f"m{n}", seed, min_families=n)
+        runs[n] = sorted(tuple(str(w[c]) for c in cols) for w in store.watches())
+        runs[f"c{n}"] = sorted(store.db.execute("SELECT cand_id, candidate_at, side, status FROM v3_candidate_log"))
+    assert runs[1] and runs[1] == runs[2] and runs["c1"] == runs["c2"]
+
+
+def _w(fam, wid, at, sym="NVDA", side="bear"):
+    return {"day": "2026-11-24", "lane": "main", "family": fam, "sym": sym, "side": side, "leg_id": f"L{wid}",
+            "watch_id": wid, "watch_at": at, "watch_price": 100.0}
+
+
+@pytest.mark.parametrize("combo", [("structure", "vwap"), ("structure", "or"), ("vwap", "or"),
+                                   ("structure", "vwap", "or")])
+def test_confluence_sends_exactly_one_message(tmp_path, combo):
+    """14:31 first family alone (muted) · 14:35 second joins inside the combine window (one combined message) ·
+    14:36 third joins (merged into it, no second message)."""
+    r, store, sim, _ = _setup(tmp_path, sender=FakeSender())
+    t0 = int(datetime.combine(TODAY, time(14, 31), ET).timestamp() * 1000)
+    open_fams = []
+    for i, f in enumerate(combo):
+        at = t0 + (0, 240_000, 300_000)[i]
+        open_fams.append(f)
+        sim["t"] = at / 1000 + 1
+        w = _w(f, f"w{i}", at)
+        text = f"🧭 V3 EARLY WATCH · {' + '.join(Pr.TAG[x] for x in open_fams)} · NVDA · BEARISH"
+        r._deliver(w, {"view": {"families": list(open_fams)}, "text": text})
+    _drain(r)
+    snd = r.sender
+    assert len(snd.texts) == 1 and r.counts["tg_queued"] == 1
+    assert snd.texts[0].startswith("🧭 V3 EARLY WATCH · " + " + ".join(Pr.TAG[x] for x in combo[:2]))
+    assert not snd.texts[0].startswith(("V3-A EARLY WATCH", "V3-B EARLY WATCH", "V3-C EARLY WATCH"))
+    assert r.counts["tg_muted"] == 1 and r.counts["tg_merged"] == len(combo) - 2
+
+
+def test_policy_decisions_for_each_case():
+    p = V3Telegram(min_families=2)
+    t = 1_000_000
+    assert p.decide(_w("structure", "1", t), t, ["structure"]) == ("muted", "v3_single_family_muted: structure")
+    assert p.decide(_w("vwap", "2", t, sym="A"), t, ["vwap"]) == ("muted", "v3_single_family_muted: vwap")
+    assert p.decide(_w("or", "3", t, sym="B"), t, ["or"]) == ("muted", "v3_single_family_muted: opening_range")
+    assert p.decide(_w("or", "3b", t, sym="B"), t, None)[0] == "muted"          # unknown families = its own only
+    assert not p.recent and not p.sent_setups                                     # muting leaves no state behind
+    assert p.decide(_w("vwap", "4", t + 240_000), t + 240_000, ["structure", "vwap"]) == ("send", "4")
+    assert p.decide(_w("or", "5", t + 280_000), t + 280_000, ["structure", "vwap", "or"]) == ("merged", "4")
+    p3 = V3Telegram(min_families=3)
+    assert p3.decide(_w("vwap", "6", t), t, ["structure", "vwap"]) == \
+        ("muted", "v3_below_min_families: structure + vwap")
+    p1 = V3Telegram(min_families=1)
+    assert p1.decide(_w("structure", "7", t), t, ["structure"]) == ("send", "7")      # launch behaviour
+
+
+def test_min_families_is_hot_and_its_history_is_recorded(tmp_path):
+    r, store, sim, p = _setup(tmp_path, sender=FakeSender())
+    assert r.policy.min_families == 2 and store.get("telegram_policy")[-1]["min_families"] == 2
+    p.write_text(p.read_text().replace("min_families = 2 ", "min_families = 1 "))
+    sim["t"] += 60
+    r.reload()
+    assert r.policy.min_families == 1 and [h["min_families"] for h in store.get("telegram_policy")] == [2, 1]
+    r.reload()
+    assert len(store.get("telegram_policy")) == 2                                 # unchanged value: no new entry
+
+
+def test_telegram_failure_under_confluence_changes_nothing_else(tmp_path):
+    _, ok, _ = _session(tmp_path / "ok", 7)
+    _, bad, _ = _session(tmp_path / "bad", 7, sender=FakeSender(fail=True))
+    key = lambda st: sorted((w["watch_id"], w["watch_at"], w["state"], w["out_60"], w["v3_verdict"])
+                            for w in st.watches())
+    assert key(ok) == key(bad)
+    failed = [w for w in bad.watches() if w["v3_verdict"] == "send"]
+    assert failed and all(not w["telegram_sent"] and "SendError" in (w["telegram_error"] or "") for w in failed)
 
 
 # ---- 7. V1 / V2 unchanged -------------------------------------------------------------------------------

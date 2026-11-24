@@ -112,8 +112,9 @@ class V3Runner:
         self.day: date | None = None
         self.last_rowid = 0
         self.finalized: set[str] = set()
-        self.hot = {"enabled": v3.enabled, "telegram_enabled": v3.telegram_enabled, "send": dict(v3.tg.send)}
-        self.policy = V3Telegram(v3.tg.combine_s, v3.tg.max_age_s, self.hot["send"])
+        self.hot = {"enabled": v3.enabled, "telegram_enabled": v3.telegram_enabled, "send": dict(v3.tg.send),
+                    "min_families": v3.tg.min_families}
+        self.policy = self._new_policy()
         self.options_factory = options_factory
         self.warm = warm or (lambda day: warm_data(self.client, self.v3, self.syms, day, self.tz))
         self.octx = None
@@ -125,6 +126,23 @@ class V3Runner:
         self.counts = {"bars": 0, "watches": 0, "errors_detector": 0, "errors_present": 0, "errors_store": 0,
                        "errors_deliver": 0, "tg_queued": 0, "tg_sent": 0, "tg_failed": 0, "tg_merged": 0,
                        "tg_skipped": 0, "tg_muted": 0, "tg_disabled": 0}
+        self._note_policy()
+
+    def _new_policy(self) -> V3Telegram:
+        return V3Telegram(self.v3.tg.combine_s, self.v3.tg.max_age_s, self.hot["send"], self.hot["min_families"])
+
+    def _note_policy(self) -> None:
+        """Delivery-policy history (kv 'telegram_policy'): when each min_families value took effect. Report only;
+        records already written keep what actually happened."""
+        try:
+            hist = self.store.get("telegram_policy", []) or []
+            n = self.hot["min_families"]
+            if not hist or hist[-1].get("min_families") != n:
+                hist.append({"min_families": n, "since": self.clock()})
+                self.store.put("telegram_policy", hist)
+                self.store.feed("telegram_policy", f"min_families = {n}")
+        except Exception:
+            log.exception("could not record the V3 delivery policy")
 
     def _new_v2_policy(self):
         try:
@@ -154,6 +172,8 @@ class V3Runner:
             log.info("V3 hot reload: %s", h)
         self.hot = h
         self.policy.send_flags = dict(h["send"])
+        self.policy.min_families = max(1, int(h.get("min_families", 1)))
+        self._note_policy()
 
     # ---- day ------------------------------------------------------------------------------------
 
@@ -189,7 +209,7 @@ class V3Runner:
             self.store.confirm(str(day), ev)
         self.day = day
         self.last_rowid = 0
-        self.policy = V3Telegram(self.v3.tg.combine_s, self.v3.tg.max_age_s, self.hot["send"])
+        self.policy = self._new_policy()
         self.v2pol, self.v2_on = self._new_v2_policy()
         self.store.feed("day_start", f"{day}: warmed {len(self.syms)} symbols (cache {hits}), "
                                      f"{len(confirms)} confirmed events")
@@ -298,7 +318,7 @@ class V3Runner:
                     would = self.v2_on and v2_verdict == "send"
                 except Exception:
                     log.exception("V2 policy mirror failed for %s", w["watch_id"])
-            verdict, info = self.policy.decide(w, now_ms)
+            verdict, info = self.policy.decide(w, now_ms, (m.get("view") or {}).get("families"))
             self.store.set_policy(w["watch_id"], verdict, v2_verdict, would)
             if verdict == "send":
                 if not self.hot["telegram_enabled"]:
@@ -448,7 +468,8 @@ async def main(cfg, v3: V3Config) -> None:
         store.feed("start", f"{len(v3.symbols)} symbols, enabled {v3.enabled}, telegram "
                             f"{'ON (V3 bot, V3 chat)' if sender and v3.telegram_enabled else 'off'}"
                             f"{f' ({why})' if why else ''}, families "
-                            f"{', '.join(f for f, on in v3.tg.send.items() if on)}")
+                            f"{', '.join(f for f, on in v3.tg.send.items() if on)}, min_families "
+                            f"{v3.tg.min_families}")
         try:
             await asyncio.gather(runner.loop(stop), runner.send_worker(stop))
         finally:

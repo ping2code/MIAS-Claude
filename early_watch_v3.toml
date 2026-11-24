@@ -5,7 +5,8 @@
 # after session 1 without the user's explicit approval.
 #
 # Hot settings (re-read every reload_seconds, no restart of anything): enabled, telegram_enabled and the
-# [early_watch_v3.telegram] send_* family flags. Any other change needs a restart of mias-early-watch-v3 only.
+# [early_watch_v3.telegram] send_* family flags and min_families. Any other change needs a restart of
+# mias-early-watch-v3 only.
 
 [early_watch_v3]
 enabled = true                      # false: V3 stops entirely (no processing, no storage, no sends); V1 / V2 unaffected
@@ -58,10 +59,14 @@ lifetime_minutes = 60               # = V2: not upgraded within 60 min -> EXPIRE
 [early_watch_v3.options]
 fresh_seconds = 330                 # = mias/observer/optctx.py FRESH_S (2 MIAS cycles + 30 s); older -> STALE
 
-[early_watch_v3.telegram]           # pacing / safety = V2; launch policy: ALL three families send
+[early_watch_v3.telegram]           # pacing / safety = V2. DELIVERY ONLY: detection, Watches, storage, scoring unchanged
 send_structure = true
 send_vwap = true
 send_or = true
+min_families = 2                    # confluence policy (user, 2026-11-24): Telegram only when >= 2 families (Structure /
+                                    # VWAP / OR) are open on the same symbol + side; one family alone is stored, scored
+                                    # and reported, never sent ("v3_single_family_muted: <family>"). 1 = launch policy
+                                    # (every family sends). Hot setting: no restart needed to change it.
 max_age_seconds = 180               # a Watch older than this when found (restart backfill) is never sent
 combine_seconds = 300               # same symbol / side within 5 min -> one combined message
 group_gap_seconds = 3.0             # Telegram pacing: 1 message per 3 s to a group chat

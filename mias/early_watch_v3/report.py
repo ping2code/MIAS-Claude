@@ -67,7 +67,8 @@ def build(db: V3DB, tz: ZoneInfo, day: str, v2_db: Path | None = None, out_dir: 
           title: str | None = None) -> str:
     ws = db.watches("day = ?", (day,))
     L = [f"# {title or f'V3 EARLY WATCH — {day}'}", "",
-         "Research only. Detection = V2 clone; all three families sent to the V3 chat. Rates only at n >= "
+         "Research only. Detection = V2 clone; every family is detected, stored and scored; Telegram follows the "
+         "delivery policy below. Rates only at n >= "
          f"{MIN_N}; smaller groups are raw counts (sample too small). First review: counts and direction only.", ""]
     sent = [w for w in ws if w["telegram_sent"]]
     L += ["## Totals", f"- Watches: **{len(ws)}** (main lane {sum(w['lane'] == 'main' for w in ws)}, opening "
@@ -112,6 +113,7 @@ def build(db: V3DB, tz: ZoneInfo, day: str, v2_db: Path | None = None, out_dir: 
     mm = [w for w in ws if w.get("market_mismatch")]
     L.append(f"- Market mismatch computed {len(mm)} · shown {sum(bool(w.get('mismatch_shown')) for w in mm)} "
              "(|SPY| >= 0.50%)")
+    L += ["", "## Delivery policy (Telegram only; detection and storage unchanged)"] + delivery(db, ws, tz)
     L += ["", "## Groups"]
     groupings = [("family", lambda w: w["family"]), ("Supports count", lambda w: w["n_support"]),
                  ("Against count", lambda w: w["n_against"]), ("Neutral count", lambda w: w["n_neutral"]),
@@ -130,6 +132,70 @@ def build(db: V3DB, tz: ZoneInfo, day: str, v2_db: Path | None = None, out_dir: 
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "v3_report.md").write_text(text)
     return text
+
+
+COMBOS = (("Structure only", ("structure",)), ("VWAP only", ("vwap",)), ("OR only", ("or",)),
+          ("Structure + VWAP", ("structure", "vwap")), ("Structure + OR", ("structure", "or")),
+          ("VWAP + OR", ("vwap", "or")), ("Structure + VWAP + OR", ("structure", "vwap", "or")))
+SINGLE_MUTED = "muted: v3_single_family_muted: "
+
+
+def _fams(w: dict) -> tuple:
+    f = w.get("families") or [w["family"]]
+    return tuple(x for x in ("structure", "vwap", "or") if x in set(f) | {w["family"]})
+
+
+def _median(xs):
+    xs = [x for x in xs if x is not None]
+    return f"{median(xs):+.3f}" if xs else "–"
+
+
+def delivery(db: V3DB, ws: list[dict], tz: ZoneInfo) -> list[str]:
+    """Counts by delivery outcome and outcomes by family composition (the families open on the symbol / side when
+    the Watch was created = the families its message shows). Standalone groups are the ones the confluence policy
+    mutes; confluence groups are Telegram-eligible (one message per setup; later joiners are merged)."""
+    hist = db.get("telegram_policy", []) or []
+    L = []
+    if hist:
+        L.append("- Policy history: " + " · ".join(
+            f"min_families {h['min_families']} since "
+            f"{datetime.fromtimestamp(h['since'], timezone.utc).astimezone(tz):%Y-%m-%d %H:%M} ET" for h in hist))
+    sent = [w for w in ws if w["telegram_sent"]]
+    muted = Counter((w["telegram_error"] or "")[len(SINGLE_MUTED):] for w in ws
+                    if (w["telegram_error"] or "").startswith(SINGLE_MUTED))
+    L += [f"- V3 Watches: **{len(ws)}** · standalone muted: Structure {muted.get('structure', 0)} · VWAP "
+          f"{muted.get('vwap', 0)} · OR {muted.get('opening_range', 0)}",
+          f"- Telegram messages: **{len(sent)}** (one family {sum(len(_fams(w)) == 1 for w in sent)} · two families "
+          f"{sum(len(_fams(w)) == 2 for w in sent)} · three families {sum(len(_fams(w)) == 3 for w in sent)}) · "
+          f"merged into a sent message {sum((w['v3_verdict'] or '') == 'merged' for w in ws)}"]
+    L += ["", "| group | n | sent | " + " | ".join(f"{h}m right" for h in HORIZONS) +
+          " | median 30m % | median 60m % | MFE % | MAE % | invalidated |",
+          "|---|---|---|" + "---|" * (len(HORIZONS) + 5)]
+    opt = []
+    for title, rows_of in (("Standalone (muted under confluence)", COMBOS[:3]), ("Confluence (Telegram)", COMBOS[3:])):
+        L.append(f"| **{title}** |" + " |" * (len(HORIZONS) + 7))
+        for name, combo in rows_of:
+            rows = [w for w in ws if _fams(w) == combo]
+            cells = []
+            for h in HORIZONS:
+                xs = [r[f"out_{h}"] for r in rows if r.get(f"out_{h}") is not None]
+                cells.append(rate(sum(x > 0 for x in xs), len(xs)))
+            L.append(f"| {name} | {len(rows)} | {sum(bool(r['telegram_sent']) for r in rows)} | " + " | ".join(cells) +
+                     f" | {_median([r['out_30'] for r in rows])} | {_median([r['out_60'] for r in rows])} | "
+                     f"{_mean([r['mfe_pct'] for r in rows])} | {_mean([r['mae_pct'] for r in rows])} | "
+                     f"{rate(sum(r['state'] == 'INVALIDATED' for r in rows), len(rows))} |")
+            by = defaultdict(list)
+            for r in rows:
+                by[r["options_overall"] or "n/a"].append(r)
+            if rows:
+                parts = []
+                for k in sorted(by):
+                    xs = [r["out_60"] for r in by[k] if r.get("out_60") is not None]
+                    parts.append(f"{k} n={len(by[k])}, 60m right {rate(sum(x > 0 for x in xs), len(xs))}")
+                opt.append(f"- {name}: " + " · ".join(parts))
+    if opt:
+        L += ["", "Options Overall by group (60m):"] + opt
+    return L
 
 
 def compare(db: V3DB, day: str, v2_db: Path | None, tz: ZoneInfo) -> list[str]:
@@ -163,7 +229,7 @@ def compare(db: V3DB, day: str, v2_db: Path | None, tz: ZoneInfo) -> list[str]:
          f"- Watch timestamp differences: {len(ts_diff)} · direction differences: {len(dir_diff)}",
          f"- Expected: detection matches → **{'MATCH' if not (ts_diff or dir_diff or only2 or only3) and cand_same else 'DIFFERENCE (see below)'}**",
          f"- Telegram messages: V2 sent {sum(r[6] for r in w2)} · V3 sent {sum(r[6] for r in w3)} "
-         "(differs by design: V3 sends all three families)"]
+         "(differs by design: V3 has its own delivery policy)"]
     for k in (only2[:10] + only3[:10]):
         L.append(f"  - {'only V2' if k in m2 else 'only V3'}: {k}")
     for k, a, b in ts_diff[:10]:
